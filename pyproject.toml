@@ -3,10 +3,17 @@ name = "voice-debt-collector"
 version = "0.1.0"
 description = "Voice debt-collection negotiation agent — the LLM talks, deterministic code decides."
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "anthropic>=0.120.2",
+    "python-dotenv>=1.2.2",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11"]
+
+[project.scripts]
+collector-text = "collector.text_app:run"
+collector-agreements = "collector.text_app:dump_agreements"
 
 [build-system]
 requires = ["hatchling"]

@@ -185,7 +185,7 @@ def validate_offer(
     counter = build_counter(
         state,
         policy,
-        capacity=_effective_capacity(proposal),
+        capacity=effective_capacity(proposal),
         preferred_cadence=proposal.cadence,
     )
     failed = {c.rule_id for c in conditions if not c.passed}
@@ -207,7 +207,7 @@ _HARD_FLOORS = frozenset(
 )
 
 
-def _effective_capacity(proposal: ConsumerProposal) -> Money:
+def effective_capacity(proposal: ConsumerProposal) -> Money:
     """What this proposal reveals the consumer thinks they can pay at a time.
 
     An explicit signal wins; otherwise their own smallest instalment is the
@@ -287,7 +287,13 @@ def build_counter(
     """Compute the offer the agent should put back to the consumer.
 
     Deterministic and total: for any inputs this returns a policy-legal Offer.
+
+    An explicit ``capacity`` wins, but with none given the state's own signal
+    stands in. Without that fallback a concession can hand back terms harder
+    than the ones just refused — the consumer says $300, we counter $300/$700,
+    they refuse, and the "concession" comes back $750/$250.
     """
+    capacity = capacity if capacity is not None else state.signaled_capacity
     tier = tier if tier is not None else select_tier(state, policy, capacity)
     total = _tier_total(tier, policy)
     amounts: tuple[Money, ...]

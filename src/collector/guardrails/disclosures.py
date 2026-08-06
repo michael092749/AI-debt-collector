@@ -106,6 +106,34 @@ def requests_ai_disclosure(text: str) -> bool:
     return _AI_REQUEST_RE.search(text) is not None
 
 
+# Deliberately narrow. "Who's asking?" and "What is this about?" are not
+# confirmations, and neither is silence; being conservative here costs one
+# extra question, while being generous discloses a debt to whoever picked up.
+_IDENTITY_CONFIRMED_RE = re.compile(
+    r"(?:\byes\b|\byeah\b|\byep\b|\byup\b|\bspeaking\b|\bthat'?s me\b|\bthis is (?:he|she|they|"
+    r"them|me)\b|\byou'?ve got (?:him|her|them|me)\b|\bgo ahead\b)",
+    re.IGNORECASE,
+)
+_IDENTITY_DENIED_RE = re.compile(
+    r"(?:\bno\b|\bwrong number\b|\bnot (?:me|him|her|them)\b|\bnever heard of\b|"
+    r"\bdoesn'?t live here\b|\bthey'?re not here\b)",
+    re.IGNORECASE,
+)
+
+
+def confirms_identity(text: str) -> bool:
+    """Did the consumer just confirm they are the account holder? (SPEC §5.1)
+
+    Code decides this, not the model: it gates every substantive word that
+    follows, so it cannot be a judgement call made inside a generated turn. A
+    denial anywhere in the utterance wins over an affirmation — "yes, but no,
+    that's not me" is not a confirmation.
+    """
+    if _IDENTITY_DENIED_RE.search(text):
+        return False
+    return _IDENTITY_CONFIRMED_RE.search(text) is not None
+
+
 def substantive_span(text: str) -> tuple[int, int] | None:
     match = _SUBSTANTIVE_RE.search(text)
     return None if match is None else match.span()

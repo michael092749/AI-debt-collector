@@ -66,6 +66,24 @@ class Offer:
     def duration_days(self) -> int:
         return max(i.due_day_offset for i in self.installments)
 
+    @classmethod
+    def from_proposal(cls, proposal: ConsumerProposal, tier: Tier) -> Offer:
+        """Give an accepted proposal a schedule, so it can be agreed to and logged.
+
+        Only meaningful once the engine has ruled the proposal legal — it is
+        the consumer's own arrangement written down, not a new offer. The split
+        is the even one the engine validated, on the cadence they asked for.
+        """
+        interval = proposal.cadence.interval_days
+        return cls(
+            tier=tier,
+            installments=tuple(
+                Installment(amount, i * interval)
+                for i, amount in enumerate(proposal.even_installments)
+            ),
+            cadence=proposal.cadence,
+        )
+
 
 @dataclass(frozen=True)
 class ConsumerProposal:
