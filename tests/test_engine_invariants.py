@@ -176,3 +176,41 @@ class TestEnginePurity:
         assert Verdict.__dataclass_fields__.keys() >= {
             "outcome", "tier", "conditions", "counter", "rationale_code"
         }
+
+
+class TestSharedVocabulary:
+    """One definition per concept, across module boundaries.
+
+    Guardrails, negotiation, and audit were built independently and each
+    grew its own ``CallOutcome``/``EscalationTrigger``/``GuardrailRing``.
+    Two of the three overlapped closely enough to compare unequal in silence
+    rather than fail — a call that ended in agreement would have logged as if
+    it had not. Identity, not just structural equality, is the assertion.
+    """
+
+    def test_call_outcome_is_defined_once(self) -> None:
+        from collector import audit
+        from collector.negotiation import CallOutcome
+
+        assert audit.CallOutcome is CallOutcome
+
+    def test_escalation_trigger_is_defined_once(self) -> None:
+        from collector import audit
+        from collector.guardrails import EscalationTrigger
+
+        assert audit.EscalationTrigger is EscalationTrigger
+
+    def test_guardrail_ring_is_defined_once(self) -> None:
+        from collector import audit
+        from collector.guardrails import GuardrailRing
+
+        assert audit.GuardrailRing is GuardrailRing
+
+    def test_every_negotiation_outcome_is_loggable(self) -> None:
+        """The audit layer must be able to record any state the call can reach."""
+        from collector.audit.events import CallEnded
+        from collector.negotiation import CallOutcome
+
+        for outcome in CallOutcome:
+            event = CallEnded("call-1", outcome, turn_count=1, at="t1")
+            assert event.outcome is outcome

@@ -21,10 +21,18 @@ from collector.policy import PolicyConfig
 
 
 class CallOutcome(StrEnum):
+    """How the call ended. Defined once here and imported by the audit layer.
+
+    ``ABANDONED`` is never reached by a transition on this class — a call that
+    drops mid-negotiation leaves its state at ``IN_PROGRESS`` forever, and only
+    the audit layer, closing the record out, can say the call ended that way.
+    """
+
     IN_PROGRESS = "in_progress"
     AGREED = "agreed"
     ESCALATED = "escalated"
     NO_AGREEMENT = "no_agreement"
+    ABANDONED = "abandoned"
 
 
 @dataclass(frozen=True)
