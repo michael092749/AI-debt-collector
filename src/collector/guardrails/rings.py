@@ -1,0 +1,605 @@
+"""Guardrail rings — SPEC §5. Pre-call, during-call, post-call.
+
+``agent.py`` drives three entry points and threads the returned state through
+the call:
+
+    state  = GuardrailState.opening(policy)
+    pre    = check_pre_call(context)                 # §5.1, once
+    inbound  = check_inbound(state, consumer_text)   # §5.2, every consumer turn
+    outbound = check_outbound(state, candidate)      # §5.2, before every TTS call
+    summary  = finalize_call(state)                  # §5.3, once
+
+Every result carries the successor state and the full violation detail. Nothing
+here returns a bare boolean: the audit log is the deliverable, and "blocked" with
+no reason is not a record.
+
+Escalation follows A6 — there is no human queue in this build, so a dispute,
+hardship, distress, attorney or cease trigger stops negotiation, states that a
+human will follow up, closes politely, and writes an escalation record.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, replace
+from enum import StrEnum
+from typing import Literal
+
+from collector.guardrails.disclosures import (
+    DisclosureId,
+    DisclosureState,
+    is_substantive,
+)
+from collector.guardrails.numeric import (
+    AuthorizedFigures,
+    Figure,
+    authorized_for,
+    check_numeric,
+    extract_figures,
+)
+from collector.guardrails.prohibited import Severity, Violation, scan_prohibited
+from collector.policy import PolicyConfig
+
+Speaker = Literal["consumer", "agent", "system"]
+
+# Two blocked regenerations and the model has shown it will not comply on this
+# turn; a third attempt is just latency. Speak the scripted line instead.
+MAX_REGENERATION_STRIKES = 2
+
+SAFE_FALLBACK_TEXT = (
+    "I'd rather not misstate anything, so let me keep this simple. "
+    "What would work for you?"
+)
+
+
+class GuardrailRing(StrEnum):
+    PRE_CALL = "pre_call"
+    DURING_CALL = "during_call"
+    POST_CALL = "post_call"
+
+
+class RingRuleId(StrEnum):
+    """Stable identifiers. These appear in the audit log and must not churn."""
+
+    ACCOUNT_NOT_LOADED = "ACCOUNT_NOT_LOADED"
+    CALL_WINDOW_CLOSED = "CALL_WINDOW_CLOSED"
+    DO_NOT_CALL_FLAG = "DO_NOT_CALL_FLAG"
+    ATTORNEY_ON_FILE = "ATTORNEY_ON_FILE"
+    CEASE_ON_FILE = "CEASE_ON_FILE"
+    IDENTITY_NOT_CONFIRMED = "IDENTITY_NOT_CONFIRMED"
+    NEGOTIATION_AFTER_ESCALATION = "NEGOTIATION_AFTER_ESCALATION"
+    DISCLOSURE_NEVER_FIRED = "DISCLOSURE_NEVER_FIRED"
+    TRANSCRIPT_NOT_PERSISTED = "TRANSCRIPT_NOT_PERSISTED"
+
+
+class EscalationTrigger(StrEnum):
+    DISTRESS = "DISTRESS"
+    CEASE_AND_DESIST = "CEASE_AND_DESIST"
+    ATTORNEY_REPRESENTATION = "ATTORNEY_REPRESENTATION"
+    DISPUTE = "DISPUTE"
+    HARDSHIP = "HARDSHIP"
+
+
+# Order matters: several can match one sentence, and the record names the most
+# serious. Safety first, then the two that legally stop the call, then the rest.
+_TRIGGER_PRIORITY: tuple[EscalationTrigger, ...] = (
+    EscalationTrigger.DISTRESS,
+    EscalationTrigger.CEASE_AND_DESIST,
+    EscalationTrigger.ATTORNEY_REPRESENTATION,
+    EscalationTrigger.DISPUTE,
+    EscalationTrigger.HARDSHIP,
+)
+
+
+_TriggerRule = tuple[EscalationTrigger, re.Pattern[str]]
+
+
+def _trigger(trigger: EscalationTrigger, *alternatives: str) -> _TriggerRule:
+    return trigger, re.compile("|".join(alternatives), re.IGNORECASE)
+
+
+_ESCALATION_PATTERNS: tuple[_TriggerRule, ...] = (
+    _trigger(
+        EscalationTrigger.DISTRESS,
+        r"\bkill\s+myself\b",
+        r"\bend\s+my\s+life\b",
+        r"\bsuicid(?:e|al)\b",
+        r"\bhurt\s+myself\b",
+        r"\bnot\s+worth\s+living\b",
+        r"\bno\s+reason\s+to\s+(?:live|go\s+on)\b",
+        r"\bcan'?t\s+(?:go\s+on|take\s+(?:this|it)\s+any\s?more|do\s+this\s+any\s?more)\b",
+        r"\bpanic\s+attack\b",
+        r"\bhaving\s+a\s+breakdown\b",
+    ),
+    _trigger(
+        EscalationTrigger.CEASE_AND_DESIST,
+        r"\bcease\s+and\s+desist\b",
+        r"\bstop\s+call(?:ing|s)\b",
+        r"\bdon'?t\s+call\s+(?:me\s+)?(?:again|any\s?more|back)\b",
+        r"\bdo\s+not\s+(?:call|contact)\s+me\b",
+        r"\bnever\s+call\s+me\b",
+        r"\btake\s+me\s+off\s+your\s+(?:list|calling\s+list)\b",
+        r"\bremove\s+my\s+(?:number|name)\b",
+        r"\bstop\s+contacting\s+me\b",
+        r"\bin\s+writing\s+only\b",
+    ),
+    _trigger(
+        EscalationTrigger.ATTORNEY_REPRESENTATION,
+        r"\bmy\s+(?:lawyer|attorney|counsel)\b",
+        r"\brepresented\s+by\s+(?:an?\s+)?(?:lawyer|attorney|counsel)\b",
+        r"\bretained\s+(?:an?\s+)?(?:lawyer|attorney)\b",
+        r"\bhired\s+(?:an?\s+)?(?:lawyer|attorney)\b",
+        r"\btalk\s+to\s+my\s+(?:lawyer|attorney)\b",
+        r"\bgo\s+through\s+my\s+(?:lawyer|attorney)\b",
+        r"\ball\s+communication\s+through\s+(?:my\s+)?(?:lawyer|attorney|counsel)\b",
+    ),
+    _trigger(
+        EscalationTrigger.DISPUTE,
+        # "that much" is excluded on purpose: haggling over the amount is
+        # negotiation, not a dispute of the debt.
+        r"\bi\s+(?:don'?t|do\s+not)\s+owe\s+(?:this|that|it|you|anything|any\s+of\s+this)\b(?!\s+much)",
+        r"\bi\s+never\s+(?:owed|had|opened|took\s+out)\b",
+        r"\bthis\s+(?:is\s?n'?t|is\s+not)\s+(?:my|mine)\b",
+        r"\bnot\s+my\s+(?:debt|account|bill)\b",
+        r"\bi\s+dispute\b",
+        r"\bi'?m\s+disputing\b",
+        r"\bidentity\s+theft\b",
+        r"\b(?:someone|somebody)\s+(?:else\s+)?(?:used|stole)\s+my\b",
+        r"\b(?:send|mail)\s+me\s+(?:the\s+)?(?:proof|validation|verification|documentation)\b",
+        r"\bvalidat(?:e|ion)\s+(?:of\s+)?(?:the\s+|this\s+)?debt\b",
+        r"\bi\s+already\s+paid\s+(?:this|that|it)\b",
+        r"\bwrong\s+(?:person|number)\b",
+    ),
+    _trigger(
+        EscalationTrigger.HARDSHIP,
+        # Strong signals only. "I can't afford $500 a month" is a capacity
+        # signal for the decision engine, not an escalation.
+        r"\bi\s+(?:lost|just\s+lost)\s+my\s+job\b",
+        r"\bi'?m\s+(?:unemployed|out\s+of\s+work|homeless|disabled)\b",
+        r"\bon\s+disability\b",
+        r"\bno\s+income\b",
+        r"\bi\s+can'?t\s+(?:afford|pay)\s+anything\b",
+        r"\bcan'?t\s+afford\s+(?:food|rent|groceries|my\s+medication)\b",
+        r"\bbankrupt(?:cy)?\b",
+        r"\bchapter\s+(?:7|13|seven|thirteen)\b",
+        r"\bin\s+the\s+hospital\b",
+        r"\bterminally\s+ill\b",
+        r"\bmy\s+(?:husband|wife|spouse|son|daughter)\s+(?:died|passed\s+away)\b",
+        r"\bi'?m\s+(?:a\s+)?(?:widow|widower)\b",
+    ),
+)
+
+# The agent is still talking terms. Used only after an escalation has fired.
+_NEGOTIATION_RE = re.compile(
+    r"\b(?:offers?|offering|settle(?:ment)?|payment\s+plan|installments?|down\s?payment|"
+    r"pay\s+(?:today|now|off)|how\s+much\s+can\s+you|afford)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class EscalationSignal:
+    trigger: EscalationTrigger
+    span: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class EscalationRecord:
+    """Written on the first trigger. A6: negotiation stops here."""
+
+    trigger: EscalationTrigger
+    signals: tuple[EscalationSignal, ...]
+    consumer_utterance: str
+    turn_index: int
+    closing_line: str
+
+
+def detect_escalation(utterance: str) -> tuple[EscalationSignal, ...]:
+    """Escalation triggers in a *consumer* utterance, most serious first."""
+    signals: list[EscalationSignal] = []
+    for trigger, pattern in _ESCALATION_PATTERNS:
+        for match in pattern.finditer(utterance):
+            signals.append(
+                EscalationSignal(trigger, match.group(0), match.start(), match.end())
+            )
+    return tuple(signals)
+
+
+def escalation_closing(trigger: EscalationTrigger) -> str:
+    """The scripted close for each trigger. No figures, no persuasion, no promises."""
+    if trigger is EscalationTrigger.CEASE_AND_DESIST:
+        return (
+            "Understood. I'll note your request and pass it to a member of our team, "
+            "and we'll stop calling you about this. Thank you for your time."
+        )
+    if trigger is EscalationTrigger.DISTRESS:
+        return (
+            "I hear you, and this call is not worth your wellbeing. I'm going to stop here. "
+            "A member of our team will follow up, and there's nothing you need to do right now."
+        )
+    if trigger is EscalationTrigger.ATTORNEY_REPRESENTATION:
+        return (
+            "Thank you for telling me. I'm going to stop here and have a member of our team "
+            "take it from your representative directly. Have a good day."
+        )
+    if trigger is EscalationTrigger.DISPUTE:
+        return (
+            "Thank you for telling me. I'm going to stop here and have a member of our team "
+            "follow up with you in writing. Have a good day."
+        )
+    return (
+        "Thank you for telling me. I'm going to stop here and have a member of our team "
+        "follow up with you directly. Have a good day."
+    )
+
+
+# -- events ----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GuardrailEvent:
+    """One guardrail decision, retained for the post-call trail (SPEC §5.3)."""
+
+    ring: GuardrailRing
+    speaker: Speaker
+    turn_index: int
+    utterance: str
+    allowed: bool
+    violations: tuple[Violation, ...] = ()
+    escalations: tuple[EscalationSignal, ...] = ()
+
+
+# -- state -----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GuardrailState:
+    """Everything the rings remember. Frozen; each check returns its successor."""
+
+    authorized: AuthorizedFigures
+    disclosures: DisclosureState = DisclosureState()
+    identity_confirmed: bool = False
+    substantive_discussed: bool = False
+    strikes: int = 0
+    escalation: EscalationRecord | None = None
+    consumer_turns: int = 0
+    events: tuple[GuardrailEvent, ...] = ()
+
+    @classmethod
+    def opening(
+        cls, policy: PolicyConfig, *, authorized: AuthorizedFigures | None = None
+    ) -> GuardrailState:
+        return cls(authorized=authorized if authorized is not None else authorized_for(policy))
+
+    @property
+    def escalated(self) -> bool:
+        return self.escalation is not None
+
+    @property
+    def agent_turns(self) -> int:
+        return self.disclosures.agent_turns
+
+    def with_authorized(self, authorized: AuthorizedFigures) -> GuardrailState:
+        """Re-point the numeric guard at the engine's current offer set."""
+        return replace(self, authorized=authorized)
+
+    def with_identity_confirmed(self) -> GuardrailState:
+        return replace(self, identity_confirmed=True)
+
+    def _record(self, event: GuardrailEvent) -> GuardrailState:
+        return replace(self, events=(*self.events, event))
+
+
+# -- ring 1: pre-call (SPEC §5.1) ------------------------------------------
+
+
+@dataclass(frozen=True)
+class PreCallContext:
+    account_loaded: bool
+    within_calling_window: bool
+    do_not_call: bool = False
+    attorney_on_file: bool = False
+    cease_on_file: bool = False
+
+
+@dataclass(frozen=True)
+class PreCallCheck:
+    ring: GuardrailRing
+    allowed: bool
+    violations: tuple[Violation, ...]
+    event: GuardrailEvent
+
+
+def check_pre_call(context: PreCallContext) -> PreCallCheck:
+    """May this call be placed at all? Runs once, before dialing."""
+    checks: tuple[tuple[bool, RingRuleId, str], ...] = (
+        (context.account_loaded, RingRuleId.ACCOUNT_NOT_LOADED, "no account context loaded"),
+        (
+            context.within_calling_window,
+            RingRuleId.CALL_WINDOW_CLOSED,
+            "outside the permitted calling window",
+        ),
+        (not context.do_not_call, RingRuleId.DO_NOT_CALL_FLAG, "do-not-call flag on the account"),
+        (
+            not context.attorney_on_file,
+            RingRuleId.ATTORNEY_ON_FILE,
+            "consumer is represented by counsel; contact the representative instead",
+        ),
+        (
+            not context.cease_on_file,
+            RingRuleId.CEASE_ON_FILE,
+            "cease-and-desist on file; no further contact",
+        ),
+    )
+    violations = tuple(
+        Violation(rule_id, Severity.BLOCK, "", 0, 0, f"{rule_id}: {detail}")
+        for passed, rule_id, detail in checks
+        if not passed
+    )
+    event = GuardrailEvent(
+        ring=GuardrailRing.PRE_CALL,
+        speaker="system",
+        turn_index=0,
+        utterance="",
+        allowed=not violations,
+        violations=violations,
+    )
+    return PreCallCheck(GuardrailRing.PRE_CALL, not violations, violations, event)
+
+
+# -- ring 2: during-call, inbound ------------------------------------------
+
+
+@dataclass(frozen=True)
+class InboundCheck:
+    """Result of checking what the *consumer* said."""
+
+    ring: GuardrailRing
+    utterance: str
+    escalations: tuple[EscalationSignal, ...]
+    escalation: EscalationRecord | None
+    ai_disclosure_requested: bool
+    state: GuardrailState
+
+    @property
+    def escalated(self) -> bool:
+        return self.escalation is not None
+
+    @property
+    def closing_line(self) -> str | None:
+        return None if self.escalation is None else self.escalation.closing_line
+
+
+def check_inbound(state: GuardrailState, utterance: str) -> InboundCheck:
+    """Pre-turn ring: read the consumer's utterance for escalation and disclosure demands.
+
+    Prohibited-persuasion scanning is deliberately *not* applied here. "Are you
+    going to sue me?" is the consumer's question, not the agent's threat.
+    """
+    signals = detect_escalation(utterance)
+    disclosures = state.disclosures.observe_consumer(utterance)
+    turn_index = state.consumer_turns
+
+    escalation = state.escalation
+    if escalation is None and signals:
+        trigger = min(signals, key=lambda s: _TRIGGER_PRIORITY.index(s.trigger)).trigger
+        escalation = EscalationRecord(
+            trigger=trigger,
+            signals=signals,
+            consumer_utterance=utterance,
+            turn_index=turn_index,
+            closing_line=escalation_closing(trigger),
+        )
+
+    event = GuardrailEvent(
+        ring=GuardrailRing.DURING_CALL,
+        speaker="consumer",
+        turn_index=turn_index,
+        utterance=utterance,
+        allowed=True,  # consumer speech is never blocked; it is only read
+        escalations=signals,
+    )
+    new_state = replace(
+        state,
+        disclosures=disclosures,
+        escalation=escalation,
+        consumer_turns=state.consumer_turns + 1,
+    )._record(event)
+
+    return InboundCheck(
+        ring=GuardrailRing.DURING_CALL,
+        utterance=utterance,
+        escalations=signals,
+        escalation=escalation,
+        ai_disclosure_requested=disclosures.ai_disclosure_requested,
+        state=new_state,
+    )
+
+
+# -- ring 2: during-call, outbound (pre-TTS) -------------------------------
+
+
+@dataclass(frozen=True)
+class OutboundCheck:
+    """Result of checking a candidate agent utterance before TTS synthesis."""
+
+    ring: GuardrailRing
+    candidate: str
+    allowed: bool
+    violations: tuple[Violation, ...]
+    figures: tuple[Figure, ...]
+    strikes: int
+    fallback_text: str | None
+    state: GuardrailState
+
+    @property
+    def blocking_violations(self) -> tuple[Violation, ...]:
+        return tuple(v for v in self.violations if v.blocking)
+
+    @property
+    def speak(self) -> str | None:
+        """What to actually synthesize: the candidate, the fallback, or nothing."""
+        if self.allowed:
+            return self.candidate
+        return self.fallback_text
+
+    def regeneration_note(self) -> str:
+        """The violation named back to the model so the retry is informed, per SPEC §5.2."""
+        return "; ".join(v.detail for v in self.blocking_violations)
+
+
+def check_outbound(
+    state: GuardrailState,
+    candidate: str,
+    *,
+    authorized: AuthorizedFigures | None = None,
+) -> OutboundCheck:
+    """The pre-TTS gate. Nothing reaches the consumer's ear without passing here."""
+    figure_set = authorized if authorized is not None else state.authorized
+    violations: list[Violation] = []
+    violations.extend(scan_prohibited(candidate))
+    violations.extend(check_numeric(candidate, figure_set))
+    violations.extend(state.disclosures.check_agent_turn(candidate))
+
+    substantive = is_substantive(candidate)
+    if substantive and not state.identity_confirmed:
+        violations.append(
+            _ring_violation(
+                RingRuleId.IDENTITY_NOT_CONFIRMED,
+                candidate,
+                "no balance or terms before the consumer's identity is confirmed (SPEC §5.1)",
+            )
+        )
+    if state.escalated and _NEGOTIATION_RE.search(candidate) is not None:
+        violations.append(
+            _ring_violation(
+                RingRuleId.NEGOTIATION_AFTER_ESCALATION,
+                candidate,
+                "negotiation stops at escalation; close politely and hand off (A6)",
+            )
+        )
+
+    blocking = [v for v in violations if v.blocking]
+    allowed = not blocking
+    strikes = 0 if allowed else state.strikes + 1
+    fallback = None if allowed or strikes < MAX_REGENERATION_STRIKES else _fallback_for(state)
+
+    event = GuardrailEvent(
+        ring=GuardrailRing.DURING_CALL,
+        speaker="agent",
+        turn_index=state.agent_turns,
+        utterance=candidate,
+        allowed=allowed,
+        violations=tuple(violations),
+    )
+    new_state = replace(
+        state,
+        disclosures=state.disclosures.observe_agent(candidate) if allowed else state.disclosures,
+        substantive_discussed=state.substantive_discussed or (allowed and substantive),
+        strikes=strikes,
+    )._record(event)
+
+    return OutboundCheck(
+        ring=GuardrailRing.DURING_CALL,
+        candidate=candidate,
+        allowed=allowed,
+        violations=tuple(violations),
+        figures=extract_figures(candidate),
+        strikes=strikes,
+        fallback_text=fallback,
+        state=new_state,
+    )
+
+
+def _fallback_for(state: GuardrailState) -> str:
+    if state.escalation is not None:
+        return state.escalation.closing_line
+    return SAFE_FALLBACK_TEXT
+
+
+def _ring_violation(rule_id: RingRuleId, candidate: str, detail: str) -> Violation:
+    return Violation(
+        rule_id=rule_id,
+        severity=Severity.BLOCK,
+        span=candidate,
+        start=0,
+        end=len(candidate),
+        detail=f"{rule_id}: {detail}",
+    )
+
+
+# -- ring 3: post-call (SPEC §5.3) -----------------------------------------
+
+
+@dataclass(frozen=True)
+class CallSummary:
+    ring: GuardrailRing
+    compliant: bool
+    blocked_turns: int
+    agent_turns: int
+    violations: tuple[Violation, ...]
+    disclosures_fired: tuple[DisclosureId, ...]
+    missing_disclosures: tuple[DisclosureId, ...]
+    escalation: EscalationRecord | None
+    events: tuple[GuardrailEvent, ...]
+
+
+def finalize_call(state: GuardrailState, *, transcript_persisted: bool = True) -> CallSummary:
+    """Post-call ring: score the trace and hand the audit layer a finished record.
+
+    A blocked turn is *not* a compliance failure — it is the guard working. What
+    fails a call is a disclosure that never fired at all, or a transcript that
+    was never written.
+    """
+    violations: list[Violation] = [v for e in state.events for v in e.violations]
+
+    if state.substantive_discussed and DisclosureId.MINI_MIRANDA not in state.disclosures.fired:
+        violations.append(
+            _post_violation(
+                RingRuleId.DISCLOSURE_NEVER_FIRED,
+                "the call discussed the debt but the Mini-Miranda never fired",
+            )
+        )
+    if state.agent_turns and DisclosureId.AI_DISCLOSURE not in state.disclosures.fired:
+        violations.append(
+            _post_violation(
+                RingRuleId.DISCLOSURE_NEVER_FIRED,
+                "the agent spoke without ever disclosing it is an AI",
+            )
+        )
+    if not transcript_persisted:
+        violations.append(
+            _post_violation(
+                RingRuleId.TRANSCRIPT_NOT_PERSISTED,
+                "the transcript was not persisted; SPEC §5.3 requires it",
+            )
+        )
+
+    blocked_turns = sum(1 for e in state.events if not e.allowed)
+    post_only = tuple(v for v in violations if v.rule_id in _POST_RULE_IDS)
+
+    return CallSummary(
+        ring=GuardrailRing.POST_CALL,
+        compliant=not post_only,
+        blocked_turns=blocked_turns,
+        agent_turns=state.agent_turns,
+        violations=tuple(violations),
+        disclosures_fired=tuple(d for d in DisclosureId if d in state.disclosures.fired),
+        missing_disclosures=state.disclosures.missing,
+        escalation=state.escalation,
+        events=state.events,
+    )
+
+
+# Compared by value, not membership in a set of enum members: a ``Violation``
+# carries its rule id as a plain str.
+_POST_RULE_IDS: tuple[str, ...] = (
+    RingRuleId.DISCLOSURE_NEVER_FIRED,
+    RingRuleId.TRANSCRIPT_NOT_PERSISTED,
+)
+
+
+def _post_violation(rule_id: RingRuleId, detail: str) -> Violation:
+    return Violation(rule_id, Severity.BLOCK, "", 0, 0, f"{rule_id}: {detail}")
