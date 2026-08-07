@@ -358,16 +358,19 @@ class MockLLMClient:
             )
 
         offer = payload.get("offer_on_the_table")
+        # The engine's own repeat-back, when it sent one. Asking for assent in
+        # the mock's own words would not clear the commitment gate, and a stand-in
+        # for a compliant model has to be able to close a call.
+        confirm = payload.get("you_must_confirm")
+        ask = str(confirm) if isinstance(confirm, str) else "Can I get your okay on that?"
+
         if payload.get("outcome") == "accept":
-            return LLMResponse(text=f"{self._describe(offer)} Can I get your okay on that?")
+            return LLMResponse(text=f"{self._describe(offer)} {ask}")
         if payload.get("moved") is False:
             # Nothing below this is available. Restating the same terms as a
             # concession is worse than saying plainly that this is the floor.
             return LLMResponse(
-                text=(
-                    f"I've gone as far as I'm able to on this one. {self._describe(offer)} "
-                    "Is there any way that works?"
-                )
+                text=f"I've gone as far as I'm able to on this one. {self._describe(offer)} {ask}"
             )
         if offer:
             if "rationale_code" not in payload and "moved" not in payload:
@@ -377,9 +380,9 @@ class MockLLMClient:
                 # "how much do I owe"). "Here's what I can do instead" is
                 # only true after a refusal — reusing it here misrepresents
                 # the plain balance as a fallback concession.
-                return LLMResponse(text=self._describe(offer, lead="You currently owe"))
+                return LLMResponse(text=f"{self._describe(offer, lead='You currently owe')} {ask}")
             reason = self._reason(payload.get("rationale_code"))
-            return LLMResponse(text=f"{reason} {self._describe(offer)}")
+            return LLMResponse(text=f"{reason} {self._describe(offer)} {ask}")
         return LLMResponse(text="Thank you for that. Let me see what I can do.")
 
     def _describe(self, offer: object, *, lead: str = "That's") -> str:

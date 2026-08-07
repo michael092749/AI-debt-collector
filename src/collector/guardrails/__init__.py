@@ -12,6 +12,11 @@ lands in the audit log.
     )
 """
 
+from collector.guardrails.confirmation import (
+    ConfirmationRuleId,
+    confirmation_line,
+    repeats_back,
+)
 from collector.guardrails.disclosures import (
     AI_DISCLOSURE_TEXT,
     MINI_MIRANDA_TEXT,
@@ -71,6 +76,7 @@ __all__ = [
     "SAFE_FALLBACK_TEXT",
     "AuthorizedFigures",
     "CallSummary",
+    "ConfirmationRuleId",
     "DisclosureId",
     "DisclosureRuleId",
     "DisclosureState",
@@ -97,6 +103,7 @@ __all__ = [
     "check_numeric",
     "check_outbound",
     "check_pre_call",
+    "confirmation_line",
     "detect_escalation",
     "escalation_closing",
     "extract_figures",
@@ -106,6 +113,7 @@ __all__ = [
     "fires_mini_miranda",
     "is_prohibited",
     "is_substantive",
+    "repeats_back",
     "requests_ai_disclosure",
     "scan_prohibited",
 ]
