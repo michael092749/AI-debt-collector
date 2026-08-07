@@ -30,6 +30,7 @@ from collector.decision_engine import (
     effective_capacity,
     validate_offer,
 )
+from collector.guardrails.confirmation import confirmation_line
 from collector.llm.base import ToolCall
 from collector.money import Money
 from collector.negotiation import CallOutcome, NegotiationState
@@ -458,6 +459,7 @@ def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult
         "conditions": [to_jsonable(c) for c in verdict.conditions],
         "offer_on_the_table": _offer_payload(on_table),
         "you_may_say": _sayable(on_table),
+        "you_must_confirm": _confirmation(on_table),
     }
     return ToolResult(
         name=name,
@@ -486,6 +488,7 @@ def _propose_offer(args: JsonDict, context: ToolContext) -> ToolResult:
             "ok": True,
             "offer_on_the_table": _offer_payload(offer),
             "you_may_say": _sayable(offer),
+            "you_must_confirm": _confirmation(offer),
         },
         context=context._with(state),
         offer=offer,
@@ -567,6 +570,7 @@ def _concede(args: JsonDict, context: ToolContext) -> ToolResult:
             "moved": moved,
             "offer_on_the_table": _offer_payload(on_table),
             "you_may_say": _sayable(on_table),
+            "you_must_confirm": _confirmation(on_table),
         },
         context=context._with(state),
         offer=on_table,
@@ -737,6 +741,17 @@ def _offer_payload(offer: Offer | None) -> JsonDict | None:
         ],
         "duration_days": offer.duration_days,
     }
+
+
+def _confirmation(offer: Offer | None) -> str | None:
+    """The line that has to be said before these terms can be agreed to.
+
+    Handed over with the offer rather than only at the point of refusal, so the
+    model reads it while it is deciding what to say — the gate in ``agent.py``
+    is then a backstop for the turn that skipped it, not the first the model
+    hears of the requirement.
+    """
+    return None if offer is None else confirmation_line(offer)
 
 
 def _sayable(offer: Offer | None) -> list[str]:

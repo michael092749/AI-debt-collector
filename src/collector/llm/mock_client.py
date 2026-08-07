@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from collector.guardrails.disclosures import (
-    AI_DISCLOSURE_TEXT,
+    AI_DISCLOSURE_WITH_HUMAN,
     MINI_MIRANDA_TEXT,
     confirms_identity,
     fires_mini_miranda,
@@ -216,7 +216,7 @@ class MockLLMClient:
         if last is not None and last.role == "system" and len(messages) > 1:
             return LLMResponse(text=self._after_block(last.content))
         if last is not None and last.role == "tool":
-            return self._speak_from_tool(last.content)
+            return self._speak_from_tool(last.content, messages)
         if not self._has_spoken(messages):
             return LLMResponse(text=self._opening())
         if last is not None and last.role == "consumer":
@@ -226,11 +226,20 @@ class MockLLMClient:
     # -- turns -------------------------------------------------------------
 
     def _opening(self) -> str:
-        """Identity first, and the AI disclosure with it. No account details:
-        nothing substantive may be said before they confirm who they are."""
+        """Greeting, disclosure and identity question in one breath.
+
+        Written out rather than assembled from ``AI_DISCLOSURE_TEXT`` because
+        the point is that it is *one sentence* — the disclosure is a clause in
+        the greeting, not a sentence of its own ahead of it. What keeps it
+        honest is ``fires_ai_disclosure``, which is the same detector the guard
+        uses, so the phrasing cannot drift out of compliance unnoticed.
+
+        No account details: nothing substantive may be said before they confirm
+        who they are. The offer of a human is held back until it is relevant.
+        """
         return (
-            f"Hi, this is Avery calling from Meridian Recovery Services. {AI_DISCLOSURE_TEXT} "
-            "Am I speaking with the account holder?"
+            "Hi, this is an automated assistant calling from Meridian Recovery "
+            "Services — am I speaking with the account holder?"
         )
 
     def _on_consumer(self, said: str, messages: tuple[Message, ...]) -> LLMResponse:
@@ -241,20 +250,29 @@ class MockLLMClient:
         # AI_DISCLOSURE_REQUEST_IGNORED on every later candidate — including
         # ones about something else entirely — and the call never recovers
         # since nothing here ever actually fires the disclosure again.
+        #
+        # Every branch here answers a question the consumer actually asked, so
+        # each speaks the full disclosure: being asked what you are is the
+        # moment the offer of a person stops being throat-clearing and becomes
+        # the answer. The opening holds that half back precisely because nobody
+        # has asked yet.
         if requests_ai_disclosure(said):
             if not self._identity_confirmed(messages):
                 return LLMResponse(
-                    text=f"{AI_DISCLOSURE_TEXT} Am I speaking with the account holder?"
+                    text=f"{AI_DISCLOSURE_WITH_HUMAN} Am I speaking with the account holder?"
                 )
             if not self._disclosed(messages):
                 return LLMResponse(
                     text=(
-                        f"{AI_DISCLOSURE_TEXT} {MINI_MIRANDA_TEXT} I'm calling about an "
+                        f"{AI_DISCLOSURE_WITH_HUMAN} {MINI_MIRANDA_TEXT} I'm calling about an "
                         "overdue account, and I'd like to find something that works for you."
                     )
                 )
             return LLMResponse(
-                text=f"{AI_DISCLOSURE_TEXT} Now, back to your account — what would work for you?"
+                text=(
+                    f"{AI_DISCLOSURE_WITH_HUMAN} Now, back to your account — "
+                    "what would work for you?"
+                )
             )
 
         # Identity, then the Mini-Miranda, then anything about the account. The
@@ -264,12 +282,11 @@ class MockLLMClient:
         if not self._identity_confirmed(messages):
             return LLMResponse(text="I'm sorry — am I speaking with the account holder?")
         if not self._disclosed(messages):
-            return LLMResponse(
-                text=(
-                    f"Thank you. {MINI_MIRANDA_TEXT} I'm calling about an overdue "
-                    "account, and I'd like to find something that works for you."
-                )
-            )
+            # Straight to the engine rather than spending this turn on the
+            # notice alone. The notice and the balance go out together in
+            # ``_speak_from_tool``: a turn that discloses and then stops has
+            # cost the consumer a round trip to hear nothing they can act on.
+            return LLMResponse(tool_calls=(ToolCall(name="propose_offer"),))
 
         if _DONE_RE.search(said):
             return LLMResponse(
@@ -332,8 +349,23 @@ class MockLLMClient:
 
     # -- reading the conversation back -------------------------------------
 
-    def _speak_from_tool(self, content: str) -> LLMResponse:
+    def _speak_from_tool(self, content: str, messages: tuple[Message, ...]) -> LLMResponse:
         payload = _load(content)
+        # The notice rides out with the first figures, so it must not ride out
+        # *only* with them: a tool round that errors used to leave it unsaid for
+        # the whole call, and the consumer heard a filler line instead of the
+        # one sentence the law requires. It goes on the front of whatever this
+        # turn says, successful round or not.
+        #
+        # Gated on identity as well as on having disclosed, because the notice
+        # says "collect a debt" and that is substantive — prepending it to the
+        # refusal an identity-gated tool just returned would be blocked, and
+        # spend strikes doing it.
+        notice = (
+            ""
+            if self._disclosed(messages) or not self._identity_confirmed(messages)
+            else f"{MINI_MIRANDA_TEXT} "
+        )
         if not payload.get("ok"):
             if "end_call" in str(payload.get("error", "")):
                 # Every tool refuses this way once the round cap is hit
@@ -349,7 +381,9 @@ class MockLLMClient:
                         ),
                     )
                 )
-            return LLMResponse(text="Give me one moment — let me check what I can do here.")
+            return LLMResponse(
+                text=f"{notice}Give me one moment — let me check what I can do here."
+            )
 
         if payload.get("agreed"):
             agreement = payload.get("agreement") or {}
@@ -358,15 +392,24 @@ class MockLLMClient:
             )
 
         offer = payload.get("offer_on_the_table")
+        # The engine's own repeat-back, when it sent one. Asking for assent in
+        # the mock's own words would not clear the commitment gate, and a stand-in
+        # for a compliant model has to be able to close a call.
+        confirm = payload.get("you_must_confirm")
+        ask = str(confirm) if isinstance(confirm, str) else "Can I get your okay on that?"
+        # The notice has to lead the sentence: the ordering check compares where
+        # it fired against where the money talk starts, so a notice that trails
+        # the balance is blocked even though the words were all said.
+
         if payload.get("outcome") == "accept":
-            return LLMResponse(text=f"{self._describe(offer)} Can I get your okay on that?")
+            return LLMResponse(text=f"{notice}{self._describe(offer)} {ask}")
         if payload.get("moved") is False:
             # Nothing below this is available. Restating the same terms as a
             # concession is worse than saying plainly that this is the floor.
             return LLMResponse(
                 text=(
-                    f"I've gone as far as I'm able to on this one. {self._describe(offer)} "
-                    "Is there any way that works?"
+                    f"{notice}I've gone as far as I'm able to on this one. "
+                    f"{self._describe(offer)} {ask}"
                 )
             )
         if offer:
@@ -377,10 +420,12 @@ class MockLLMClient:
                 # "how much do I owe"). "Here's what I can do instead" is
                 # only true after a refusal — reusing it here misrepresents
                 # the plain balance as a fallback concession.
-                return LLMResponse(text=self._describe(offer, lead="You currently owe"))
+                return LLMResponse(
+                    text=f"{notice}{self._describe(offer, lead='You currently owe')} {ask}"
+                )
             reason = self._reason(payload.get("rationale_code"))
-            return LLMResponse(text=f"{reason} {self._describe(offer)}")
-        return LLMResponse(text="Thank you for that. Let me see what I can do.")
+            return LLMResponse(text=f"{notice}{reason} {self._describe(offer)} {ask}")
+        return LLMResponse(text=f"{notice}Let me see what I can do.")
 
     def _describe(self, offer: object, *, lead: str = "That's") -> str:
         """Read back an engine-authored offer using only its own figures."""

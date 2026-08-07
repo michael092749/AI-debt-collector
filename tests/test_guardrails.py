@@ -40,6 +40,7 @@ from collector.guardrails import (
     check_numeric,
     check_outbound,
     check_pre_call,
+    confirms_identity,
     detect_escalation,
     escalation_closing,
     extract_figures,
@@ -901,6 +902,99 @@ class TestDisclosureGating:
         assert not state.ai_disclosure_requested
 
 
+class TestTheOnlyOpeningOrderTheGuardsAdmit:
+    """The opening sequence, walked through the production gate.
+
+    Three rules intersect here, and only one order satisfies all three:
+
+    * ``AI_DISCLOSURE_MISSING_AT_OPEN`` — turn one must say it is an AI.
+    * ``IDENTITY_NOT_CONFIRMED`` — nothing substantive before they confirm.
+    * ``MINI_MIRANDA_NOT_FIRED`` / ``_OUT_OF_ORDER`` — the notice leads the
+      first substantive turn.
+
+    The trap is that ``MINI_MIRANDA_TEXT`` is *itself* substantive — it says
+    "collect a debt" — so the notice cannot be moved earlier to be safe. Fire
+    it before identity is confirmed and it trips ``IDENTITY_NOT_CONFIRMED``
+    instead. ``mock_client.py:260-263`` states this rule in a comment and its
+    scripted turns obey it; ``SYSTEM_PROMPT`` is what drives the production
+    model, and these cases are the order it has to encode.
+
+    Production tripped ``MINI_MIRANDA_OUT_OF_ORDER`` then
+    ``MINI_MIRANDA_NOT_FIRED`` on the first substantive turn of both observed
+    calls, costing a full regeneration round-trip each time
+    (FINDINGS-2026-08-07.md Part 2, fix #1)."""
+
+    def test_the_notice_is_itself_substantive(self) -> None:
+        """The premise the rest of the class rests on. If this ever stops being
+        true, the ordering below is over-constrained and can be relaxed."""
+        assert is_substantive(MINI_MIRANDA_TEXT)
+        assert not is_substantive(AI_DISCLOSURE_TEXT)
+
+    def test_turn_one_discloses_the_ai_and_names_nothing_substantive(
+        self, policy: PolicyConfig
+    ) -> None:
+        result = check_outbound(
+            GuardrailState.opening(policy),
+            "Hi — this is an AI assistant calling from Meridian Recovery Services "
+            "on behalf of the creditor, and you can ask for a human at any time. "
+            "Am I speaking with Jordan Reyes?",
+        )
+        assert result.allowed, result.violations
+
+    def test_turn_one_that_names_the_debt_is_blocked(self, policy: PolicyConfig) -> None:
+        """Why the prompt has to bar money words from the opening outright: the
+        model cannot fix this by adding the notice, because the notice is
+        substantive too and identity is still unconfirmed."""
+        result = check_outbound(
+            GuardrailState.opening(policy),
+            "Hi — this is an AI assistant calling about a debt you owe. "
+            "Am I speaking with Jordan Reyes?",
+        )
+        assert not result.allowed
+        assert {
+            RingRuleId.IDENTITY_NOT_CONFIRMED,
+            DisclosureRuleId.MINI_MIRANDA_NOT_FIRED,
+        } <= rule_ids(result.violations)
+
+    def test_the_notice_before_identity_is_confirmed_is_blocked(self, policy: PolicyConfig) -> None:
+        opened = check_outbound(
+            GuardrailState.opening(policy),
+            f"{AI_DISCLOSURE_TEXT} Am I speaking with Jordan Reyes?",
+        )
+        assert opened.allowed, opened.violations
+
+        early = check_outbound(opened.state, MINI_MIRANDA_TEXT)
+        assert not early.allowed
+        assert RingRuleId.IDENTITY_NOT_CONFIRMED in rule_ids(early.violations)
+
+    def test_the_notice_leads_the_turn_after_identity_is_confirmed(
+        self, policy: PolicyConfig
+    ) -> None:
+        opened = check_outbound(
+            GuardrailState.opening(policy),
+            f"{AI_DISCLOSURE_TEXT} Am I speaking with Jordan Reyes?",
+        )
+        assert confirms_identity("Yes, speaking.")
+        confirmed = opened.state.with_identity_confirmed()
+
+        result = check_outbound(confirmed, f"{MINI_MIRANDA_TEXT} Your balance is $1,000.00.")
+        assert result.allowed, result.violations
+        assert result.state.substantive_discussed
+
+    def test_the_same_turn_with_the_notice_trailing_is_blocked(self, policy: PolicyConfig) -> None:
+        """The negative control, and the shape production actually emitted."""
+        opened = check_outbound(
+            GuardrailState.opening(policy),
+            f"{AI_DISCLOSURE_TEXT} Am I speaking with Jordan Reyes?",
+        )
+        result = check_outbound(
+            opened.state.with_identity_confirmed(),
+            f"Your balance is $1,000.00. {MINI_MIRANDA_TEXT}",
+        )
+        assert not result.allowed
+        assert DisclosureRuleId.MINI_MIRANDA_OUT_OF_ORDER in rule_ids(result.violations)
+
+
 # ==========================================================================
 # Escalation — A6: a trigger ends the call, there is no human queue here
 # ==========================================================================
@@ -1600,6 +1694,13 @@ class TestEscalationRegexFalsePositives:
         "Right, um... so, the total comes to one thousand dollars.",
         "Hmm... I hear you. Let me check what else there is.",
         "Uh... give me one second.",
+        # The two disclosures. Same trap, higher stakes: the prompt has to tell
+        # the model *when* to say these, and the moment it quotes one to say
+        # what it is, saying it becomes CONFIDENTIAL_TEXT_LEAKED — so the
+        # required turn is unsayable and the call cannot legally proceed.
+        # Describe the disclosures in the prompt; never transcribe them.
+        MINI_MIRANDA_TEXT,
+        AI_DISCLOSURE_TEXT,
     ],
 )
 def test_filler_speech_is_not_mistaken_for_a_prompt_leak(candidate: str) -> None:
@@ -1617,6 +1718,17 @@ def test_filler_speech_is_not_mistaken_for_a_prompt_leak(candidate: str) -> None
         f"{candidate!r} overlaps SYSTEM_PROMPT by {_LEAK_MIN_WORDS}+ words — "
         "shorten the example it came from"
     )
+
+
+@pytest.mark.parametrize("candidate", [MINI_MIRANDA_TEXT, AI_DISCLOSURE_TEXT])
+def test_the_disclosures_survive_the_wider_reference_production_uses(candidate: str) -> None:
+    """``check_outbound``'s default reference is the system prompt alone, but
+    ``agent.py`` passes a wider one that also covers the tool-schema text. A
+    disclosure made unsayable by a *tool description* would fail exactly the
+    same way, and only in production."""
+    from collector.agent import _CONFIDENTIAL_REFERENCE
+
+    assert not _contains_verbatim_leak(candidate, _CONFIDENTIAL_REFERENCE)
 
 
 def test_the_leak_guard_still_catches_a_real_prompt_leak() -> None:

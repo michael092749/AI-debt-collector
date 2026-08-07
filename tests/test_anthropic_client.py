@@ -17,13 +17,14 @@ through and killed the call. These tests pin the statuses, not the hierarchy.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
 import pytest
 
-from collector.llm.anthropic_client import AnthropicClient
-from collector.llm.base import LLMResponse, Message, StreamCompleted
+from collector.llm.anthropic_client import AnthropicClient, _cached_transcript, _to_anthropic
+from collector.llm.base import LLMResponse, Message, StreamCompleted, ToolCall, system_prompt
 
 FAKE_KEY = "sk-ant-not-a-real-key"
 
@@ -226,3 +227,166 @@ class TestResponseAssembly:
         )
         assert response.text == "Hello."
         assert response.usage is not None and response.usage.output_tokens == 0
+
+
+class TestPromptCaching:
+    """What a turn's second, third and fourth model calls stop paying for.
+
+    ``stream_turn`` can make five sequential calls for one spoken reply, each
+    re-sending the whole growing transcript plus the system prompt plus six tool
+    schemas. Two ``cache_control`` breakpoints turn that into one full-price
+    prefix per call instead of five.
+
+    **These tests certify shape, not savings.** A cache hit is only observable
+    as a non-zero ``cache_read_input_tokens`` from the live API, and a prefix
+    under the model's 1024-token minimum caches nothing at all while reporting
+    no error. So what is pinned here is everything that would silently cost
+    every hit if it drifted: where the breakpoints sit, that there are few
+    enough of them, and that the cached prefix is byte-identical between calls.
+    The live signal is ``cache_read_tokens`` on the ``ModelCalled`` row, which
+    ``_usage`` already reads and ``estimate_cost`` already prices.
+    """
+
+    def _sent(self, messages: tuple[Message, ...]) -> dict[str, Any]:
+        """The kwargs the SDK would have received."""
+        seen: dict[str, Any] = {}
+        client = _client()
+
+        class _Captures:
+            def create(self, **kwargs: Any) -> Any:
+                seen.update(kwargs)
+                return _Message(content=[], stop_reason="end_turn", usage=_Usage(), model="m")
+
+        client._client.messages = _Captures()  # type: ignore[assignment]
+        client.respond(messages)
+        return seen
+
+    @staticmethod
+    def _breakpoints(request: dict[str, Any]) -> int:
+        """Every marked block in the request, ``tools`` included — the API's
+        ceiling of four counts those too, so a count that skipped them could
+        report three while the request carried five."""
+        blocks = [*request["tools"], *request["system"]]
+        for message in request["messages"]:
+            content = message["content"]
+            if not isinstance(content, str):
+                blocks.extend(content)
+        return sum("cache_control" in block for block in blocks)
+
+    def _conversation(self) -> tuple[Message, ...]:
+        return (
+            system_prompt(consumer_name="Dana", account_ref="A-1"),
+            Message(role="consumer", content="Yes, speaking."),
+            Message(role="agent", content="Thanks for confirming."),
+            Message(role="consumer", content="I can do fifty a month."),
+        )
+
+    def _mid_turn(self) -> tuple[Message, ...]:
+        """A transcript whose last entry is an engine result — the shape every
+        round after the first actually sends, and the one the compounding win
+        depends on. ``_tool_exchange`` expands it into an assistant ``tool_use``
+        followed by a user ``tool_result``, so the breakpoint lands on a
+        ``tool_result`` block rather than on plain text."""
+        call = ToolCall(name="validate_consumer_offer", arguments={}, call_id="toolu_abc")
+        return (
+            *self._conversation(),
+            Message(role="tool", content='{"ok": true}', tool_call=call),
+        )
+
+    def test_the_system_prompt_carries_a_breakpoint_and_so_covers_the_tools(self) -> None:
+        """Render order is tools, then system, then messages, so one breakpoint
+        on the last system block caches the six tool schemas with it. That is
+        why there is no separate breakpoint on the tools."""
+        request = self._sent(self._conversation())
+
+        assert isinstance(request["system"], list), "a bare string has nowhere to put cache_control"
+        assert request["system"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert "collections representative" in request["system"][-1]["text"]
+
+    def test_the_end_of_the_transcript_carries_a_breakpoint(self) -> None:
+        """The one that compounds inside a turn: round two reads the prefix
+        round one wrote."""
+        request = self._sent(self._conversation())
+
+        last = request["messages"][-1]["content"]
+        assert not isinstance(last, str), "a string content block cannot be marked"
+        assert last[-1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_the_breakpoints_stay_under_the_ceiling(self) -> None:
+        """Four per request, and the API rejects a fifth outright — so a third
+        breakpoint added later has to be a decision, not an accident."""
+        assert self._breakpoints(self._sent(self._conversation())) <= 4
+
+    def test_the_opening_call_is_marked_too(self) -> None:
+        """``open_call`` sends only the system prompt. It is the request that
+        *writes* the entry the first turn reads, so leaving it unmarked would
+        make every call pay full price for its first two model calls."""
+        request = self._sent((system_prompt(consumer_name="Dana", account_ref="A-1"),))
+
+        assert request["system"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert self._breakpoints(request) >= 1
+
+    def test_the_cached_prefix_is_byte_identical_between_calls(self) -> None:
+        """The silent-invalidator guard. Caching is a prefix match, so anything
+        non-deterministic in the tool schemas or the system prompt — an unsorted
+        ``json.dumps``, a timestamp, a set iteration — costs every hit on every
+        call and reports nothing. Compared as serialized bytes, because that is
+        what the cache key is derived from."""
+        first = self._sent(self._conversation())
+        second = self._sent(self._conversation())
+
+        assert json.dumps(first["tools"]) == json.dumps(second["tools"])
+        assert json.dumps(first["system"]) == json.dumps(second["system"])
+
+    def test_a_tool_result_carries_the_breakpoint_without_losing_its_shape(self) -> None:
+        """Round two onward is where caching earns the write premium, and round
+        two's last block is a ``tool_result``, not text. Marking it must leave
+        ``tool_use_id`` and ``type`` intact: a mangled pairing is rejected by the
+        API outright, which would turn a cost optimization into a dropped
+        turn — and the engine result the model was waiting on with it."""
+        request = self._sent(self._mid_turn())
+
+        last = request["messages"][-1]["content"][-1]
+        assert last["type"] == "tool_result"
+        assert last["tool_use_id"] == "toolu_abc"
+        assert last["content"] == '{"ok": true}'
+        assert last["cache_control"] == {"type": "ephemeral"}
+        assert self._breakpoints(request) <= 4
+
+    def test_marking_the_request_does_not_reach_back_into_the_mapping(self) -> None:
+        """``_to_anthropic`` is a pure mapping the loop's own tests read
+        directly. The caching layer copies the entry it marks, so the mapping
+        keeps returning the shape it documents.
+
+        Run over the mid-turn transcript, not the plain one: a plain last entry
+        has string ``content``, which is *promoted* to a block list and so cannot
+        be mutated in place even by accident. The block-list branch — the one
+        that has to copy each block rather than mark the original — is only
+        reachable when the last entry already carries blocks, which is exactly
+        the ``tool_result`` case.
+        """
+        for messages in (self._conversation(), self._mid_turn()):
+            _, conversation = _to_anthropic(messages)
+            before = json.dumps(conversation)
+
+            _cached_transcript(conversation)
+
+            assert json.dumps(conversation) == before
+
+    def test_streaming_sends_the_same_cached_prefix(self) -> None:
+        """The voice path streams, so an unmarked ``stream()`` would mean the
+        caching only ever helped the terminal."""
+        seen: dict[str, Any] = {}
+        client = _client()
+
+        class _Captures:
+            def stream(self, **kwargs: Any) -> Any:
+                seen.update(kwargs)
+                raise RuntimeError("captured")
+
+        client._client.messages = _Captures()  # type: ignore[assignment]
+        with pytest.raises(RuntimeError):
+            list(client.stream(self._conversation()))
+
+        assert seen["system"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert seen["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}

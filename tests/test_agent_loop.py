@@ -12,23 +12,34 @@ escalation trigger.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-from collector.agent import NegotiationAgent
+from collector.agent import _CONFIDENTIAL_REFERENCE, NegotiationAgent
 from collector.audit.store import AuditStore
 from collector.decision_engine import RationaleCode
 from collector.guardrails.disclosures import (
+    AI_DISCLOSURE_TEXT,
+    AI_DISCLOSURE_WITH_HUMAN,
+    HUMAN_AVAILABLE_TEXT,
+    MINI_MIRANDA_TEXT,
     DisclosureId,
     confirms_identity,
     denies_identity,
     fires_ai_disclosure,
+    fires_mini_miranda,
 )
 from collector.guardrails.numeric import FigureKind, extract_figures
-from collector.guardrails.rings import EscalationTrigger, PreCallContext
+from collector.guardrails.rings import (
+    SAFE_FALLBACK_TEXT,
+    EscalationTrigger,
+    PreCallContext,
+    _contains_verbatim_leak,
+)
 from collector.llm.anthropic_client import _to_anthropic
 from collector.llm.base import LLMResponse, Message, ToolCall, system_prompt
 from collector.llm.mock_client import MockLLMClient, parse_proposal
@@ -345,17 +356,92 @@ class TestTurnLoop:
         assert offer.cadence in POLICY.allowed_cadences
 
     def test_disclosures_fire_in_order_and_before_any_substance(self) -> None:
+        """The Mini-Miranda precedes the first figure — in the call, and inside
+        the turn that carries both.
+
+        This was asserted as "a later turn index than the Mini-Miranda", which
+        was only ever a proxy: it held while the notice and the balance were
+        always separate turns, and read a correct call as a violation the moment
+        they were collapsed into one. The guard itself compares *offsets*
+        (``MINI_MIRANDA_OUT_OF_ORDER``), so the test now asks what the guard asks.
+        """
         agent = _run(["Yes, this is her.", "What do you want?"])
         spoken = [m.content for m in agent.messages if m.role == "agent"]
 
-        assert "AI assistant" in spoken[0], "AI disclosure opens the call"
+        # Asked of the detector, not of a substring. The opening's wording is
+        # free to change — it since became one merged breath that says
+        # "automated assistant" rather than "AI assistant" — but what has to
+        # stay true is that the disclosure *fires*, and that is not a property
+        # of any particular phrase.
+        assert fires_ai_disclosure(spoken[0]), "AI disclosure opens the call"
         mini_miranda_turn = next(
-            i for i, text in enumerate(spoken) if "attempt to collect a debt" in text
+            i for i, text in enumerate(spoken) if fires_mini_miranda(text) is not None
         )
-        substantive_turns = [i for i, text in enumerate(spoken) if "$" in text]
-        assert all(i > mini_miranda_turn for i in substantive_turns), (
-            "no figure may be spoken before the Mini-Miranda"
+        for i, text in enumerate(spoken):
+            if "$" not in text:
+                continue
+            assert i >= mini_miranda_turn, "a figure was spoken before the Mini-Miranda turn"
+            if i == mini_miranda_turn:
+                fired_at = fires_mini_miranda(text)
+                assert fired_at is not None and fired_at < text.index("$"), (
+                    "the Mini-Miranda must lead the figure it shares a turn with"
+                )
+
+    def test_the_notice_and_the_balance_share_a_turn(self) -> None:
+        """The notice does not cost a round trip of its own.
+
+        It used to: the turn after identity was confirmed said the notice and
+        nothing actionable, and the balance waited for the turn after that. On a
+        phone call that is a full round trip — several seconds of the consumer
+        waiting, and one more place to hang up — spent saying something they
+        cannot answer.
+        """
+        agent = _run(["Yes, this is her."])
+        spoken = [m.content for m in agent.messages if m.role == "agent"]
+
+        notice_turn = next(i for i, t in enumerate(spoken) if fires_mini_miranda(t) is not None)
+        assert "$" in spoken[notice_turn], "the notice turn must also carry the balance"
+
+    def test_the_notice_survives_a_failed_tool_round(self) -> None:
+        """Collapsing the notice into the offer turn must not make it
+        *conditional* on that turn succeeding.
+
+        It briefly was. The notice had its own turn before any tool ran, so it
+        was always on record; riding it out with the first figures meant a tool
+        round that errored left it unsaid for the rest of the call — the
+        consumer heard a filler line instead of the one sentence that is
+        required, and the audit trail recorded a call that never disclosed.
+        """
+        agent = _agent()
+        agent.open_call(PreCallContext(account_loaded=True, within_calling_window=True))
+        # Exhaust the negotiation so the first post-identity tool round errors.
+        agent.tools = dataclasses.replace(
+            agent.tools, state=dataclasses.replace(agent.tools.state, max_rounds=0)
         )
+
+        turn = agent.turn("Yes, this is her.")
+
+        assert turn.spoken is not None
+        assert fires_mini_miranda(turn.spoken) is not None, (
+            "a failed tool round swallowed the required notice"
+        )
+        assert DisclosureId.MINI_MIRANDA in agent.guard.disclosures.fired
+
+    def test_the_collapsed_turn_survives_sentence_streaming(self) -> None:
+        """The voice path guards a sentence at a time and holds a chunk back
+        while a disclosure rule is still unsatisfied (``_owes_a_disclosure``).
+        A turn carrying the notice *and* the balance is exactly the shape that
+        exercises the hold, so it is asserted on ``stream_turn`` and not only on
+        the text path.
+        """
+        agent = _agent()
+        agent.open_call()
+        spoken = " ".join(agent.stream_turn("Yes, this is her."))
+
+        fired_at = fires_mini_miranda(spoken)
+        assert fired_at is not None, f"the notice never reached TTS: {spoken!r}"
+        assert "$" in spoken, f"the balance never reached TTS: {spoken!r}"
+        assert fired_at < spoken.index("$"), "the notice must lead the figure"
 
     def test_identity_gates_the_whole_conversation(self) -> None:
         agent = _run(["Who is this?", "I'm not telling you that."])
@@ -433,6 +519,80 @@ class TestTurnLoop:
         check = agent._guard_and_speak(leak)
         spoken, blocked = check
         assert spoken != leak or blocked, "a verbatim system-prompt leak must not be spoken"
+
+    @pytest.mark.parametrize(
+        "script",
+        [
+            MINI_MIRANDA_TEXT,
+            AI_DISCLOSURE_TEXT,
+            HUMAN_AVAILABLE_TEXT,
+            AI_DISCLOSURE_WITH_HUMAN,
+            SAFE_FALLBACK_TEXT,
+        ],
+    )
+    def test_no_required_script_reads_as_a_prompt_leak(self, script: str) -> None:
+        """A line the agent is *required* to say must never be quotable from the
+        confidential reference.
+
+        The leak check blocks any turn sharing an eight-word run with the system
+        prompt or the tool schemas. So writing a required script into the prompt
+        as an example turns the guard against the very line it is guarding: the
+        compliant turn gets blocked, the agent strikes out, and the fallback
+        speaks instead. That is precisely what happened when the opening was
+        collapsed and its example sentence went into the prompt verbatim — five
+        blocked turns and an abandoned call, from a prompt edit that looked like
+        documentation. The prompt describes these lines; it must not quote them.
+        """
+        assert not _contains_verbatim_leak(script, _CONFIDENTIAL_REFERENCE), (
+            "this script is quotable from the system prompt or tool schemas, "
+            "so speaking it would be blocked as a leak"
+        )
+
+    @pytest.mark.parametrize(
+        "utterance",
+        [
+            # The decline bridge the prompt asks for, in the phrasings a model
+            # following that instruction actually produces.
+            "That one will not work on your end, and here is another option.",
+            "That one won't work on your end, and here is another option.",
+            "Okay, that is not one I can do. Here is what I can offer instead.",
+            "I'm not able to do that figure, but here is another option.",
+            # Answering "who are you?" by echoing the persona line.
+            "I'm a collections representative for Meridian Recovery Services, "
+            "and I'm calling about an overdue account.",
+        ],
+    )
+    def test_prompt_directed_phrasings_are_not_quotable(self, utterance: str) -> None:
+        """The prompt may *ask* for a sentence; it must not supply one.
+
+        The script constants were never the whole exposure. An instruction that
+        hands over the exact words — "say the human version: <sentence>" — is
+        the same trap wearing prose: the model says what it was told to, and the
+        guard blocks it for reciting the prompt. That is not hypothetical; the
+        decline-bridge line below was written into the prompt as an em-dash
+        aside during this work and tripped on every phrasing that kept its
+        opening clause.
+        """
+        assert not _contains_verbatim_leak(utterance, _CONFIDENTIAL_REFERENCE), (
+            "the prompt hands the model this phrasing, and speaking it would be blocked as a leak"
+        )
+
+    def test_the_opening_turn_is_not_quotable_from_the_prompt(self) -> None:
+        """The regression itself: the opening is the turn that broke.
+
+        Collapsing the opening into one breath came with an example of that
+        breath written into the system prompt. The stand-in model said the
+        example, the leak check recognised its own prompt, and the opening was
+        blocked — every call abandoned before the first question. The example is
+        gone, and this asserts it stays gone.
+        """
+        agent = _agent()
+        _, opening = agent.open_call(
+            PreCallContext(account_loaded=True, within_calling_window=True)
+        )
+        assert opening is not None, "the opening turn was blocked outright"
+        assert fires_ai_disclosure(opening), "the opening must still disclose"
+        assert not _contains_verbatim_leak(opening, _CONFIDENTIAL_REFERENCE)
 
     def test_pre_call_block_means_no_call_is_placed(self) -> None:
         agent = _agent()

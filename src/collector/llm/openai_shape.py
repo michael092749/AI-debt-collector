@@ -1,14 +1,12 @@
 """The OpenAI chat-completions wire shape, shared by every client that speaks it.
 
-Two backends reach the same model surface through this format: OpenRouter
-(`openrouter_client.py`) and LiveKit Inference (`livekit_client.py`). The
-mapping lives here rather than in either of them because a second copy of it
-is a compliance hazard, not just duplication — if the transcript a model sees
+`openrouter_client.py` is the only such client today. The mapping stays
+factored out here rather than folded back into it, because a second copy of it
+is a compliance hazard and not just duplication: if the transcript a model sees
 drifts between routes, the guardrail behaviour certified on one route is not
-the behaviour running on the other.
-
-What differs between the two clients is authentication, the model id, and the
-provider-specific request extras. Everything below is identical for both.
+the behaviour running on the other. What a second client would differ in is
+authentication, the model id, and the provider-specific request extras.
+Everything below would be identical.
 """
 
 from __future__ import annotations

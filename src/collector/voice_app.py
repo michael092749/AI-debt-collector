@@ -11,18 +11,29 @@ STT (Deepgram) and TTS (Cartesia) are the framework's, served through LiveKit
 Inference. The turn itself is not:
 ``llm_node`` is overridden below to bypass the framework's own LLM and
 function-calling machinery entirely and hand the transcribed consumer
-utterance straight to ``NegotiationAgent.turn()``, which already resolves
-tool calls, guardrails, and disclosures before a word reaches here. What
-this file adds is only the plumbing to get a sentence in and a sentence out.
+utterance straight to ``NegotiationAgent.stream_turn()``, which resolves tool
+calls, guardrails, and disclosures itself and emits the reply a guarded
+sentence at a time. What this file adds is only the plumbing to get a sentence
+in and sentences out — and, because that generator is synchronous and this
+node is not, the pump in ``_stream_sentences`` that bridges the two without
+losing the audit write when a consumer talks over the agent.
+
+The bypass is not an optimization, it is the architecture: every dollar figure
+is computed by the decision engine and cleared by the outbound guard *before*
+it becomes a text chunk here. Handing the tools to the framework's own
+function-calling loop instead would put the numeric guard downstream of
+nothing, which is the one thing this design does not permit.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
-from collections.abc import AsyncIterable
+import threading
+from collections.abc import AsyncIterable, AsyncIterator
 from typing import Never, NoReturn
 
 from dotenv import load_dotenv
@@ -46,7 +57,7 @@ from livekit.agents.llm import ChatMessage
 from livekit.agents.voice.agent import ModelSettings
 from livekit.agents.voice.agent_session import RecordingOptions
 
-from collector.agent import AgentTurn, NegotiationAgent
+from collector.agent import NegotiationAgent
 from collector.audit.store import DEFAULT_DB_PATH, AuditStore
 from collector.guardrails.rings import PreCallContext
 from collector.llm.anthropic_client import AnthropicClient
@@ -136,24 +147,25 @@ GREETING_PAUSE_SECONDS = 0.7
 
 # Preemptive generation is on by the SDK's own default, and it is wrong for
 # this agent specifically. It calls `Agent.llm_node` — and so
-# `NegotiationAgent.turn()` — on transcripts that are not yet a committed
-# turn, up to `max_retries` times per consumer utterance, discarding all but
-# at most one. Verified in the pinned livekit-agents 1.6.8:
+# `NegotiationAgent.stream_turn()` — on transcripts that are not yet a
+# committed turn, up to `max_retries` times per consumer utterance, discarding
+# all but at most one. Verified in the pinned livekit-agents 1.6.8:
 # `_pipeline_reply_task_impl` runs `perform_llm_inference(node=llm_node, ...)`
 # roughly a hundred lines before it awaits `speech_handle._wait_for_scheduled()`,
 # and the preflight path reaches it whenever `_vad_base_turn_detection` holds
 # — which it does for the default `inference.TurnDetector()`.
 #
 # For an agent whose node is a pure text->text call, a discarded generation
-# costs only tokens. `turn()` is not that: it advances `_turn_index`, records
-# a ConsumerUtterance, and can move the concession ladder through `concede`
-# or `record_refusal`. Worse, `llm_node` runs it under `asyncio.to_thread`,
-# and a thread cannot be cancelled — the SDK cancels the SpeechHandle while
-# `turn()` runs to completion regardless. "I can do two fifty" finalizes,
-# the ladder moves, "...a month" arrives, the generation is invalidated, and
-# the ladder moves again: one utterance the consumer spoke once, two rows in
-# the audit log and two concessions off a ladder that is only ever supposed
-# to move on a refusal on record.
+# costs only tokens. `stream_turn()` is not that: it advances `_turn_index`,
+# records a ConsumerUtterance, and can move the concession ladder through
+# `concede` or `record_refusal`. Streaming narrows the window but does not
+# close it — a cancelled generation stops the pump within one sentence, and
+# the guardrail state, the ladder, and the audit rows for the sentences it did
+# release all stand. "I can do two fifty" finalizes, the ladder moves,
+# "...a month" arrives, the generation is invalidated, and the ladder moves
+# again: one utterance the consumer spoke once, two rows in the audit log and
+# two concessions off a ladder that is only ever supposed to move on a refusal
+# on record.
 #
 # `preemptive_tts` is off by default and must stay off for the same reason
 # one step further along — it would synthesize audio for a reply derived from
@@ -218,6 +230,23 @@ async def _say_opening(session: AgentSession[None], opening: str) -> None:
     await session.say(remainder, allow_interruptions=False)
 
 
+def _retrieve_pump_exception(pump: asyncio.Task[None]) -> None:
+    """Keep an unexpected pump failure from surfacing as an asyncio warning
+    about an exception nobody read.
+
+    ``_stream_sentences``' worker relays everything to its caller, so this
+    should never find anything. The ``cancelled()`` guard is not cosmetic:
+    ``Task.exception()`` re-raises ``CancelledError`` on a cancelled task, and
+    the pump is routinely still pending when a worker's loop shuts down under
+    it — the thread cannot be cancelled, only the task waiting on it.
+    """
+    if pump.cancelled():
+        return
+    exc = pump.exception()
+    if exc is not None:
+        logger.error("stream_turn pump failed", exc_info=exc)
+
+
 class _ConsumerContextError(ValueError):
     """Dispatch metadata was present but could not be parsed into a consumer
     context. Raised rather than silently substituting the fixture consumer —
@@ -230,19 +259,32 @@ def _recording_options() -> bool | RecordingOptions:
     store. ``COLLECTOR_VOICE_RECORDING``:
 
     * unset / ``off`` — **the default.** Nothing is uploaded.
-    * ``diagnostics`` — pipeline traces and agent-server logs, no audio and no
-      transcript. The granular middle ground: it
-      buys the Agent-insights timeline for latency and failures without a
-      third-party copy of the consumer's words.
+    * ``diagnostics`` — no audio track and no session-report transcript, but
+      **it does upload the consumer's words.** See the warning below.
     * ``full`` — everything, i.e. the SDK's own default. Local debugging in
       the Agent Console only.
 
-    The default does not move: this project's ``AuditStore`` is the
-    compliance record, and nothing here collects consent for a second copy of
-    a consumer's speech held by anyone else. ``diagnostics`` is narrower than
-    a full upload, but it is still a
-    product decision to make deliberately, per call deployment — not a
-    default to drift into.
+    ``diagnostics`` is not the privacy middle ground its name suggests, and
+    this docstring claimed for a while that it was. ``transcript: False`` gates
+    only the end-of-session chat-history report (``telemetry/traces.py``); it
+    does not touch the live span pipeline. Under ``traces: True`` the SDK sets
+    ``lk.user_transcript`` to the consumer's verbatim utterance on every
+    user-turn span (``voice/audio_recognition.py``) and ``lk.chat_ctx`` to the
+    entire serialized conversation on every LLM-node span
+    (``voice/generation.py``) — neither consults the recording options. Our
+    ``llm_node`` override is called *by* that wrapper, so it is not exempt.
+
+    So ``diagnostics`` buys the Agent-insights timeline at the price of a
+    third-party verbatim copy of the call: materially the same consent decision
+    already declined for audio, differing only in medium. ``logs: True`` adds a
+    second route the SDK logs transcripts on at DEBUG, which production's INFO
+    floor happens to filter and ``lk agent dev`` does not.
+
+    The default does not move: this project's ``AuditStore`` is the compliance
+    record, and nothing here collects consent for a second copy of a consumer's
+    speech held by anyone else. If the goal is only latency data, note that
+    ``turn_latency`` (``e2e_ms``/``turn_ms``/``tts_ttfb_ms``) is already logged
+    locally and works with recording off.
     """
     mode = os.environ.get("COLLECTOR_VOICE_RECORDING", "off").lower()
     if mode == "full":
@@ -261,26 +303,20 @@ def _llm_route() -> str:
 
 
 def _llm_client() -> LLMClient:
-    """Anthropic by default; ``COLLECTOR_LLM`` routes the same calls elsewhere —
-    ``openrouter`` for the backend ``text_app.py`` reaches with ``--openrouter``,
-    ``livekit`` for Gemini 3 Flash on LiveKit Inference (``--livekit``). An env
-    var rather than a CLI flag because the worker's own argv is consumed
-    entirely by ``cli.run_app``'s dev/start subcommands (and, when launched via
-    ``lk agent dev``, by the CLI wrapper itself).
+    """Anthropic by default; ``COLLECTOR_LLM=openrouter`` routes the same calls
+    to the backend ``text_app.py`` reaches with ``--openrouter``. An env var
+    rather than a CLI flag because the worker's own argv is consumed entirely by
+    ``cli.run_app``'s dev/start subcommands (and, when launched via ``lk agent
+    dev``, by the CLI wrapper itself).
 
-    Neither alternate route is certified: ``MAX_TOOL_ROUNDS`` and the
+    The alternate route is not certified: ``MAX_TOOL_ROUNDS`` and the
     regeneration-strike budget were tuned against Claude, so a route change
     needs ``tests/evals/`` and the ADVERSARIAL_TESTING pass re-run before it
     carries a real call."""
-    route = os.environ.get("COLLECTOR_LLM")
-    if route == "openrouter":
+    if os.environ.get("COLLECTOR_LLM") == "openrouter":
         from collector.llm.openrouter_client import OpenRouterClient
 
         return OpenRouterClient()
-    if route == "livekit":
-        from collector.llm.livekit_client import LiveKitInferenceClient
-
-        return LiveKitInferenceClient()
     return AnthropicClient()
 
 
@@ -324,6 +360,10 @@ class CollectorAgent(Agent):
             else None,
         )
         self._negotiation_agent = negotiation_agent
+        # Every in-flight ``_stream_sentences`` pump, so ``drain()`` can wait
+        # for an abandoned turn's audit write before the store closes. All of
+        # them: see the note where they are added.
+        self._pumps: set[asyncio.Task[None]] = set()
 
     async def llm_node(
         self,
@@ -332,6 +372,13 @@ class CollectorAgent(Agent):
         model_settings: ModelSettings,
     ) -> AsyncIterable[str]:
         if self._negotiation_agent.ended:
+            # Normally unreachable — the turn that ends the call shuts the
+            # session down itself. Not always: a barge-in can tear that turn
+            # down after a tool closed the call but before this node returned,
+            # and then nothing has asked the room to close. Without the
+            # shutdown here the agent is mute for the rest of a call that
+            # never hangs up.
+            self._end_the_call()
             return
 
         user_msg = chat_ctx.items[-1] if chat_ctx.items else None
@@ -342,40 +389,226 @@ class CollectorAgent(Agent):
         if not utterance:
             return
 
-        # NegotiationAgent.turn() is synchronous and makes up to several
-        # blocking Anthropic calls (MAX_TOOL_ROUNDS round trips plus
-        # regeneration strikes) — run it off the event loop so it doesn't
-        # stall audio I/O, VAD, and STT streaming for the whole turn.
+        spoke = False
         try:
-            turn: AgentTurn = await asyncio.to_thread(self._negotiation_agent.turn, utterance)
+            async for sentence in self._stream_sentences(utterance):
+                if not sentence:
+                    # ``stream_turn`` yields its escalation line through
+                    # ``spoken or ""``; an empty chunk is not speech, and the
+                    # framework drops it downstream anyway.
+                    continue
+                # The framework concatenates chunks *raw* into the assistant
+                # message and into what TTS receives, so the separator is this
+                # node's to supply: without it the history reads
+                # "That works.Let me confirm" and the synthesizer runs two
+                # sentences together. A single space is the same join
+                # ``stream_turn`` uses for ``AgentTurn.spoken`` and
+                # ``_transcribe`` uses for the model's own transcript, so all
+                # three agree on the text character for character.
+                chunk = sentence if not spoke else f" {sentence}"
+                spoke = True
+                yield chunk
         except Exception:
             # A transient failure here (rate limit, network blip) must not
-            # silently drop the call — turn() already recorded the consumer's
-            # utterance and updated guardrail state before any point it could
-            # raise, so the call is safe to continue on the next turn; it
-            # just never produced a response to this one.
-            logger.exception("negotiation_agent.turn() raised; apologizing and continuing the call")
-            # The apology is about to be spoken, so it has to be in the record
-            # before it is. Off the event loop for the same
-            # reason turn() is: AuditStore.record() blocks on the store's own
-            # worker thread.
-            await asyncio.to_thread(
-                self._negotiation_agent.record_fallback_speech, _TRANSIENT_ERROR_APOLOGY
-            )
-            yield _TRANSIENT_ERROR_APOLOGY
-            return
-        if turn.spoken:
-            yield turn.spoken
+            # silently drop the call — stream_turn already recorded the
+            # consumer's utterance and updated guardrail state before any
+            # point it could raise, so the call is safe to continue on the
+            # next turn.
+            if spoke:
+                # Mid-stream the apology's own premise is already false:
+                # earlier sentences are audio, and a scripted "could you say
+                # that again?" after real speech reads as a non-sequitur
+                # rather than a recovery. Same rule ``_Round.needs_fallback``
+                # applies one level down. The turn keeps what it did say.
+                logger.exception("stream_turn raised mid-turn; leaving the line where it is")
+            else:
+                logger.exception("stream_turn raised; apologizing and continuing the call")
+                # The apology is about to be spoken, so it has to be in the
+                # record before it is. Off the event loop for the same reason
+                # the turn itself is: AuditStore.record() blocks on the
+                # store's own worker thread.
+                await asyncio.to_thread(
+                    self._negotiation_agent.record_fallback_speech, _TRANSIENT_ERROR_APOLOGY
+                )
+                yield _TRANSIENT_ERROR_APOLOGY
+        finally:
+            # In a ``finally`` rather than after the loop, because the turn
+            # that ends the call is exactly the turn a consumer is most likely
+            # to talk over — "we're all set, you'll get an email" — and a
+            # barge-in tears this generator down at the ``yield``. The check
+            # has to run on that path too, or the room stays open with an
+            # agent that will not speak again.
+            if self._negotiation_agent.ended:
+                self._end_the_call()
 
-        if self._negotiation_agent.ended:
-            # ``drain=True`` (the default) waits for the line just yielded to
-            # finish playing before the room actually closes — confirmed
-            # against AgentActivity.drain(), which processes the entire
-            # queued-speech backlog, not just what's already in flight.
-            # NegotiationAgent.close() itself runs once, from the job's
-            # shutdown callback below — the only path guaranteed to fire
-            # whether the call ends here or the room just disconnects.
-            self.session.shutdown()
+    def _end_the_call(self) -> None:
+        """``drain=True`` (the default) waits for the lines already yielded to
+        finish playing before the room actually closes — confirmed against
+        ``AgentActivity.drain()``, which processes the entire queued-speech
+        backlog, not just what's already in flight. ``NegotiationAgent.close()``
+        itself runs once, from the job's shutdown callback below — the only
+        path guaranteed to fire whether the call ends here or the room just
+        disconnects.
+
+        ``Agent.session`` raises when the agent is not attached to a running
+        activity — a closing turn driven directly, with no room to close. That
+        is a no-op here, not a failure: this method's whole job is to hang up a
+        call, and there is no call."""
+        try:
+            session = self.session
+        except RuntimeError:
+            logger.debug("no running session to shut down; the call is already over")
+            return
+        session.shutdown()
+
+    async def _stream_sentences(self, utterance: str) -> AsyncIterator[str]:
+        """``NegotiationAgent.stream_turn`` — a *synchronous* generator making
+        blocking model calls — driven as an async one, so each guarded sentence
+        reaches TTS the moment it clears instead of after the whole turn
+        completes. That is the entire point of the streaming path, and the
+        reason this replaced a ``to_thread(turn, ...)``: TTS starts on sentence
+        one while the model is still writing sentence two, and the framework's
+        ``llm_node_ttft`` becomes a real time-to-first-token again.
+
+        What that does *not* buy, and it is worth being exact because
+        ``preemptive_tts`` is off here and has to stay off: synthesis does not
+        begin the instant a chunk exists. The chunks land in an unbounded
+        ``text_ch``, and the task that drains it into TTS
+        (``AgentActivity._produce_segments``) is only started before scheduling
+        when ``preemptive_tts`` is on — otherwise "right after scheduling
+        below", in the SDK's own words (verified in 1.6.8,
+        ``voice/agent_activity.py`` around the ``wait_for_scheduled`` await).
+        So first audio is gated on ``speech_handle._wait_for_scheduled()`` as
+        well as on the first sentence.
+
+        That gate is not the thing this fixes and does not undo the fix:
+        ``perform_llm_inference`` is launched roughly a hundred lines *before*
+        that await, so generation is already running while the handle waits,
+        and scheduling is about speech ordering rather than about this turn's
+        model calls. The change moves the LLM leg off the critical path; the
+        endpointing and scheduling legs are still on it.
+
+        A single pump thread drives the generator and hands sentences over
+        through the loop's own queue. Two properties are why it is a pump
+        rather than one ``to_thread(next, ...)`` per sentence:
+
+        * **The generator is closed by the thread that owns it.** A cancelled
+          ``to_thread`` leaves its thread running — the interpreter cannot
+          interrupt a blocking read — so a per-``next()`` design abandons the
+          generator suspended at a ``yield``, and ``stream_turn``'s ``finally``,
+          which writes the turn to the audit store, then runs whenever the
+          garbage collector reaches it, on whatever thread that happens to be.
+          Here the pump owns the generator start to finish and ``closing()``
+          runs that ``finally`` deterministically, on one thread.
+        * **Abandonment is cooperative and bounded.** A barge-in sets
+          ``abandoned``; the pump, mid-``next()``, finishes that one sentence,
+          sees the flag, and closes. So exactly one sentence past the
+          interruption is guarded and written as spoken without reaching TTS.
+          That over-record cannot be eliminated — the guard fires when a
+          sentence is *released* and the generator is by design a step ahead of
+          the ear — but it is bounded at one, where the ``turn()`` path this
+          replaces recorded a whole turn the consumer heard only part of.
+        """
+        loop = asyncio.get_running_loop()
+        # Unbounded: a spoken turn is a handful of sentences, and a bounded
+        # queue would park the pump inside a ``put`` where the abandonment
+        # check below cannot reach it.
+        handoff: asyncio.Queue[str | BaseException | None] = asyncio.Queue()
+        abandoned = threading.Event()
+        stream = self._negotiation_agent.stream_turn(utterance)
+
+        def hand_over(item: str | BaseException | None) -> None:
+            try:
+                loop.call_soon_threadsafe(handoff.put_nowait, item)
+            except RuntimeError:
+                # The loop is gone: the worker is shutting down mid-turn.
+                # Nobody is left to deliver to, so stop generating — the
+                # ``closing()`` below still writes the turn.
+                abandoned.set()
+
+        def drive() -> None:
+            try:
+                with contextlib.closing(stream):
+                    for sentence in stream:
+                        hand_over(sentence)
+                        if abandoned.is_set():
+                            break
+            except BaseException as exc:  # noqa: BLE001 — relayed, not swallowed
+                hand_over(exc)
+                if abandoned.is_set():
+                    # Relaying just wrote to a queue with no consumer. Log it
+                    # here or the failure vanishes entirely: ``drive`` returns
+                    # normally either way, so the task carries no exception for
+                    # ``_retrieve_pump_exception`` to find.
+                    logger.error(
+                        "stream_turn failed after the caller stopped listening", exc_info=exc
+                    )
+            else:
+                hand_over(None)
+
+        pump = asyncio.create_task(asyncio.to_thread(drive))
+        # A set, not a single slot. Two generations can be in flight at once —
+        # the framework's preflight path builds one and abandons it — and a
+        # cancelled ``to_thread`` does not stop the thread under it, so the
+        # abandoned pump is still generating, still guarding sentences, and
+        # still writing to the store. Tracked in one slot, the older pump went
+        # untracked the moment the newer one replaced it: ``drain()`` returned
+        # as soon as the *newer* one finished, ``store.close()`` ran, and the
+        # older one's next ``TurnRecorded`` hit a closed store. That row is lost
+        # and its ``AgentTurn`` lands after ``CallEnded.turn_count`` was taken,
+        # so the graded record under-reports the call — and none of it surfaces,
+        # because the failure is relayed to a queue nobody reads.
+        self._pumps.add(pump)
+        pump.add_done_callback(self._pumps.discard)
+        pump.add_done_callback(_retrieve_pump_exception)
+        try:
+            while True:
+                item = await handoff.get()
+                if item is None:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            abandoned.set()
+
+    async def drain(self, timeout: float = 5.0) -> None:
+        """Wait for an abandoned ``stream_turn`` to finish unwinding.
+
+        A barge-in leaves the pump thread mid-``next()``. It finishes that
+        sentence, then closes the generator — and closing it is not free. Two
+        things the shutdown callback depends on happen during that unwind, on
+        the pump's thread:
+
+        * The sentence it finishes is guarded, which writes its ``TurnRecorded``
+          row (``_guard_sentence`` → ``_record_audio``), and ``_stream_round``'s
+          own ``finally`` writes the aborted ``ModelCalled`` row for the round it
+          cut short. Both are store writes, and ``store.close()`` is a few lines
+          away in ``_finalize_call``.
+        * ``stream_turn``'s ``finally`` appends the ``AgentTurn``, which is what
+          ``NegotiationAgent.close()`` counts into ``CallEnded.turn_count``.
+          Draining after that count is taken would leave the record claiming
+          one turn fewer than the consumer had.
+
+        So this is ordered before both, and the audit chain keeps the single
+        writer it is built on.
+
+        Bounded rather than unbounded: a wedged model call must not hold the
+        room open, and one lost turn row is a smaller loss than a call that
+        never hangs up.
+        """
+        pumps = {pump for pump in self._pumps if not pump.done()}
+        if not pumps:
+            return
+        # ``wait``, not ``wait_for``: a timeout here must not cancel the tasks,
+        # because cancelling one would not stop the thread underneath it and
+        # would only hide that pump's own exception.
+        _, pending = await asyncio.wait(pumps, timeout=timeout)
+        if pending:
+            logger.warning(
+                "stream_turn did not finish writing before shutdown",
+                extra={"pending_pumps": len(pending)},
+            )
 
 
 def _consumer_context(ctx: JobContext) -> tuple[str, str]:
@@ -411,19 +644,23 @@ def _consumer_context(ctx: JobContext) -> tuple[str, str]:
 def _log_turn_latency(session: AgentSession[None]) -> None:
     """Log what a turn actually cost the consumer in silence.
 
-    ``NegotiationAgent.turn()`` can stack seven sequential model round trips
-    into one spoken reply — ``MAX_TOOL_ROUNDS`` (4), the final ask for words,
-    and up to ``MAX_REGENERATION_STRIKES`` (2) rewrites behind the outbound
-    guard. ``agent.py``'s per-call ``elapsed_ms`` line shows each leg; nothing
-    showed the sum, which is the number a phone call is judged on.
+    ``NegotiationAgent.stream_turn()`` can stack five sequential model round
+    trips into one spoken reply — ``MAX_TOOL_ROUNDS`` (4) plus the final ask
+    for words. ``agent.py``'s per-call ``elapsed_ms`` line shows each leg;
+    nothing showed what the consumer experienced, which is the number a phone
+    call is judged on.
 
-    Both figures come from the framework and neither needs the LiveKit Cloud
+    All three figures come from the framework and none needs the LiveKit Cloud
     recording this project leaves off:
 
     * ``e2e_latency`` — consumer stopped speaking to agent audio playing.
-    * ``llm_node_ttft`` — normally time-to-first-token, but ``llm_node`` here
-      yields only after the whole blocking turn completes, so it *is* the
-      total ``turn()`` latency, isolated from STT and TTS.
+    * ``llm_node_ttft`` — time to the *first guarded sentence*, which since
+      ``llm_node`` streams is a genuine time-to-first-token and not the whole
+      turn. It is the number the streaming path exists to move; the rest of the
+      turn generates while that first sentence is already playing, so
+      ``turn_ms`` is now well under ``e2e_ms`` rather than nearly all of it.
+    * ``tts_node_ttfb`` — the synthesis leg, which now starts on sentence one
+      rather than waiting for the last.
     """
 
     @session.on("conversation_item_added")
@@ -616,9 +853,10 @@ async def entrypoint(ctx: JobContext) -> None:
         ctx.shutdown("pre-call guardrail blocked")
         return
 
-    # Constructed here rather than just before `start()` so `_finalize_call`
-    # can close over it; the constructor opens nothing.
+    # Both constructed here rather than just before `start()` so
+    # `_finalize_call` can close over them; neither constructor opens anything.
     session: AgentSession[None] = AgentSession(turn_handling=TURN_HANDLING)
+    collector = CollectorAgent(negotiation_agent)
 
     async def _finalize_call() -> None:
         # The one call site for NegotiationAgent.close(), reached whether the
@@ -627,6 +865,12 @@ async def entrypoint(ctx: JobContext) -> None:
         # or the room just disconnects out from under us. A phone call that
         # ends without this running writes no agreement — the brief's graded
         # deliverable — so it must not depend on how the call ended.
+        #
+        # The drain comes first: a turn the consumer talked over is still
+        # writing its record on a pump thread, and that write has to land
+        # before close() stamps the turn count and store.close() shuts the
+        # audit writer down.
+        await collector.drain()
         await asyncio.to_thread(negotiation_agent.close)
         store.close()
         # Last, deliberately: the agreement and the closed store are the
@@ -647,9 +891,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # transcripts, traces, and logs to LiveKit Cloud's observability store
     # for every call. See `_recording_options()` for the three modes and why
     # the default stays off.
-    await session.start(
-        agent=CollectorAgent(negotiation_agent), room=ctx.room, record=_recording_options()
-    )
+    await session.start(agent=collector, room=ctx.room, record=_recording_options())
     await _say_opening(session, opening)
 
 
