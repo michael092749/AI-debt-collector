@@ -37,6 +37,7 @@ from collector.guardrails.numeric import (
     Figure,
     authorized_for,
     check_numeric,
+    consumer_stated_money,
     extract_figures,
 )
 from collector.guardrails.prohibited import (
@@ -472,6 +473,11 @@ class GuardrailState:
     """Everything the rings remember. Frozen; each check returns its successor."""
 
     authorized: AuthorizedFigures
+    # Money the consumer named, which the agent may echo back. Kept apart from
+    # ``authorized`` because ``with_authorized`` re-derives that set from the
+    # engine on every tool result and would otherwise wipe this on the next
+    # tool call. See ``consumer_stated_money`` for how narrow it is.
+    acknowledged: AuthorizedFigures = AuthorizedFigures()
     disclosures: DisclosureState = DisclosureState()
     identity_confirmed: bool = False
     substantive_discussed: bool = False
@@ -600,6 +606,11 @@ def check_inbound(state: GuardrailState, utterance: str) -> InboundCheck:
     signals = detect_escalation(utterance)
     disclosures = state.disclosures.observe_consumer(utterance)
     turn_index = state.consumer_turns
+    acknowledged = state.acknowledged.merged_with(
+        consumer_stated_money(
+            utterance, ceiling=max(state.authorized.money, default=None)
+        )
+    )
 
     escalation = state.escalation
     if escalation is None and signals:
@@ -622,6 +633,7 @@ def check_inbound(state: GuardrailState, utterance: str) -> InboundCheck:
     )
     new_state = replace(
         state,
+        acknowledged=acknowledged,
         disclosures=disclosures,
         escalation=escalation,
         consumer_turns=state.consumer_turns + 1,
@@ -685,7 +697,12 @@ def check_outbound(
     ``tools.py`` (the four-module guardrail package would otherwise become
     a cycle: ``tools`` -> ``audit.events`` -> ``rings``).
     """
-    figure_set = authorized if authorized is not None else state.authorized
+    # Merged here rather than left to the caller: both real paths pass
+    # ``authorized=`` explicitly, so an acknowledgment folded into the state
+    # alone would be bypassed everywhere it matters.
+    figure_set = (authorized if authorized is not None else state.authorized).merged_with(
+        state.acknowledged
+    )
     violations: list[Violation] = []
     violations.extend(scan_prohibited(candidate))
     violations.extend(check_numeric(candidate, figure_set))

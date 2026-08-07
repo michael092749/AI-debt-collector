@@ -279,6 +279,43 @@ def authorized_for(
     return authorized
 
 
+def consumer_stated_money(utterance: str, *, ceiling: Decimal | None = None) -> AuthorizedFigures:
+    """Money the *consumer* named, which the agent may repeat back to them.
+
+    Echoing a figure the consumer just spoke aloud discloses nothing — they
+    are the one who said it. Without this the agent could not acknowledge
+    "I can do two hundred dollars" with the number in it at all, and every
+    attempt cost a regeneration round-trip.
+
+    Deliberately narrow, because this is a hole in a *provenance* guard whose
+    whole contract is that the engine authored every figure:
+
+    * **Money only.** "I could do twelve months" must not make 12 sayable as
+      a duration or a payment count — a term the consumer floated is not a
+      term the engine agreed to.
+    * **Bounded by ``ceiling``**, the largest already-authorized amount (the
+      balance). Nothing the consumer says widens the guard past the account.
+    * **Nothing suspicious.** A digit run against a letter is an evasion
+      shape whoever typed it; it never widens anything.
+
+    What this cannot do is tell an *acknowledgment* from an *offer*. Both are
+    the agent saying "$200", and the guard sees only the figure. "Two hundred
+    dollars, understood" and "Two hundred dollars works" are indistinguishable
+    here — the rule that the agent must not accept terms the engine has not
+    priced lives in the decision engine and the system prompt, not in this
+    function. Widening this set makes that rule matter more, not less.
+    """
+    values = {
+        figure.value
+        for figure in extract_figures(utterance)
+        if figure.kind is FigureKind.MONEY
+        and figure.value is not None
+        and not figure.suspicious
+        and (ceiling is None or figure.value <= ceiling)
+    }
+    return AuthorizedFigures(money=frozenset(values))
+
+
 # -- invisible-character defense --------------------------------------------
 #
 # Unicode format characters (category ``Cf``: zero-width space, zero-width

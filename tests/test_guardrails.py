@@ -1283,6 +1283,59 @@ class TestDuringCallRing:
         assert [f.text for f in result.figures] == ["$250", "today"]
 
 
+class TestAcknowledgingCallerStatedAmounts:
+    """A figure the consumer said first is echoable back to them.
+
+    The consumer already knows their own number, so repeating it discloses
+    nothing. Before this, "I can do two hundred dollars" could not be
+    answered with "two hundred dollars" at all — the numeric guard blocked
+    the agent for repeating a figure the consumer had just spoken aloud.
+    """
+
+    def test_a_caller_stated_amount_becomes_echoable(self, ready: GuardrailState) -> None:
+        blocked = check_outbound(ready, "Two hundred dollars — let me see what I can do.")
+        assert NumericRuleId.UNAUTHORIZED_AMOUNT in rule_ids(blocked.violations)
+
+        heard = check_inbound(ready, "I can do two hundred dollars a month.")
+        echoed = check_outbound(heard.state, "Two hundred dollars — let me see what I can do.")
+        assert echoed.allowed, echoed.violations
+
+    def test_only_money_is_widened(self, ready: GuardrailState) -> None:
+        """ "I could do twelve months" must not make 12 sayable as a duration.
+        A term the consumer floated is not a term the engine has agreed to."""
+        heard = check_inbound(ready, "Could I have twelve months to pay this off?")
+        result = check_outbound(heard.state, "Let's say twelve months.")
+        assert NumericRuleId.UNAUTHORIZED_DURATION in rule_ids(result.violations)
+
+    def test_an_amount_above_the_balance_is_not_acknowledged(
+        self, ready: GuardrailState
+    ) -> None:
+        """The echo is bounded by what is already authorized — the balance.
+        Nothing the consumer says can widen the guard past the account."""
+        heard = check_inbound(ready, "What if I paid you five thousand dollars?")
+        result = check_outbound(heard.state, "Five thousand dollars it is.")
+        assert NumericRuleId.UNAUTHORIZED_AMOUNT in rule_ids(result.violations)
+
+    def test_the_acknowledgment_set_survives_a_re_pointed_authorized_set(
+        self, ready: GuardrailState, settlement_offer: Offer
+    ) -> None:
+        """``with_authorized`` is called on every tool result to re-derive the
+        engine's offer set. It must not wipe what the consumer said — that is
+        exactly the path the widening would otherwise never survive."""
+        heard = check_inbound(ready, "Two hundred dollars is what I have.")
+        repointed = heard.state.with_authorized(
+            AuthorizedFigures.empty().with_offer(settlement_offer)
+        )
+        assert check_outbound(repointed, "Two hundred dollars, understood.").allowed
+
+    def test_acknowledgment_persists_across_later_turns(self, ready: GuardrailState) -> None:
+        """Said on turn two, still echoable on turn four — figures age out of
+        nothing, the same rule the engine's own offer set follows."""
+        heard = check_inbound(ready, "I can do two hundred dollars.")
+        later = check_inbound(heard.state, "Sorry, what were you saying?")
+        assert check_outbound(later.state, "You mentioned two hundred dollars.").allowed
+
+
 class TestPostCallRing:
     def test_a_compliant_call_summarizes_clean(
         self, policy: PolicyConfig, settlement_offer: Offer
