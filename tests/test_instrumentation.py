@@ -905,7 +905,9 @@ class TestStreamingTurn:
 
         assert "Am I speaking with the account holder?" in spoken
         assert not any("garnish" in s for s in spoken)
-        assert spoken[-1] == CONNECTIVE_TEXT
+        # Nothing substantive was said, so the closer is the fallback rather
+        # than the connective — see ``TestABlockAfterRealSpeechClosesTheThought``.
+        assert spoken[-1] == SAFE_FALLBACK_TEXT
         assert not any("So what will it be?" in s for s in spoken), "the stream aborts, not skips"
         assert agent.turns[-1].blocked
 
@@ -927,7 +929,7 @@ class TestStreamingTurn:
         spoken = list(agent.stream_turn("Yes, this is Dana."))
 
         assert not any("four hundred" in s for s in spoken)
-        assert spoken[-1] == CONNECTIVE_TEXT, "a block after speech closes, it does not restart"
+        assert spoken[-1] == SAFE_FALLBACK_TEXT
 
     def test_an_escalation_stops_the_stream_before_any_generation(self) -> None:
         agent = _agent()
@@ -1243,15 +1245,39 @@ class TestABlockAfterRealSpeechClosesTheThought:
     leaves it standing.
     """
 
-    def test_the_connective_replaces_the_fallback_after_speech(self) -> None:
-        agent = _agent(llm=_ThreateningStreamer())
+    def test_the_connective_replaces_the_fallback_after_substantive_speech(self) -> None:
+        agent = _agent(llm=_ThreatensAfterDisclosing())
         agent.open_call()
         spoken = list(agent.stream_turn("Yes, this is Dana."))
 
         assert spoken[-1] == CONNECTIVE_TEXT
         assert SAFE_FALLBACK_TEXT not in spoken
-        assert "Am I speaking with the account holder?" in spoken
+        assert MINI_MIRANDA_TEXT in spoken, "the turn did say something that stands"
         assert not any("garnish" in s for s in spoken), "the block still holds"
+
+    def test_a_turn_that_only_said_pleasantries_gets_the_fallback(self) -> None:
+        """"Does that work for you?" asks about something. After "Thanks for
+        confirming." it is the same non-sequitur it was brought in to
+        replace, just shorter — there is no offer standing for it to refer
+        to. The gate is substantive speech, not any speech at all.
+        """
+
+        class _ThanksThenThreatens:
+            def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+                return LLMResponse(text=_GREETING)
+
+            def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+                yield TextDelta("Thanks for confirming. ")
+                yield TextDelta("Pay today or we will garnish your wages. ")
+                yield StreamCompleted(LLMResponse(text="..."))
+
+        agent = _agent(llm=_ThanksThenThreatens())
+        agent.open_call()
+        spoken = list(agent.stream_turn("Yes, this is Dana."))
+
+        assert "Thanks for confirming." in spoken
+        assert spoken[-1] == SAFE_FALLBACK_TEXT
+        assert CONNECTIVE_TEXT not in spoken
 
     def test_a_turn_that_never_spoke_still_gets_the_fallback(self) -> None:
         """Nothing to connect to, so there is nothing to close."""

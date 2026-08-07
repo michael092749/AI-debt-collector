@@ -47,6 +47,7 @@ from collector.guardrails.disclosures import (
     AI_DISCLOSURE_TEXT,
     confirms_identity,
     denies_identity,
+    is_substantive,
 )
 from collector.guardrails.numeric import AuthorizedFigures, authorized_for
 from collector.guardrails.rings import (
@@ -247,11 +248,17 @@ class _Round:
             # on the second attempt.
             if not spoken and not self.exhausted:
                 return _Outcome.REGENERATE
-            # Something is already in the consumer's ear, and it stands on its
-            # own. The scripted fallback restarts the conversation, which after
-            # a laid-out offer talks over the proposal instead of recovering
-            # from anything; a connective closes the thought and leaves it.
-            if spoken:
+            # Something substantive is already in the consumer's ear, and it
+            # stands on its own. The scripted fallback restarts the
+            # conversation, which after a laid-out offer talks over the
+            # proposal instead of recovering from anything; a connective
+            # closes the thought and leaves it.
+            #
+            # Substantive, not merely spoken: "Does that work for you?" asks
+            # about something, and after "Thanks for confirming." there is
+            # nothing for it to refer to — it is then the same non-sequitur
+            # it was brought in to replace, only shorter.
+            if is_substantive(" ".join(spoken)):
                 return _Outcome.CONNECTIVE
             return _Outcome.FALLBACK
         # A failed call only falls back if the round said nothing, since a
