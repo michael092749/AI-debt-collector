@@ -50,6 +50,7 @@ from collector.guardrails.disclosures import (
 )
 from collector.guardrails.numeric import AuthorizedFigures, authorized_for
 from collector.guardrails.rings import (
+    CONNECTIVE_TEXT,
     MAX_REGENERATION_STRIKES,
     CallSummary,
     EscalationRecord,
@@ -207,6 +208,7 @@ class _Outcome(StrEnum):
 
     CONTINUE = "continue"
     REGENERATE = "regenerate"
+    CONNECTIVE = "connective"
     FALLBACK = "fallback"
 
 
@@ -245,6 +247,12 @@ class _Round:
             # on the second attempt.
             if not spoken and not self.exhausted:
                 return _Outcome.REGENERATE
+            # Something is already in the consumer's ear, and it stands on its
+            # own. The scripted fallback restarts the conversation, which after
+            # a laid-out offer talks over the proposal instead of recovering
+            # from anything; a connective closes the thought and leaves it.
+            if spoken:
+                return _Outcome.CONNECTIVE
             return _Outcome.FALLBACK
         # A failed call only falls back if the round said nothing, since a
         # scripted line after real speech reads as a non-sequitur rather
@@ -483,10 +491,14 @@ class NegotiationAgent:
                     self._note_block(round_)
                     pending_note = None
                     continue
-                if outcome is _Outcome.FALLBACK:
-                    fallback = self._stream_fallback()
-                    spoken.append(fallback)
-                    yield fallback
+                if outcome in (_Outcome.CONNECTIVE, _Outcome.FALLBACK):
+                    closer = (
+                        self._stream_connective()
+                        if outcome is _Outcome.CONNECTIVE
+                        else self._stream_fallback()
+                    )
+                    spoken.append(closer)
+                    yield closer
                     break
 
                 response = round_.response
@@ -1087,6 +1099,29 @@ class NegotiationAgent:
         self._observe_scripted(line)
         self._speak_verbatim(line)
         return line
+
+    def _stream_connective(self) -> str:
+        """Close a turn that was cut off *after* it had already said something.
+
+        ``SAFE_FALLBACK_TEXT`` restarts the conversation — "let me keep this
+        simple, what would work for you?" That is a recovery when the consumer
+        heard nothing. Spoken over an offer the agent has just finished laying
+        out, it is a non-sequitur that asks a question the turn already
+        answered, and the offer needs no rescuing: it was spoken, it cleared
+        the guard, it stands.
+
+        Two cases still want the fallback, because it carries something the
+        connective does not. An escalation makes ``fallback_for`` return the
+        closing line, which is the compliance obligation and not something a
+        question inviting more negotiation may displace; and a pending
+        AI-disclosure request is answered by ``_fallback_line``, which a
+        connective would silently drop.
+        """
+        if self.guard.escalated or self.guard.disclosures.ai_disclosure_requested:
+            return self._stream_fallback()
+        self._observe_scripted(CONNECTIVE_TEXT)
+        self._record_audio(CONNECTIVE_TEXT)
+        return CONNECTIVE_TEXT
 
     def _stream_fallback(self) -> str:
         """The same line on the streaming path, where the transcript entry for

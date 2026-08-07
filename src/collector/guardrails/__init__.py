@@ -42,6 +42,7 @@ from collector.guardrails.prohibited import (
     scan_prohibited,
 )
 from collector.guardrails.rings import (
+    CONNECTIVE_TEXT,
     MAX_REGENERATION_STRIKES,
     SAFE_FALLBACK_TEXT,
     CallSummary,
@@ -66,6 +67,7 @@ from collector.guardrails.rings import (
 
 __all__ = [
     "AI_DISCLOSURE_TEXT",
+    "CONNECTIVE_TEXT",
     "MAX_REGENERATION_STRIKES",
     "MINI_MIRANDA_TEXT",
     "SAFE_FALLBACK_TEXT",

@@ -44,6 +44,7 @@ from collector.guardrails.disclosures import (
     fires_ai_disclosure,
 )
 from collector.guardrails.rings import (
+    CONNECTIVE_TEXT,
     MAX_REGENERATION_STRIKES,
     SAFE_FALLBACK_TEXT,
     PreCallContext,
@@ -873,10 +874,18 @@ class TestStreamingTurn:
         assert agent.ended
         assert closing, "a turn that ends the call in silence is a dead line"
 
-    def test_a_blocked_sentence_aborts_to_the_fallback_rather_than_regenerating(self) -> None:
+    def test_a_blocked_sentence_aborts_rather_than_regenerating_once_audio_exists(
+        self,
+    ) -> None:
         """The text path can retry because nothing was spoken. Here the earlier
         sentences are already audio, so a retry would contradict what the
-        consumer just heard."""
+        consumer just heard.
+
+        The turn closes on the connective rather than the scripted fallback —
+        see ``TestABlockAfterRealSpeechClosesTheThought``. What this test is
+        about is that the stream *aborts*: the blocked sentence never goes out
+        and neither does anything the model wrote after it.
+        """
 
         class ThreateningStreamer:
             def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
@@ -895,7 +904,7 @@ class TestStreamingTurn:
 
         assert "Am I speaking with the account holder?" in spoken
         assert not any("garnish" in s for s in spoken)
-        assert spoken[-1] == SAFE_FALLBACK_TEXT
+        assert spoken[-1] == CONNECTIVE_TEXT
         assert not any("So what will it be?" in s for s in spoken), "the stream aborts, not skips"
         assert agent.turns[-1].blocked
 
@@ -917,7 +926,7 @@ class TestStreamingTurn:
         spoken = list(agent.stream_turn("Yes, this is Dana."))
 
         assert not any("four hundred" in s for s in spoken)
-        assert spoken[-1] == SAFE_FALLBACK_TEXT
+        assert spoken[-1] == CONNECTIVE_TEXT, "a block after speech closes, it does not restart"
 
     def test_an_escalation_stops_the_stream_before_any_generation(self) -> None:
         agent = _agent()
@@ -1003,17 +1012,22 @@ class TestStreamingTurn:
         tool_at = [i for i, m in enumerate(second) if m.role == "tool"]
         assert tool_at and tool_at[-1] > spoke_at[-1], "spoken first, then the engine's answer"
 
-    def test_the_scripted_fallback_is_written_to_the_transcript_once(self) -> None:
-        """``_speak_verbatim`` put the fallback into ``self.messages`` and the
-        end-of-turn join put it there again — two consecutive assistant
-        messages carrying the same line."""
+    def test_the_scripted_closing_line_is_written_to_the_transcript_once(self) -> None:
+        """``_speak_verbatim`` put the scripted line into ``self.messages`` and
+        the end-of-turn join put it there again — two consecutive assistant
+        messages carrying the same line.
+
+        This turn speaks before it is blocked, so the line that closes it is
+        the connective; the duplication it guards against is a property of
+        every code-authored line, whichever one applies.
+        """
         agent = _agent(llm=_ThreatensAfterDisclosing())
         agent.open_call()
         before = sum(1 for m in agent.messages if m.role == "agent")
         list(agent.stream_turn("Yes, this is Dana."))
         written = [m.content for m in agent.messages if m.role == "agent"][before:]
 
-        assert sum(m.count(SAFE_FALLBACK_TEXT) for m in written) == 1
+        assert sum(m.count(CONNECTIVE_TEXT) for m in written) == 1
         assert len(written) == 1, "one assistant message for the turn, not one per line"
 
     def test_an_aborted_round_still_records_its_model_call(self, tmp_path: Path) -> None:
@@ -1026,7 +1040,7 @@ class TestStreamingTurn:
             spoken = list(agent.stream_turn("Yes, this is Dana."))
             calls = store.model_calls(agent.call_id)
 
-        assert spoken[-1] == SAFE_FALLBACK_TEXT, "the round did abort"
+        assert spoken[-1] == CONNECTIVE_TEXT, "the round did abort"
         assert calls, "an aborted round still spent a model call"
         assert any(c.stop_reason == "aborted" for c in calls)
         assert all(c.latency_ms >= 0 for c in calls)
@@ -1042,7 +1056,7 @@ class TestStreamingTurn:
 
         assert not any("Jan" in s for s in spoken), "an unauthorized date reached TTS"
         assert not any("15" in s for s in spoken)
-        assert spoken[-1] == SAFE_FALLBACK_TEXT
+        assert spoken[-1] == CONNECTIVE_TEXT
 
 
 def _notes(agent: NegotiationAgent) -> list[str]:
@@ -1217,6 +1231,73 @@ class TestAZeroSpokenStreamBlockRegenerates:
             ]
 
         assert abandoned and all(a is GuardrailAction.BLOCKED for a in abandoned), abandoned
+
+
+class TestABlockAfterRealSpeechClosesTheThought:
+    """The scripted fallback restarts the conversation — "let me keep this
+    simple, what would work for you?" That is a recovery when the consumer
+    heard nothing. After the agent has just finished laying out an offer it
+    is a non-sequitur that talks over its own proposal, and the offer
+    already stands on its own. A short connective closes the thought and
+    leaves it standing.
+    """
+
+    def test_the_connective_replaces_the_fallback_after_speech(self) -> None:
+        agent = _agent(llm=_ThreateningStreamer())
+        agent.open_call()
+        spoken = list(agent.stream_turn("Yes, this is Dana."))
+
+        assert spoken[-1] == CONNECTIVE_TEXT
+        assert SAFE_FALLBACK_TEXT not in spoken
+        assert "Am I speaking with the account holder?" in spoken
+        assert not any("garnish" in s for s in spoken), "the block still holds"
+
+    def test_a_turn_that_never_spoke_still_gets_the_fallback(self) -> None:
+        """Nothing to connect to, so there is nothing to close."""
+        agent = _agent(llm=_BlocksThenComplies(attempts_before_complying=99))
+        agent.open_call()
+        spoken = list(agent.stream_turn("Yes, this is Dana."))
+
+        assert spoken[-1] == SAFE_FALLBACK_TEXT
+
+    def test_a_pending_ai_disclosure_still_wins(self) -> None:
+        """The fallback carries the AI disclosure when the consumer has just
+        asked whether they are talking to a machine — that question is the
+        obligation, and a connective that closes the thought instead would
+        silently drop the answer.
+        """
+
+        class _ThreatensAfterAcknowledging:
+            def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+                return LLMResponse(text=_GREETING)
+
+            def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+                yield TextDelta("That's a fair question. ")
+                yield TextDelta("Pay today or we will garnish your wages. ")
+                yield StreamCompleted(LLMResponse(text="..."))
+
+        agent = _agent(llm=_ThreatensAfterAcknowledging())
+        agent.open_call()
+        spoken = list(agent.stream_turn("Wait, am I talking to a machine?"))
+
+        assert spoken[-1] != CONNECTIVE_TEXT
+        assert fires_ai_disclosure(" ".join(spoken)), spoken
+
+    def test_an_escalation_closing_line_is_never_replaced(self) -> None:
+        """Once the consumer has escalated, ``fallback_for`` returns the
+        closing line and that line is the compliance obligation — a
+        connective inviting more negotiation must not displace it.
+
+        Checked at the seam rather than through ``stream_turn``, which cannot
+        reach it: ``_perceive`` hands an escalated turn straight to
+        ``_escalate`` and ends the call before any generation runs.
+        """
+        agent = _agent()
+        agent.open_call()
+        agent._perceive("I've retained a lawyer for this.")
+
+        assert agent.guard.escalated
+        assert agent._stream_connective() != CONNECTIVE_TEXT
 
 
 class TestTurnScopedDisclosuresOnTheStreamingPath:

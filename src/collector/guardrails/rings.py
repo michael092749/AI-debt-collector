@@ -59,6 +59,14 @@ SAFE_FALLBACK_TEXT = (
     "I'd rather not misstate anything, so let me keep this simple. What would work for you?"
 )
 
+# What to say when a block lands *after* real speech. The fallback above
+# restarts the conversation — reasonable when the consumer heard nothing, a
+# non-sequitur when the agent has just finished laying out an offer. This
+# closes the thought instead and leaves what was already said standing.
+# Deliberately says nothing: no figure, nothing substantive, and no term the
+# negotiation ring would read as bargaining after an escalation.
+CONNECTIVE_TEXT = "Does that work for you?"
+
 
 class GuardrailRing(StrEnum):
     PRE_CALL = "pre_call"
