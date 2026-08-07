@@ -30,7 +30,7 @@ decided. If it's evaluated conditions and a policy path, the engine did."*
 
 ```bash
 uv sync                            # everything below needs no keys at all
-uv run pytest                      # 792 tests, offline
+uv run pytest                      # 796 tests, offline
 uv run collector-text              # negotiate in a terminal, mock model, no keys
 ```
 
@@ -256,7 +256,7 @@ rounding nit, so `Money` refuses to be constructed from one at all.
 
 ## Testing
 
-`uv run pytest` — **792 tests, no API key, no network.** `addopts = "-m 'not evals'"`
+`uv run pytest` — **796 tests, no API key, no network.** `addopts = "-m 'not evals'"`
 deselects the 73 tier-2 evals; run those explicitly with `uv run pytest -m evals
 tests/evals`.
 
@@ -343,6 +343,17 @@ route has to stream for the model's speed to reach the consumer's ear any sooner
 `openrouter` route is uncertified besides (`MAX_TOOL_ROUNDS` and the regeneration-strike budget
 were tuned against Claude, so `tests/evals/` and the adversarial pass have to be re-run before it
 carries a real call).
+
+**A faster model is `COLLECTOR_MODEL`, not a new route.** `claude-haiku-4-5` is reachable on the
+certified Anthropic path today and inherits streaming and caching for free — no second client, no
+second transcript mapping. It has one non-obvious cost: the minimum cacheable prefix is per-model
+and **not monotonic** (512 tokens on `claude-opus-5`, 1024 on `claude-sonnet-5`, 4096 on
+`claude-haiku-4-5`), and this system prompt plus six tool schemas is on the order of two thousand
+tokens — over Sonnet's minimum, under Haiku's. So switching to Haiku for latency silently switches
+prompt caching *off* and partly cancels itself, with no error anywhere. The client detects that at
+runtime and logs `prompt caching reported no read and no write` once per call; it is still a
+re-certification decision, because the same swap changes the model the guardrail budgets were
+tuned against.
 
 **Tracing is off by default and it fails loudly.** `COLLECTOR_TRACING` accepts `off`/unset and
 `otlp` and nothing else: any other value raises at start-up rather than reading as "off", and
