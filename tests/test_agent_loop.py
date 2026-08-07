@@ -127,6 +127,24 @@ class TestToolWhitelist:
         assert result.proposal.total == Money(Decimal("850.50"))
 
 
+def _rule_on_something(context: ToolContext) -> ToolContext:
+    """Put a capacity on the record so the ladder can be walked at all.
+
+    ``concede`` refuses until ``validate_consumer_offer`` has told the engine
+    what the consumer can manage; without it the T2 step invents a maximized
+    downpayment nobody asked for. $750 is the ceiling the engine would have
+    taken on its own, so the schedules the tests below were written against
+    are unchanged.
+    """
+    return execute(
+        ToolCall(
+            name="validate_consumer_offer",
+            arguments={"total": "750", "payment_count": 1, "cadence": "immediate"},
+        ),
+        context,
+    ).context
+
+
 class TestConcessionsAreEarned:
     def test_concede_refuses_without_a_refusal_on_record(self) -> None:
         context = ToolContext.opening(POLICY)
@@ -135,11 +153,40 @@ class TestConcessionsAreEarned:
         assert not result.ok
         assert result.payload["may_concede"] is False
 
+    def test_concede_refuses_before_anything_has_been_ruled_on(self) -> None:
+        """The $200 call. The consumer said "I can make a payment of two hundred
+        dollars", the agent said "that works", and the next thing it put up was
+        $750 today and $250 next month.
+
+        The figures were engine-authored, so no guardrail could catch them: the
+        model never called ``validate_consumer_offer``, ``signaled_capacity``
+        stayed ``None`` — its only writer is that tool — and ``build_counter``
+        with no capacity takes the T2 ceiling by design
+        (``decision_engine.py:401-407``). The engine was never told, so the
+        refusal belongs at the tool layer, next to the one that already stops a
+        concession with no refusal on record.
+        """
+        context = ToolContext.opening(POLICY)
+        context = execute(ToolCall(name="propose_offer"), context).context
+        context = execute(ToolCall(name="record_refusal"), context).context
+
+        result = execute(ToolCall(name="concede"), context)
+
+        assert not result.ok, (
+            "conceded to a maximized downpayment with no capacity ever ruled on: "
+            f"{result.payload.get('offer_on_the_table')}"
+        )
+        state = result.context.state
+        assert state.ladder_floor is Tier.PAY_IN_FULL, "the ladder moved on a refused concession"
+        assert state.can_concede, "the refusal that earned the attempt was spent for nothing"
+        assert result.context.standing_offer == context.standing_offer
+
     def test_concede_never_hands_back_a_harder_offer(self) -> None:
         """The tier order puts settlement above payment plan, so a naive step
         down can raise the ask. Walking the ladder must never do that."""
         context = ToolContext.opening(POLICY)
         context = execute(ToolCall(name="propose_offer"), context).context
+        context = _rule_on_something(context)
         standing = context.standing_offer
         assert standing is not None
 
@@ -198,6 +245,7 @@ class TestConcessionsAreEarned:
         $800 settlement is handing us $100, and it closes at $900."""
         context = ToolContext.opening(POLICY)
         context = execute(ToolCall(name="propose_offer"), context).context
+        context = _rule_on_something(context)
         for _ in range(2):
             context = execute(ToolCall(name="record_refusal"), context).context
             context = execute(ToolCall(name="concede"), context).context
@@ -320,6 +368,7 @@ class TestConcessionsAreEarned:
         zero benefit (ADVERSARIAL_TESTING.md L1)."""
         context = ToolContext.opening(POLICY)
         context = execute(ToolCall(name="propose_offer"), context).context
+        context = _rule_on_something(context)
 
         moved_to_worse = False
         for _ in range(6):
@@ -659,6 +708,35 @@ class TestTurnLoop:
         )
 
 
+class TestFallbackSpeechRecord:
+    """``record_fallback_speech`` must leave one turn per exchange, whichever
+    path the transport failed down."""
+
+    APOLOGY = "Sorry, I had trouble hearing that — could you say that again?"
+
+    class _RaisingClient:
+        def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+            raise RuntimeError("upstream rate limit")
+
+    def test_the_apology_still_appends_after_a_raising_text_turn(self) -> None:
+        """The text path's contract, unchanged: ``turn()`` appends nothing
+        when it raises, so the apology is the turn — and an earlier, genuinely
+        spoken turn is never mistaken for the silent one to complete."""
+        agent = _agent()
+        agent.open_call()
+        first = agent.turn("Yes, speaking.")
+        agent.llm = self._RaisingClient()
+
+        with pytest.raises(RuntimeError):
+            agent.turn("What do I owe?")
+
+        turn = agent.record_fallback_speech(self.APOLOGY)
+
+        assert agent.turns == [first, turn]
+        assert turn.spoken == self.APOLOGY
+        assert turn.consumer == "What do I owe?"
+
+
 class TestEscalationCallback:
     """A6 ends the call; it must not end it on a dismissal.
 
@@ -935,8 +1013,18 @@ class TestBalanceInquiry:
     def test_a_genuine_concession_keeps_its_fallback_framing(self) -> None:
         """Regression guard: distinguishing a fresh propose_offer from a
         concede result must not also swallow the "here's what I can do
-        instead" framing that a real concession earns."""
-        agent = _run(["Yes, this is Dana.", "not right now", "No, too much."])
+        instead" framing that a real concession earns.
+
+        The "$300 a month" turn is load-bearing: a concession is refused until
+        the engine has been told what the consumer can manage."""
+        agent = _run(
+            [
+                "Yes, this is Dana.",
+                "not right now",
+                "I can only manage $300 a month",
+                "No, too much.",
+            ]
+        )
         spoken = agent.turns[-1].spoken
         assert spoken is not None
         assert "here's what i can do instead" in spoken.lower()

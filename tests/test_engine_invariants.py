@@ -16,10 +16,12 @@ from pathlib import Path
 import pytest
 
 from collector.decision_engine import Verdict, build_counter, validate_offer
+from collector.llm.base import ToolCall
 from collector.money import Money
 from collector.negotiation import NegotiationState
 from collector.offers import Cadence, ConsumerProposal, Offer, Tier
 from collector.policy import PolicyConfig
+from collector.tools import ToolContext, execute
 
 POLICY = PolicyConfig.default()
 
@@ -159,6 +161,102 @@ class TestInvariantsHoldEverywhere:
                     assert max(i.amount for i in offer.installments) <= capacity, (
                         f"{label}: instalment above capacity when a legal schedule existed"
                     )
+
+    def test_the_tool_layer_never_emits_a_counter_the_engine_was_underinformed_for(
+        self,
+    ) -> None:
+        """The seam the sweep above never crossed.
+
+        Every capacity rule here is stated against ``build_counter``, which the
+        tests hand ``capacity=`` directly. The production caller does not: the
+        tools call it with no ``capacity`` at all and rely on the
+        ``state.signaled_capacity`` fallback — and that field has exactly one
+        writer, ``validate_consumer_offer``. Skip that tool and the engine is
+        asked to counter knowing nothing, which at DOWNPAYMENT_PLUS_ONE means
+        taking the ceiling: a consumer who said "two hundred" gets asked for
+        $750 today, in figures the engine authored and therefore authorized.
+
+        So the rule is asserted where the model actually stands: over every
+        short sequence of tool calls, an offer that reaches the table is either
+        built on a capacity the state holds, or is the opening pay-in-full,
+        whose schedule no capacity could shape.
+        """
+        walkable = (
+            ToolCall(name="propose_offer"),
+            ToolCall(name="record_refusal"),
+            ToolCall(name="concede"),
+            ToolCall(
+                name="validate_consumer_offer",
+                arguments={"total": "200", "payment_count": 1, "cadence": "immediate"},
+            ),
+        )
+        for walk in itertools.product(walkable, repeat=4):
+            context = ToolContext.opening(POLICY)
+            for step, call in enumerate(walk):
+                result = execute(call, context)
+                context = result.context
+                offer = result.offer
+                if not result.ok or offer is None:
+                    continue
+                label = f"{'->'.join(c.name for c in walk[: step + 1])}"
+                _assert_offer_legal(offer, label)
+
+                capacity = context.state.signaled_capacity
+                if capacity is None:
+                    assert offer.tier is Tier.PAY_IN_FULL, (
+                        f"{label}: put {offer.tier.label} terms on the table with "
+                        "nothing on record about what the consumer can pay"
+                    )
+                    continue
+                # Same bound as the sweep above: a capacity funds a tier only if
+                # the whole total fits in the instalments that tier allows, each
+                # still clearing the floor. Where it does, the figure they named
+                # must lead the schedule rather than be quietly discarded.
+                needed = _payments_needed(offer.total, capacity)
+                room = int(offer.total.amount / POLICY.min_payment.amount)
+                if needed <= min(POLICY.max_payments_for(offer.tier), room):
+                    assert max(i.amount for i in offer.installments) <= capacity, (
+                        f"{label}: instalment above the capacity on record"
+                    )
+
+    def test_per_payment_phrasing_reaches_the_engine_as_the_full_sum(self) -> None:
+        """ "Two payments of five hundred" is an offer of $1,000, not $500.
+
+        Consumers name per-payment figures; the model is forbidden arithmetic,
+        so the schema must accept the figure verbatim and multiply in the
+        engine's world. Before ``amount_each`` existed the model's only move
+        was ``total=500``, which the engine read as a $500 lowball with a $250
+        capacity — and countered $250/$750 at a consumer offering the whole
+        balance (live call, 2026-08-07).
+        """
+        result = execute(
+            ToolCall(
+                name="validate_consumer_offer",
+                arguments={"amount_each": "500.00", "payment_count": 2, "cadence": "monthly"},
+            ),
+            ToolContext.opening(POLICY),
+        )
+        assert result.ok, result.payload
+        ruled = result.context.state.rounds[-1].proposal
+        assert ruled is not None
+        assert ruled.total == Money("1000"), (
+            f"engine ruled on {ruled.total}, not the 2 x $500 the consumer offered"
+        )
+
+    def test_amount_each_and_total_together_are_rejected_not_guessed(self) -> None:
+        result = execute(
+            ToolCall(
+                name="validate_consumer_offer",
+                arguments={
+                    "total": "1000.00",
+                    "amount_each": "500.00",
+                    "payment_count": 2,
+                    "cadence": "monthly",
+                },
+            ),
+            ToolContext.opening(POLICY),
+        )
+        assert not result.ok
 
     def test_ladder_never_moves_backwards(self) -> None:
         """A4: once conceded to a tier, the engine never counters above it."""

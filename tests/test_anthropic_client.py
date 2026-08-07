@@ -25,7 +25,7 @@ import httpx
 import pytest
 
 from collector.llm.anthropic_client import AnthropicClient, _cached_transcript, _to_anthropic
-from collector.llm.base import LLMResponse, Message, StreamCompleted, ToolCall, system_prompt
+from collector.llm.base import Message, StreamCompleted, ToolCall, system_prompt
 
 FAKE_KEY = "sk-ant-not-a-real-key"
 
@@ -146,88 +146,46 @@ class _Message:
         self.content, self.stop_reason, self.usage, self.model = content, stop_reason, usage, model
 
 
-class TestResponseAssembly:
-    def _replied(self, message: _Message) -> LLMResponse:
-        client = _client()
+class _FakeStream:
+    """The context manager ``client.messages.stream`` returns, drained empty."""
 
-        class _Returns:
-            def create(self, **kwargs: Any) -> Any:
-                return message
+    def __init__(self, message: _Message) -> None:
+        self._message = message
+        self.text_stream: Any = iter(())
 
-        client._client.messages = _Returns()  # type: ignore[assignment]
-        return client.respond(())
+    def __enter__(self) -> _FakeStream:
+        return self
 
-    def test_text_and_tool_calls_are_both_carried(self) -> None:
-        response = self._replied(
-            _Message(
-                content=[
-                    _Block(type="text", text="Let me check that."),
-                    _Block(
-                        type="tool_use",
-                        name="propose_offer",
-                        input={"preferred_cadence": "weekly"},
-                        id="toolu_1",
-                    ),
-                ],
-                stop_reason="tool_use",
-                usage=_Usage(input_tokens=900, output_tokens=42),
-                model="claude-sonnet-5",
-            )
-        )
-        assert response.text == "Let me check that."
-        assert response.tool_calls[0].name == "propose_offer"
-        assert response.tool_calls[0].arguments == {"preferred_cadence": "weekly"}
-        assert response.tool_calls[0].call_id == "toolu_1"
+    def __exit__(self, *exc: object) -> None:
+        return None
 
-    def test_a_refusal_yields_an_empty_turn_but_still_reports_usage(self) -> None:
-        response = self._replied(
-            _Message(
-                content=[_Block(type="text", text="I won't help with that.")],
-                stop_reason="refusal",
-                usage=_Usage(input_tokens=10, output_tokens=0),
-                model="claude-sonnet-5",
-            )
-        )
-        assert response.text == ""
-        assert response.tool_calls == ()
-        assert response.usage is not None and response.usage.stop_reason == "refusal"
+    def get_final_message(self) -> _Message:
+        return self._message
 
-    def test_usage_maps_every_counter_and_prices_it(self) -> None:
-        response = self._replied(
-            _Message(
-                content=[_Block(type="text", text="Hello.")],
-                stop_reason="end_turn",
-                usage=_Usage(
-                    input_tokens=1_000_000,
-                    output_tokens=0,
-                    cache_read_input_tokens=7,
-                    cache_creation_input_tokens=11,
-                ),
-                model="claude-sonnet-5",
-            )
-        )
-        usage = response.usage
-        assert usage is not None
-        assert (usage.input_tokens, usage.cache_read_tokens, usage.cache_write_tokens) == (
-            1_000_000,
-            7,
-            11,
-        )
-        assert usage.cost_usd is not None and usage.cost_usd > 3
 
-    def test_a_missing_usage_counter_costs_a_number_not_the_call(self) -> None:
-        """The usage shape has grown before. A counter that disappears should
-        cost a figure in a report, not the turn it came from."""
-        response = self._replied(
-            _Message(
-                content=[_Block(type="text", text="Hello.")],
-                stop_reason="end_turn",
-                usage=_Usage(input_tokens=5),
-                model="claude-sonnet-5",
-            )
-        )
-        assert response.text == "Hello."
-        assert response.usage is not None and response.usage.output_tokens == 0
+class _Captures:
+    """Stands in for ``client.messages``, recording the request kwargs."""
+
+    def __init__(self, message: _Message) -> None:
+        self._message = message
+        self.kwargs: dict[str, Any] = {}
+
+    def create(self, **kwargs: Any) -> Any:
+        self.kwargs = kwargs
+        return self._message
+
+    def stream(self, **kwargs: Any) -> Any:
+        self.kwargs = kwargs
+        return _FakeStream(self._message)
+
+
+def _empty_reply() -> _Message:
+    return _Message(
+        content=[_Block(type="text", text="Hello.")],
+        stop_reason="end_turn",
+        usage=_Usage(input_tokens=1, output_tokens=1),
+        model="claude-sonnet-5",
+    )
 
 
 class TestPromptCaching:

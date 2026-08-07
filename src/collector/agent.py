@@ -958,16 +958,37 @@ class NegotiationAgent:
         ``collector-voice start`` the framework formats records as JSON and
         merges arbitrary extras in as top-level keys, so ``elapsed_ms`` is a
         queryable number rather than a substring of one opaque string.
+
+        The token counts ride along here as well as on ``ModelCalled``, and the
+        duplication is deliberate. ``ModelCalled`` goes to the audit store,
+        which on a cloud deployment is a container-local file destroyed when
+        the replica cycles; the log drain is the only surface that survives a
+        finished job. Without these fields, per-call cost and cache
+        effectiveness are unmeasurable in production.
+
+        ``cost_usd`` is deliberately *not* here. It is a ``Decimal``, and the
+        framework's JSON encoder falls back to ``str()`` for types it cannot
+        serialize, so it would land as a quoted string — the opposite of the
+        reason these fields go in ``extra=`` at all. It stays a Decimal on
+        ``ModelCalled``, and a drain can recompute it from these counts.
+
+        ``None`` rather than an omitted key when the call failed and reported
+        no usage: a missing measurement must not read as zero tokens.
         """
         start = time.monotonic()
         response = self.llm.respond(tuple(self.messages))
         elapsed_ms = (time.monotonic() - start) * 1000
+        usage = response.usage
         logger.info(
             "llm_respond",
             extra={
                 "turn": self._turn_index,
                 "label": label,
                 "elapsed_ms": round(elapsed_ms),
+                "input_tokens": usage.input_tokens if usage is not None else None,
+                "output_tokens": usage.output_tokens if usage is not None else None,
+                "cache_read_tokens": usage.cache_read_tokens if usage is not None else None,
+                "cache_write_tokens": usage.cache_write_tokens if usage is not None else None,
             },
         )
         self._record_model_call(response)

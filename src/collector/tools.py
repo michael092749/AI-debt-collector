@@ -250,9 +250,23 @@ TOOL_SCHEMAS: tuple[ToolSchema, ...] = (
                 name="total",
                 kind=ParamKind.MONEY,
                 description=(
-                    "Total they offered to pay, as a decimal string, e.g. '500.00'. "
-                    "Omit it when they proposed only a structure and no sum — "
-                    "'weekly for a year' — and the full balance is assumed."
+                    "The one overall sum they offered to pay, as a decimal string, "
+                    "e.g. '850.00'. Only for a sum they named as the whole amount. "
+                    "If they sized the payments instead — 'two payments of five "
+                    "hundred' — pass amount_each and leave this out; never multiply "
+                    "it out yourself. Omit both when they proposed only a structure "
+                    "and no figure — 'weekly for a year' — and the full balance is "
+                    "assumed."
+                ),
+            ),
+            Param(
+                name="amount_each",
+                kind=ParamKind.MONEY,
+                description=(
+                    "What they offered per payment, as a decimal string, when they "
+                    "named the size of each payment rather than an overall sum. "
+                    "Relay their figure verbatim; the engine does the multiplying. "
+                    "Never pass both this and total."
                 ),
             ),
             Param(
@@ -401,12 +415,30 @@ def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult
             "this call has run its course; close it out with end_call rather than "
             "evaluating another proposal",
         )
-    proposal = ConsumerProposal(
+    # Two ways to name the money, because that is how it arrives: "eight
+    # fifty all in" is a total, "two payments of five hundred" is a size of
+    # each. The model relays whichever was said verbatim — it is forbidden
+    # arithmetic — so the multiplication happens here. Both at once is a
+    # contradiction to send back, not a guess to make.
+    if "amount_each" in args and "total" in args:
+        return _error(
+            name,
+            context,
+            "total and amount_each together are ambiguous: pass the one figure "
+            "the consumer actually said, and let the engine do the rest",
+        )
+    amount_each = args.get("amount_each")
+    total = (
+        amount_each * args["payment_count"]
+        if amount_each is not None
         # Membership, not truthiness. "They proposed $0" and "they named no sum
         # at all" are different negotiation states — the first is a lowball to
         # rule on, the second means the balance stands and only the structure
         # is in question — and a falsy-zero would silently merge them.
-        total=args.get("total", context.policy.original_balance),
+        else args.get("total", context.policy.original_balance)
+    )
+    proposal = ConsumerProposal(
+        total=total,
         payment_count=args["payment_count"],
         cadence=args["cadence"],
         signaled_capacity=args.get("signaled_capacity"),
@@ -527,6 +559,37 @@ def _concede(args: JsonDict, context: ToolContext) -> ToolResult:
         )
     if context.state.is_exhausted:
         return _error(name, context, "round limit reached; close the call out with end_call")
+    # A concession is the first place the engine has to guess at what the
+    # consumer can put down: stepping to DOWNPAYMENT_PLUS_ONE with no capacity
+    # on record takes the ceiling by design (decision_engine.py:401-407), so a
+    # consumer who said "two hundred" and was never relayed gets asked for
+    # $750 today. Nothing above the engine can catch that — the engine authored
+    # the figures, so it authorized them (decision_engine.py:127-131). The
+    # signal is only missing because the model skipped the tool that carries
+    # it: ``signaled_capacity`` is written nowhere but validate_consumer_offer,
+    # and once written it is never cleared, so this refuses at most once, before
+    # the first ruling of the call.
+    #
+    # ``propose_offer`` reads the same field and needs no equivalent guard: it
+    # only reaches that branch below PAY_IN_FULL, and this is the sole caller of
+    # advance_ladder(), so a moved ladder now implies a capacity on record. That
+    # is an argument, so it is also swept: test_engine_invariants.py walks every
+    # short tool sequence and asserts it of whatever reaches the table.
+    #
+    # The round is recorded even though the call is refused, for the same reason
+    # a non-concession step records one further down: a consumer who keeps
+    # refusing without ever naming a figure would otherwise never advance the
+    # round count, leaving the cap unreachable and the call unable to close.
+    if context.state.signaled_capacity is None:
+        return _error(
+            name,
+            context._with(context.state.record_round(None, None, None)),
+            "nothing on record about what they can manage, and a concession has to "
+            "be built around that. If they named an amount, a payment count or a "
+            "timeframe, put it through validate_consumer_offer first; if they have "
+            "not, ask them what they can manage before conceding",
+            may_concede=True,
+        )
     cadence = _cadence_arg(args)
 
     # Step until the terms actually improve for the consumer. Two ways a step

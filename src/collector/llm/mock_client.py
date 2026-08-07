@@ -349,6 +349,23 @@ class MockLLMClient:
 
     # -- reading the conversation back -------------------------------------
 
+    # In rotation, never in repetition: two consecutive capacity refusals from
+    # concede must not produce the same sentence twice (the anti-badgering
+    # rule the agent-loop tests assert of every spoken line).
+    _CAPACITY_ASKS = (
+        "Is there an amount you could put toward this today?",
+        "What figure would actually be workable on your side?",
+        "If the full amount is out of reach, what could you do?",
+    )
+
+    def _capacity_ask(self, messages: tuple[Message, ...]) -> str:
+        asked = sum(
+            1
+            for m in messages
+            if m.role == "agent" and any(ask in m.content for ask in self._CAPACITY_ASKS)
+        )
+        return self._CAPACITY_ASKS[asked % len(self._CAPACITY_ASKS)]
+
     def _speak_from_tool(self, content: str, messages: tuple[Message, ...]) -> LLMResponse:
         payload = _load(content)
         # The notice rides out with the first figures, so it must not ride out
@@ -367,7 +384,8 @@ class MockLLMClient:
             else f"{MINI_MIRANDA_TEXT} "
         )
         if not payload.get("ok"):
-            if "end_call" in str(payload.get("error", "")):
+            error = str(payload.get("error", ""))
+            if "end_call" in error:
                 # Every tool refuses this way once the round cap is hit
                 # (tools.py's own instruction is to close out with end_call
                 # rather than keep negotiating) — without this, the call has
@@ -381,6 +399,13 @@ class MockLLMClient:
                         ),
                     )
                 )
+            if "what they can manage" in error:
+                # Concede refused for want of a capacity on record: the
+                # corrective instruction is to ask the consumer for a figure,
+                # and a real model rotates its phrasing rather than badger
+                # with the same sentence — the anti-repeat invariant holds
+                # for this line like any other.
+                return LLMResponse(text=f"{notice}{self._capacity_ask(messages)}")
             return LLMResponse(
                 text=f"{notice}Give me one moment — let me check what I can do here."
             )
