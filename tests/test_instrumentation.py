@@ -27,6 +27,8 @@ import pytest
 from collector.agent import NegotiationAgent, _split_sentences
 from collector.audit.events import (
     EventType,
+    GuardrailAction,
+    GuardrailTripped,
     ModelCalled,
     Speaker,
     ToolInvoked,
@@ -41,7 +43,11 @@ from collector.guardrails.disclosures import (
     DisclosureId,
     fires_ai_disclosure,
 )
-from collector.guardrails.rings import SAFE_FALLBACK_TEXT, PreCallContext
+from collector.guardrails.rings import (
+    MAX_REGENERATION_STRIKES,
+    SAFE_FALLBACK_TEXT,
+    PreCallContext,
+)
 from collector.llm.base import (
     LLMClient,
     LLMResponse,
@@ -1095,6 +1101,122 @@ class TestABlockedStreamTellsTheModelWhy:
         list(agent.stream_turn("Yes, this is Dana."))
 
         assert not _notes(agent)
+
+
+class _BlocksThenComplies:
+    """Blocks on its first streamed attempt, then says something clean.
+
+    The block lands on the *first* sentence, so nothing has been spoken and
+    the streaming contract's reason for aborting — "a retry would contradict
+    what the consumer just heard" — does not apply.
+    """
+
+    def __init__(self, attempts_before_complying: int = 1) -> None:
+        self.attempts_before_complying = attempts_before_complying
+        self.attempts = 0
+        self.prompts: list[tuple[Message, ...]] = []
+
+    def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+        return LLMResponse(text=_GREETING)
+
+    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        self.attempts += 1
+        self.prompts.append(messages)
+        if self.attempts <= self.attempts_before_complying:
+            yield TextDelta("Pay today or we will garnish your wages. ")
+        else:
+            yield TextDelta("Thanks for confirming. ")
+            yield TextDelta("What would be manageable for you? ")
+        yield StreamCompleted(LLMResponse(text="..."))
+
+
+class TestAZeroSpokenStreamBlockRegenerates:
+    """The streaming path aborted to the scripted fallback on *any* block.
+
+    The reason it gives is sound only when something has already been
+    spoken: a retry would then contradict live audio. When the block lands
+    before a single sentence has gone to TTS, nothing has been contradicted,
+    and the turn can be rewritten exactly the way the text path rewrites it.
+    Aborting there spent a scripted non-sequitur on a turn that had every
+    chance of clearing on the second attempt.
+    """
+
+    def test_a_block_before_any_speech_is_rewritten_not_abandoned(self) -> None:
+        llm = _BlocksThenComplies()
+        agent = _agent(llm=llm)
+        agent.open_call()
+        spoken = list(agent.stream_turn("Yes, this is Dana."))
+        joined = " ".join(spoken)
+
+        assert llm.attempts == 2, "the turn was never retried"
+        assert "Thanks for confirming." in joined
+        assert SAFE_FALLBACK_TEXT not in joined
+        assert not any("garnish" in s for s in spoken)
+        assert agent.turns[-1].blocked, "the block still belongs on the record"
+
+    def test_the_retry_is_told_why_before_it_runs(self) -> None:
+        """A rewrite asked with unchanged context reproduces the blocked
+        phrasing and burns the strike budget for nothing."""
+        llm = _BlocksThenComplies()
+        agent = _agent(llm=llm)
+        agent.open_call()
+        list(agent.stream_turn("Yes, this is Dana."))
+
+        assert len(llm.prompts) == 2, "no retry to inspect"
+        retry_prompt = " ".join(m.content for m in llm.prompts[1])
+        assert "THREAT" in retry_prompt, "the retry was asked blind"
+        assert "garnish" in retry_prompt, "and was not told which phrasing to drop"
+
+    def test_rewrites_are_capped_by_the_existing_strike_budget(self) -> None:
+        """A model that will not comply must still stop costing round-trips."""
+        llm = _BlocksThenComplies(attempts_before_complying=99)
+        agent = _agent(llm=llm)
+        agent.open_call()
+        spoken = list(agent.stream_turn("Yes, this is Dana."))
+
+        assert llm.attempts == MAX_REGENERATION_STRIKES
+        assert spoken[-1] == SAFE_FALLBACK_TEXT
+
+    def test_a_block_after_real_speech_still_does_not_retry(self) -> None:
+        """The contract that survives: those sentences are already audio."""
+        llm = _ThreateningStreamer()
+        agent = _agent(llm=llm)
+        agent.open_call()
+        list(agent.stream_turn("Yes, this is Dana."))
+
+        assert llm.__class__ is _ThreateningStreamer
+        assert agent.turns[-1].spoken is not None
+        assert "Am I speaking with the account holder?" in agent.turns[-1].spoken
+
+    def test_the_audit_log_says_regenerated_only_when_it_regenerated(
+        self, tmp_path: Path
+    ) -> None:
+        """An audit trail that says "blocked" about a turn that was rewritten,
+        or "regenerated" about one that was abandoned, is a false record of
+        what the guard did."""
+        with AuditStore(tmp_path / "retried.db", json_dir=tmp_path) as store:
+            agent = _agent(store, llm=_BlocksThenComplies())
+            agent.open_call()
+            list(agent.stream_turn("Yes, this is Dana."))
+            retried = [
+                event.action
+                for event in store.trace(agent.call_id)
+                if isinstance(event, GuardrailTripped)
+            ]
+
+        assert retried and all(a is GuardrailAction.REGENERATED for a in retried), retried
+
+        with AuditStore(tmp_path / "abandoned.db", json_dir=tmp_path) as store:
+            agent = _agent(store, llm=_ThreateningStreamer())
+            agent.open_call()
+            list(agent.stream_turn("Yes, this is Dana."))
+            abandoned = [
+                event.action
+                for event in store.trace(agent.call_id)
+                if isinstance(event, GuardrailTripped)
+            ]
+
+        assert abandoned and all(a is GuardrailAction.BLOCKED for a in abandoned), abandoned
 
 
 class TestTurnScopedDisclosuresOnTheStreamingPath:

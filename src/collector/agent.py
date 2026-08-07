@@ -23,8 +23,9 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from collector.audit.events import (
     CallEnded,
@@ -201,6 +202,14 @@ def _split_sentences(buffer: str) -> tuple[list[str], str]:
     return sentences, buffer[cursor:].lstrip()
 
 
+class _Outcome(StrEnum):
+    """What a streamed round leaves the turn to do next."""
+
+    CONTINUE = "continue"
+    REGENERATE = "regenerate"
+    FALLBACK = "fallback"
+
+
 @dataclass
 class _Round:
     """What one streamed round produced, beside the sentences it yielded.
@@ -214,16 +223,35 @@ class _Round:
     blocked: str | None = None
     # Why it was blocked, in the guard's own words, for the model to read.
     note: str | None = None
+    # The guard's strike budget is spent; a rewrite is no longer on offer.
+    exhausted: bool = False
 
     @property
     def failed(self) -> bool:
         return self.response is not None and self.response.error is not None
 
-    def needs_fallback(self, spoken: list[str]) -> bool:
-        """A blocked sentence always falls back; a failed call only if the
-        round said nothing, since a scripted line after real speech reads as a
-        non-sequitur rather than a recovery."""
-        return self.blocked is not None or (self.failed and not spoken)
+    def outcome(self, spoken: list[str]) -> _Outcome:
+        """What the turn does next, given what it has already put on the wire.
+
+        ``spoken`` is the whole turn's speech, not this round's: once any
+        sentence is audio, every later block in the same turn is judged
+        against the fact that the consumer has heard something.
+        """
+        if self.blocked is not None:
+            # Nothing spoken means nothing contradicted, so the turn can be
+            # rewritten the way the text path rewrites it. This is the case
+            # the old always-abort rule handled worst: a scripted
+            # non-sequitur spent on a turn that had every chance of clearing
+            # on the second attempt.
+            if not spoken and not self.exhausted:
+                return _Outcome.REGENERATE
+            return _Outcome.FALLBACK
+        # A failed call only falls back if the round said nothing, since a
+        # scripted line after real speech reads as a non-sequitur rather
+        # than a recovery.
+        if self.failed and not spoken:
+            return _Outcome.FALLBACK
+        return _Outcome.CONTINUE
 
 
 @dataclass(frozen=True)
@@ -369,13 +397,22 @@ class NegotiationAgent:
         the consumer's ear while the rest is still being written. That is the
         entire sub-500ms first-audio budget.
 
-        One rule differs, and it is not negotiable. ``turn()`` can regenerate a
-        blocked turn because nothing was spoken yet and the contract holds —
-        "blocked, so the consumer did not hear it". Mid-stream that contract is
-        already false: earlier sentences are audio. So a block here **aborts the
-        stream and speaks the scripted fallback**. Retrying would mean
-        contradicting something the consumer just heard, which is worse than the
-        sentence that was blocked.
+        One rule differs, and what it turns on is whether anything is already
+        audio. ``turn()`` can regenerate a blocked turn because nothing was
+        spoken yet and the contract holds — "blocked, so the consumer did not
+        hear it". Here that contract survives exactly as long as the turn has
+        stayed silent:
+
+        * **Block before a single sentence went to TTS** — nothing is
+          contradicted, so the turn is rewritten, on the guard's own strike
+          budget, the same way ``turn()`` rewrites it.
+        * **Block after real speech** — retrying would mean contradicting
+          something the consumer just heard, which is worse than the sentence
+          that was blocked. The stream aborts.
+
+        The earlier rule aborted in both cases. That was right about the second
+        and wrong about the first, where it spent a scripted non-sequitur on a
+        turn that had every chance of clearing on the second attempt.
 
         The turn is appended to ``self.turns`` however the iterator ends,
         including when the caller stops listening. Barge-in is the ordinary
@@ -424,16 +461,29 @@ class NegotiationAgent:
         closing = False
 
         try:
-            for _ in range(MAX_TOOL_ROUNDS + 1):
+            # Tool rounds plus, at most, the guard's strike budget in
+            # rewrites. Rewrites only happen while nothing has been spoken and
+            # each one spends a strike that a clean sentence would have to
+            # reset, so the two budgets cannot compound past this.
+            for _ in range(MAX_TOOL_ROUNDS + MAX_REGENERATION_STRIKES + 1):
                 round_ = _Round()
-                for sentence in self._stream_round(round_):
+                for sentence in self._stream_round(round_, spoken):
                     spoken.append(sentence)
                     yield sentence
 
                 if round_.blocked is not None:
                     blocked.append(round_.blocked)
                     pending_note = round_
-                if round_.needs_fallback(spoken):
+
+                outcome = round_.outcome(spoken)
+                if outcome is _Outcome.REGENERATE:
+                    # Nothing is on the wire, so nothing is contradicted by
+                    # trying again — but the retry has to be told what it may
+                    # not say, or it writes the blocked sentence a second time.
+                    self._note_block(round_)
+                    pending_note = None
+                    continue
+                if outcome is _Outcome.FALLBACK:
                     fallback = self._stream_fallback()
                     spoken.append(fallback)
                     yield fallback
@@ -485,12 +535,17 @@ class NegotiationAgent:
             self.messages.append(Message(role="agent", content=" ".join(spoken[already:])))
         return len(spoken)
 
-    def _stream_round(self, round_: _Round) -> Iterator[str]:
+    def _stream_round(self, round_: _Round, spoken: Sequence[str] = ()) -> Iterator[str]:
         """One streamed round, yielding each chunk that clears the guard.
 
-        Stops at the first blocked chunk — the abort the streaming contract
-        requires. What the round produced besides speech (the assembled
-        response, the blocked text) lands on ``round_``.
+        Stops at the first blocked chunk. What the round produced besides
+        speech (the assembled response, the blocked text and why) lands on
+        ``round_``, and the caller decides from there whether the turn is
+        rewritten or abandoned.
+
+        ``spoken`` is what the *turn* has already put on the wire, read at the
+        moment a chunk is blocked rather than at the start of the round —
+        a round can speak one sentence cleanly and block the next.
         """
         buffer = ""
         # Complete sentences withheld from TTS because a disclosure rule is
@@ -508,7 +563,7 @@ class NegotiationAgent:
                             if self._owes_a_disclosure(held):
                                 continue
                             candidate, held = held, ""
-                            allowed = self._guard_sentence(candidate, round_)
+                            allowed = self._guard_sentence(candidate, round_, spoken)
                             if allowed is None:
                                 return
                             yield allowed
@@ -523,7 +578,7 @@ class NegotiationAgent:
             # the whole chunk gets judged on that.
             tail = f"{held} {buffer.strip()}".strip() if held else buffer.strip()
             if tail:
-                allowed = self._guard_sentence(tail, round_)
+                allowed = self._guard_sentence(tail, round_, spoken)
                 if allowed is not None:
                     yield allowed
         finally:
@@ -593,16 +648,21 @@ class NegotiationAgent:
         """
         return bool(self.guard.disclosures.check_agent_turn(candidate))
 
-    def _guard_sentence(self, sentence: str, round_: _Round) -> str | None:
+    def _guard_sentence(
+        self, sentence: str, round_: _Round, spoken: Sequence[str] = ()
+    ) -> str | None:
         """The pre-TTS gate for one sentence. ``None`` means do not speak it.
 
         A block lands on ``round_`` — the text that was stopped and the guard's
         own account of why — because the caller is what decides between
         aborting and retrying, and both need the reason.
 
-        Records the trip as ``BLOCKED`` rather than ``REGENERATED``: on the
-        streaming path there is no retry, and an audit log that says
-        "regenerated" about a turn that was abandoned is a false record.
+        The trip is recorded as whichever of the two actually follows, which
+        is decidable here: a turn is rewritten only when nothing has been
+        spoken and the strike budget is unspent, and both are known at the
+        moment of the block. An audit log that says "regenerated" about a
+        turn that was abandoned — or "blocked" about one that was rewritten —
+        is a false record of what the guard did.
         """
         candidate = sentence.strip()
         if not candidate:
@@ -624,6 +684,8 @@ class NegotiationAgent:
 
         round_.blocked = sentence
         round_.note = check.regeneration_note()
+        round_.exhausted = check.fallback_text is not None
+        rewriting = not spoken and not round_.exhausted
         for violation in check.blocking_violations:
             self._record(
                 GuardrailTripped(
@@ -631,7 +693,9 @@ class NegotiationAgent:
                     turn_index=self._turn_index,
                     ring=GuardrailRing.DURING_CALL,
                     rule_id=violation.rule_id,
-                    action=GuardrailAction.BLOCKED,
+                    action=(
+                        GuardrailAction.REGENERATED if rewriting else GuardrailAction.BLOCKED
+                    ),
                     detail=violation.detail,
                     blocked_text=candidate,
                 )

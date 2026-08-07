@@ -394,7 +394,11 @@ class TestEveryLayerReachesTheTrace:
         agent = _agent()
         agent.open_call()
         round_ = _Round()
-        blocked = agent._guard_sentence("Pay today or we will garnish your wages.", round_)
+        # A sentence is already audio, so this block aborts rather than being
+        # rewritten — which is what makes the recorded action "blocked".
+        blocked = agent._guard_sentence(
+            "Pay today or we will garnish your wages.", round_, ("Hello there.",)
+        )
         # One span per blocking rule: the threat, the unauthorized figure and
         # the missing Mini-Miranda all fire on that one sentence.
         trips = _named(spans, "guardrail_trip")
