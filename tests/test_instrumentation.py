@@ -891,20 +891,25 @@ class TestStreamingTurn:
         """
 
         class ThreateningStreamer:
+            attempts = 0
+
             def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
                 # Used only for the opening line, which stream_turn does not drive.
                 return LLMResponse(text=_GREETING)
 
             def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+                type(self).attempts += 1
                 yield TextDelta("Am I speaking with the account holder? ")
                 yield TextDelta("Pay today or we will garnish your wages. ")
                 yield TextDelta("So what will it be? ")
                 yield StreamCompleted(LLMResponse(text="..."))
 
-        agent = _agent(llm=ThreateningStreamer())
+        llm = ThreateningStreamer()
+        agent = _agent(llm=llm)
         agent.open_call()
         spoken = list(agent.stream_turn("Yes, this is Dana."))
 
+        assert llm.attempts == 1, "the model was asked again after speech was already out"
         assert "Am I speaking with the account holder?" in spoken
         assert not any("garnish" in s for s in spoken)
         # Nothing substantive was said, so the closer is the fallback rather
@@ -1305,7 +1310,64 @@ class TestAZeroSpokenStreamBlockRegenerates:
                 if isinstance(event, GuardrailTripped)
             ]
 
-        assert abandoned and all(a is GuardrailAction.BLOCKED for a in abandoned), abandoned
+        # Nothing substantive was spoken, so the turn is handed to the
+        # scripted fallback and the trail says so — the text path's own word
+        # for the same situation. See TestTheTrailSaysHowAStreamedTurnClosed.
+        assert abandoned and all(
+            a is GuardrailAction.SAFE_FALLBACK for a in abandoned
+        ), abandoned
+
+
+def _actions(store: AuditStore, agent: NegotiationAgent) -> list[GuardrailAction]:
+    return [
+        event.action
+        for event in store.trace(agent.call_id)
+        if isinstance(event, GuardrailTripped)
+    ]
+
+
+class TestTheTrailSaysHowAStreamedTurnClosed:
+    """A streamed turn now ends one of three ways — rewritten, closed on the
+    connective, or handed to the scripted fallback. The trail knew two
+    verbs, so it could not say which line the consumer actually heard, and
+    it disagreed with the text path about the one situation they share.
+    """
+
+    def test_a_streamed_fallback_is_recorded_the_way_the_text_path_records_it(
+        self, tmp_path: Path
+    ) -> None:
+        """Same situation, same word for it. Counting scripted lines off the
+        trail otherwise undercounts the voice path to zero."""
+        with AuditStore(tmp_path / "stream.db", json_dir=tmp_path) as store:
+            streamed = _agent(store, llm=_BlocksThenComplies(attempts_before_complying=99))
+            streamed.open_call()
+            spoken = list(streamed.stream_turn("Yes, this is Dana."))
+            streamed_actions = _actions(store, streamed)
+
+        with AuditStore(tmp_path / "text.db", json_dir=tmp_path) as store:
+            texted = _agent(store, llm=_AlwaysBlocked())
+            texted.open_call()
+            texted._perceive("Yes, this is Dana.")
+            texted.turn("What are my options?")
+            text_actions = _actions(store, texted)
+
+        assert spoken[-1] == SAFE_FALLBACK_TEXT
+        assert GuardrailAction.SAFE_FALLBACK in text_actions, "the text path's own word"
+        assert GuardrailAction.SAFE_FALLBACK in streamed_actions, streamed_actions
+
+    def test_a_connective_close_is_not_recorded_as_a_fallback(self, tmp_path: Path) -> None:
+        """The consumer heard the offer plus "Does that work for you?" in one
+        case and a scripted restart in the other. A reader of the trail has
+        to be able to tell those apart."""
+        with AuditStore(tmp_path / "connective.db", json_dir=tmp_path) as store:
+            agent = _agent(store, llm=_ThreatensAfterDisclosing())
+            agent.open_call()
+            spoken = list(agent.stream_turn("Yes, this is Dana."))
+            actions = _actions(store, agent)
+
+        assert spoken[-1] == CONNECTIVE_TEXT
+        assert actions and GuardrailAction.SAFE_FALLBACK not in actions, actions
+        assert GuardrailAction.CONNECTIVE in actions, actions
 
 
 class TestABlockAfterRealSpeechClosesTheThought:
@@ -1364,23 +1426,23 @@ class TestABlockAfterRealSpeechClosesTheThought:
         asked whether they are talking to a machine — that question is the
         obligation, and a connective that closes the thought instead would
         silently drop the answer.
+
+        Checked at the seam, like the escalation case and for a similar
+        reason: ``stream_turn`` cannot reach this branch either.
+        ``_owes_a_disclosure`` withholds every sentence while the request is
+        outstanding, so a turn with the flag set has no speech to close on
+        and takes the rewrite path instead. Driving it through
+        ``stream_turn`` produces a test that passes on the strength of that
+        detour while asserting nothing about this branch at all.
         """
-
-        class _ThreatensAfterAcknowledging:
-            def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
-                return LLMResponse(text=_GREETING)
-
-            def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
-                yield TextDelta("That's a fair question. ")
-                yield TextDelta("Pay today or we will garnish your wages. ")
-                yield StreamCompleted(LLMResponse(text="..."))
-
-        agent = _agent(llm=_ThreatensAfterAcknowledging())
+        agent = _agent()
         agent.open_call()
-        spoken = list(agent.stream_turn("Wait, am I talking to a machine?"))
+        agent._perceive("Wait, am I talking to a machine?")
+        assert agent.guard.disclosures.ai_disclosure_requested
 
-        assert spoken[-1] != CONNECTIVE_TEXT
-        assert fires_ai_disclosure(" ".join(spoken)), spoken
+        line = agent._stream_connective()
+        assert line != CONNECTIVE_TEXT
+        assert fires_ai_disclosure(line), line
 
     def test_an_escalation_closing_line_is_never_replaced(self) -> None:
         """Once the consumer has escalated, ``fallback_for`` returns the
@@ -1457,12 +1519,24 @@ class TestRepeatedFallbacksEscalateToTheStandingOffer:
         ``check_outbound`` entirely — so a line that would *not* have cleared
         is a line that reaches TTS unchecked. Every figure in it comes from
         the engine's own offer, and that has to be true by test, not by
-        inspection."""
+        inspection.
+
+        The default offer is pay-in-full, whose only figure is the account
+        balance — and ``authorized_for`` puts the balance in the base set
+        before any offer exists. A line built from that clears against a
+        guard that has never seen an offer, so it cannot detect a broken
+        offer-to-authorized derivation. Concede first, so the figures are
+        the schedule's and nothing else.
+        """
         agent = self._agent_with_an_offer(_AlwaysBlocked())
+        agent._run_tool(_call("record_refusal"))
+        agent._run_tool(_call("concede"))
         agent.turn("What are my options?")
         line = agent._fallback_line()
+        balance = str(POLICY.original_balance)
 
         assert line != SAFE_FALLBACK_TEXT
+        assert balance not in line, f"only the balance is proven by this: {line}"
         check = check_outbound(agent.guard, line, authorized=agent.authorized)
         assert check.allowed, check.violations
 

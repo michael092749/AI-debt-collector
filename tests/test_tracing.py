@@ -408,7 +408,9 @@ class TestEveryLayerReachesTheTrace:
         for span in trips:
             assert span.attributes is not None
             assert span.attributes["collector.guardrail.ring"] == "during_call"
-            assert span.attributes["collector.guardrail.action"] == "blocked"
+            # Something non-substantive was already audio, so this block ends
+            # the turn on the scripted line rather than rewriting it.
+            assert span.attributes["collector.guardrail.action"] == "safe_fallback"
             assert span.attributes["collector.guardrail.rule_id"]
             assert "garnish" not in str(span.attributes)
 

@@ -64,11 +64,20 @@ class Speaker(StrEnum):
 
 
 class GuardrailAction(StrEnum):
-    """What the guardrail did about it. ``BLOCKED`` means nothing was spoken."""
+    """What the guardrail did about it. ``BLOCKED`` means nothing was spoken.
+
+    ``CONNECTIVE`` is the streaming path's third way to close a turn: the
+    blocked sentence was dropped, but substantive speech had already gone to
+    TTS, so the turn ends on a short scripted connective instead of the
+    conversation-restarting fallback. Recording it as ``SAFE_FALLBACK`` would
+    say the consumer heard a line they did not, and as ``BLOCKED`` that they
+    heard nothing.
+    """
 
     BLOCKED = "blocked"
     REGENERATED = "regenerated"
     SAFE_FALLBACK = "safe_fallback"
+    CONNECTIVE = "connective"
     ESCALATED = "escalated"
 
 

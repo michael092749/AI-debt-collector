@@ -213,6 +213,23 @@ class _Outcome(StrEnum):
     FALLBACK = "fallback"
 
 
+# How a blocked round reads on the compliance record. The streaming path
+# recorded every block as ``BLOCKED``, which said the consumer heard nothing
+# and disagreed with the text path about the one case they share — a turn
+# handed to the scripted fallback, which ``turn()`` has always called
+# ``SAFE_FALLBACK``. Anything counting scripted lines off the trail therefore
+# undercounted the voice path to zero.
+_ACTION_FOR: dict[_Outcome, GuardrailAction] = {
+    _Outcome.REGENERATE: GuardrailAction.REGENERATED,
+    _Outcome.CONNECTIVE: GuardrailAction.CONNECTIVE,
+    _Outcome.FALLBACK: GuardrailAction.SAFE_FALLBACK,
+    # A round that was blocked and still says CONTINUE cannot happen — the
+    # predicate returns it only when nothing blocked — but a dict lookup
+    # should not be the thing that discovers that.
+    _Outcome.CONTINUE: GuardrailAction.BLOCKED,
+}
+
+
 @dataclass
 class _Round:
     """What one streamed round produced, beside the sentences it yielded.
@@ -733,7 +750,11 @@ class NegotiationAgent:
         round_.blocked = sentence
         round_.note = check.regeneration_note()
         round_.exhausted = check.fallback_text is not None
-        rewriting = may_rewrite and not spoken and not round_.exhausted
+        # Asked of the same function the caller will ask, rather than
+        # re-derived from the same inputs: two copies of this rule drift, and
+        # the drift is only ever visible in the compliance record, where it is
+        # least likely to be noticed and most expensive to have been wrong.
+        action = _ACTION_FOR[round_.outcome(list(spoken), may_rewrite=may_rewrite)]
         for violation in check.blocking_violations:
             self._record(
                 GuardrailTripped(
@@ -741,9 +762,7 @@ class NegotiationAgent:
                     turn_index=self._turn_index,
                     ring=GuardrailRing.DURING_CALL,
                     rule_id=violation.rule_id,
-                    action=(
-                        GuardrailAction.REGENERATED if rewriting else GuardrailAction.BLOCKED
-                    ),
+                    action=action,
                     detail=violation.detail,
                     blocked_text=candidate,
                 )
