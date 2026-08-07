@@ -27,7 +27,11 @@ import pytest
 from collector.agent import NegotiationAgent, _split_sentences
 from collector.audit.events import EventType, ModelCalled, ToolInvoked, event_from_json, event_json
 from collector.audit.store import DB_PATH_ENV_VAR, DEFAULT_DB_PATH, AuditStore, default_db_path
-from collector.guardrails.disclosures import AI_DISCLOSURE_TEXT
+from collector.guardrails.disclosures import (
+    AI_DISCLOSURE_TEXT,
+    DisclosureId,
+    fires_ai_disclosure,
+)
 from collector.guardrails.rings import SAFE_FALLBACK_TEXT, PreCallContext
 from collector.llm.base import (
     LLMClient,
@@ -170,16 +174,32 @@ class TestToolInstrumentation:
     def test_every_tool_call_is_logged_not_just_the_ruling_ones(self, tmp_path: Path) -> None:
         """``DecisionRecorded`` is the compliance record and only two tools
         produce one. The other four move the negotiation and used to leave no
-        trace of having been called at all."""
+        trace of having been called at all.
+
+        Every one of the six is driven explicitly. An earlier version of this
+        test ran a script that only reached ``validate_consumer_offer`` and
+        ``confirm_agreement``, so reverting to verdict-only logging left all of
+        its assertions passing — it could not catch the regression it exists
+        for.
+        """
         with AuditStore(tmp_path / "c.db", json_dir=tmp_path) as store:
-            agent = _run(SCRIPT, store)
+            agent = _agent(store)
+            agent.open_call()
+            agent._perceive("Yes, this is Dana.")
+            for call in (
+                _call("propose_offer"),
+                _call("validate_consumer_offer", payment_count=1, cadence="immediate", total="50"),
+                _call("record_refusal"),
+                _call("concede"),
+                _call("confirm_agreement"),
+                _call("end_call", reason="wrapped up"),
+            ):
+                agent._run_tool(call)
             invocations = store.tool_calls(agent.call_id)
 
-        assert invocations
-        assert {i.tool for i in invocations} <= {s.name for s in TOOL_SCHEMAS}
-        # confirm_agreement produces no verdict of its own on the decisions
-        # table, so this is the only place it appears.
-        assert "confirm_agreement" in {i.tool for i in invocations}
+        assert {i.tool for i in invocations} == {s.name for s in TOOL_SCHEMAS}, (
+            "all six tools must leave a trace, not just the ruling ones"
+        )
         assert all(i.latency_ms >= 0 for i in invocations)
 
     def test_a_failed_tool_call_records_its_reason(self, tmp_path: Path) -> None:
@@ -205,6 +225,106 @@ class TestToolInstrumentation:
             ]
 
         assert invocation.arguments == {"payment_count": 2, "cadence": "MONTHLY"}
+
+
+class TestInstrumentationDoesNotBreakTheCall:
+    """Regressions found by review. Each of these killed a live call.
+
+    The shared shape: a tool or a model call worked, and then *recording* it
+    raised or lost the record. Instrumentation added to observe a system must
+    not be able to take it down.
+    """
+
+    def test_a_float_argument_survives_the_audit_write(self, tmp_path: Path) -> None:
+        """JSON has one number type and it decodes to float. ``_parse_money``
+        exists to absorb that; logging the raw arguments must not undo it.
+
+        Before the fix: ``execute()`` returned ``ok`` and then ``to_jsonable``
+        raised ``TypeError: float 500.5 in an audit record``, which unwound
+        through ``_run_tool`` and ended the call.
+        """
+        with AuditStore(tmp_path / "c.db", json_dir=tmp_path) as store:
+            agent = _agent(store)
+            agent.open_call()
+            agent._perceive("Yes, this is Dana.")
+            result = agent._run_tool(
+                _call("validate_consumer_offer", total=500.5, payment_count=2, cadence="monthly")
+            )
+            (invocation,) = [
+                i for i in store.tool_calls(agent.call_id) if i.tool == "validate_consumer_offer"
+            ]
+
+        assert result.ok
+        assert not agent.ended
+        # The digits the model actually emitted, kept as a string — never a
+        # float in the record (SPEC §9).
+        assert invocation.arguments["total"] == "500.5"
+
+    def test_a_failed_model_call_with_no_usage_still_leaves_a_reason(self, tmp_path: Path) -> None:
+        """Gating the event on ``usage`` meant a client that reports an error
+        without one logged nothing — "never fail into silence" held for the
+        consumer's ear and not for the audit trail."""
+
+        class BareFailure:
+            def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+                return LLMResponse(error="APIConnectionError: reset by peer")
+
+        with AuditStore(tmp_path / "c.db", json_dir=tmp_path) as store:
+            agent = _agent(store, llm=BareFailure())
+            _, spoken = agent.open_call()
+            calls = store.model_calls(agent.call_id)
+
+        assert spoken == SAFE_FALLBACK_TEXT
+        assert calls, "a failure with no usage record must still be on the trail"
+        assert "APIConnectionError" in (calls[0].error or "")
+
+
+class TestArgumentsCannotFalsifyTheRecord:
+    def test_a_non_finite_amount_is_refused_at_the_boundary(self) -> None:
+        """``Decimal("NaN")`` is a valid Decimal and quantizes to NaN, so it
+        cleared Money and reached ``validate_offer`` — which raised
+        ``InvalidOperation`` out of a function documented as pure and total,
+        escaping ``execute``'s ``ArgumentError`` catch and dropping the call.
+        """
+        result = execute(
+            _call("validate_consumer_offer", total="NaN", payment_count=1, cadence="immediate"),
+            ToolContext.opening(POLICY),
+        )
+        assert not result.ok
+        assert "finite" in result.payload["error"]
+
+    @pytest.mark.parametrize("bad", ["NaN", "-NaN", "sNaN", "Infinity", "-Infinity"])
+    def test_no_non_finite_spelling_gets_through(self, bad: str) -> None:
+        result = execute(
+            _call("validate_consumer_offer", total=bad, payment_count=1, cadence="immediate"),
+            ToolContext.opening(POLICY),
+        )
+        assert not result.ok
+
+    def test_an_unknown_argument_is_named_not_ignored(self) -> None:
+        """Silently dropping it turns a key confusion into a falsified decision
+        record: ``amount`` instead of ``total`` leaves ``total`` absent, the
+        full balance is assumed, the engine *accepts* $1,000 in one payment,
+        and the agreement describes a proposal the consumer never made.
+        """
+        result = execute(
+            _call("validate_consumer_offer", amount="500", payment_count=1, cadence="immediate"),
+            ToolContext.opening(POLICY),
+        )
+        assert not result.ok
+        assert "amount" in result.payload["error"]
+        assert "total" in result.payload["error"], "name what it should have said instead"
+        assert result.verdict is None, "nothing was ruled on"
+
+    def test_a_deliberate_full_balance_offer_still_works(self) -> None:
+        """The guard above must not block the legitimate case it resembles:
+        omitting ``total`` on purpose means the balance stands."""
+        result = execute(
+            _call("validate_consumer_offer", payment_count=1, cadence="immediate"),
+            ToolContext.opening(POLICY),
+        )
+        assert result.ok
+        assert result.verdict is not None and result.verdict.outcome == "accept"
 
 
 class TestModelInstrumentation:
@@ -374,6 +494,7 @@ class TestModelSelection:
         new one regresses, rather than editing a constant and shipping."""
         from collector.llm.anthropic_client import MODEL, MODEL_ENV_VAR, resolve_model
 
+        monkeypatch.delenv(MODEL_ENV_VAR, raising=False)
         assert resolve_model() == MODEL
         monkeypatch.setenv(MODEL_ENV_VAR, "claude-opus-5")
         assert resolve_model() == "claude-opus-5"
@@ -384,6 +505,7 @@ class TestStoreConfiguration:
     def test_the_db_path_can_be_set_by_the_environment(self, monkeypatch, tmp_path: Path) -> None:
         """A CWD-relative default breaks on the first deploy whose entrypoint
         does not run from the repo root."""
+        monkeypatch.delenv(DB_PATH_ENV_VAR, raising=False)
         assert default_db_path() == DEFAULT_DB_PATH
         monkeypatch.setenv(DB_PATH_ENV_VAR, str(tmp_path / "elsewhere.db"))
         assert default_db_path() == tmp_path / "elsewhere.db"
@@ -429,10 +551,16 @@ class TestEventRoundTrip:
         """A type missing from the trace query vanishes from the timeline
         without failing anything."""
         with AuditStore(tmp_path / "c.db", json_dir=tmp_path) as store:
-            agent = _run(SCRIPT, store)
+            agent = _agent(store, llm=_UsageMock())
+            agent.open_call()
+            for said in SCRIPT:
+                if agent.ended:
+                    break
+                agent.turn(said)
             kinds = {e.EVENT_TYPE for e in store.trace(agent.call_id)}
 
         assert EventType.TOOL_CALL in kinds
+        assert EventType.MODEL_CALL in kinds, "dropping it from _TRACE_EVENT_TYPES must fail here"
 
 
 # ==========================================================================
@@ -494,13 +622,15 @@ class TestOpeningIsNotStreamed:
         whose disclosure is not its opening clause.
         """
         agent = _agent()
-        greeting = agent.messages  # capture identity before the call
         _, spoken = agent.open_call()
 
         assert spoken is not None
         assert spoken != SAFE_FALLBACK_TEXT, "guarded whole, this clears; per sentence it would not"
-        assert AI_DISCLOSURE_TEXT.split(":")[0] in spoken
-        assert greeting is agent.messages
+        # The disclosure itself, not a prefix of it: asserting the leading
+        # clause ("Before we go further") would pass on a greeting that never
+        # mentions an AI at all.
+        assert fires_ai_disclosure(spoken), spoken
+        assert DisclosureId.AI_DISCLOSURE in agent.guard.disclosures.fired
 
     def test_the_mini_miranda_rule_does_compose_sentence_by_sentence(self) -> None:
         """It constrains *order* within a turn, and a per-sentence guard

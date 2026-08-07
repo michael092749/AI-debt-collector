@@ -61,6 +61,7 @@ from collector.guardrails.rings import (
 from collector.llm.base import (
     LLMClient,
     LLMResponse,
+    LLMUsage,
     Message,
     StreamCompleted,
     TextDelta,
@@ -82,6 +83,34 @@ MAX_TOOL_ROUNDS = 4
 # is what this splits — an abbreviation mid-sentence costs one early TTS flush,
 # not a compliance failure, because every fragment is guarded either way.
 _SENTENCE_END = re.compile(r"[.!?][\"')\]]*(?=\s)")
+
+
+def _loggable(arguments: dict[str, object]) -> dict[str, object]:
+    """The model's raw arguments, made safe to write to the audit log.
+
+    ``to_jsonable`` raises on a float, deliberately — a float in a payment
+    schedule is a compliance defect (SPEC §9). But JSON has one number type and
+    it decodes to float, so the model saying ``total: 500.5`` is *ordinary* and
+    ``_parse_money`` exists to absorb it. Logging the raw arguments without
+    this would mean the tool succeeded and then recording that success killed
+    the call — instrumentation defeating the tolerance it was added to observe.
+
+    Floats become their exact decimal string, the same route ``_parse_money``
+    takes, so the log keeps the digits the model actually emitted.
+    """
+    return {key: _loggable_value(value) for key, value in arguments.items()}
+
+
+def _loggable_value(value: object) -> object:
+    if isinstance(value, bool | int | str) or value is None:
+        return value
+    if isinstance(value, float):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _loggable_value(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_loggable_value(v) for v in value]
+    return str(value)
 
 
 def _split_sentences(buffer: str) -> tuple[list[str], str]:
@@ -501,7 +530,13 @@ class NegotiationAgent:
         return response
 
     def _record_model_call(self, response: LLMResponse) -> None:
-        usage = response.usage
+        # A failed call with no usage record still has to leave a reason on the
+        # trail. Gating the whole event on ``usage`` meant "never fail into
+        # silence" held for the consumer's ear and not for the audit log — the
+        # half that matters afterwards.
+        usage = response.usage or (
+            LLMUsage(model="unknown") if response.error is not None else None
+        )
         if usage is not None:
             self._record(
                 ModelCalled(
@@ -533,7 +568,7 @@ class NegotiationAgent:
                 call_id=self.call_id,
                 turn_index=self._turn_index,
                 tool=call.name,
-                arguments=dict(call.arguments),
+                arguments=_loggable(call.arguments),
                 ok=result.ok,
                 latency_ms=latency_ms,
                 error=None if result.ok else str(result.payload.get("error", "")),

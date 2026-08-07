@@ -121,9 +121,19 @@ def _parse_money(value: object) -> Money:
     """
     if isinstance(value, Money):
         return value
-    if isinstance(value, float | int | str | Decimal):
-        return Money(Decimal(str(value)))
-    raise ValueError(f"expected an amount, got {type(value).__name__}")
+    if not isinstance(value, float | int | str | Decimal):
+        raise ValueError(f"expected an amount, got {type(value).__name__}")
+    amount = Decimal(str(value))
+    # ``Decimal("NaN")`` is a valid Decimal and quantizes to NaN without
+    # complaint, so it clears Money and every check here — and then raises
+    # ``InvalidOperation`` on the first comparison inside ``validate_offer``,
+    # out of a function documented as pure and total. ``Infinity`` is caught by
+    # Money's quantize; NaN is the one that has to be named. (Rejected here
+    # rather than in Money so the model gets a readable tool error it can
+    # correct, instead of an exception that ends the call.)
+    if not amount.is_finite():
+        raise ValueError(f"expected a finite amount, got {value!r}")
+    return Money(amount)
 
 
 def _parse_count(value: object) -> int:
@@ -179,7 +189,21 @@ class ToolSchema:
         Absent optional arguments stay absent rather than becoming ``None``:
         the tools distinguish "they named no sum" from "they named nothing",
         and a default injected here would erase that distinction.
+
+        An *unknown* argument is an error, not something to ignore. Dropping it
+        silently is how a key confusion becomes a falsified decision record:
+        ``amount="500"`` instead of ``total="500"`` leaves ``total`` absent, so
+        the full balance is assumed, the engine accepts $1,000 in one payment,
+        and the agreement record describes a proposal the consumer never made.
+        Naming the bad key gives the model something it can correct.
         """
+        unknown = sorted(set(arguments) - {p.name for p in self.params})
+        if unknown:
+            known = ", ".join(p.name for p in self.params) or "none"
+            raise ArgumentError(
+                f"{self.name} has no argument {', '.join(repr(u) for u in unknown)}; "
+                f"accepted: {known}"
+            )
         parsed: JsonDict = {}
         for param in self.params:
             if param.name not in arguments or arguments[param.name] is None:
