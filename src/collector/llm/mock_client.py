@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from collector.guardrails.disclosures import (
-    AI_DISCLOSURE_TEXT,
+    AI_DISCLOSURE_WITH_HUMAN,
     MINI_MIRANDA_TEXT,
     confirms_identity,
     fires_mini_miranda,
@@ -226,11 +226,20 @@ class MockLLMClient:
     # -- turns -------------------------------------------------------------
 
     def _opening(self) -> str:
-        """Identity first, and the AI disclosure with it. No account details:
-        nothing substantive may be said before they confirm who they are."""
+        """Greeting, disclosure and identity question in one breath.
+
+        Written out rather than assembled from ``AI_DISCLOSURE_TEXT`` because
+        the point is that it is *one sentence* — the disclosure is a clause in
+        the greeting, not a sentence of its own ahead of it. What keeps it
+        honest is ``fires_ai_disclosure``, which is the same detector the guard
+        uses, so the phrasing cannot drift out of compliance unnoticed.
+
+        No account details: nothing substantive may be said before they confirm
+        who they are. The offer of a human is held back until it is relevant.
+        """
         return (
-            f"Hi, this is Avery calling from Meridian Recovery Services. {AI_DISCLOSURE_TEXT} "
-            "Am I speaking with the account holder?"
+            "Hi, this is an automated assistant calling from Meridian Recovery "
+            "Services — am I speaking with the account holder?"
         )
 
     def _on_consumer(self, said: str, messages: tuple[Message, ...]) -> LLMResponse:
@@ -241,20 +250,29 @@ class MockLLMClient:
         # AI_DISCLOSURE_REQUEST_IGNORED on every later candidate — including
         # ones about something else entirely — and the call never recovers
         # since nothing here ever actually fires the disclosure again.
+        #
+        # Every branch here answers a question the consumer actually asked, so
+        # each speaks the full disclosure: being asked what you are is the
+        # moment the offer of a person stops being throat-clearing and becomes
+        # the answer. The opening holds that half back precisely because nobody
+        # has asked yet.
         if requests_ai_disclosure(said):
             if not self._identity_confirmed(messages):
                 return LLMResponse(
-                    text=f"{AI_DISCLOSURE_TEXT} Am I speaking with the account holder?"
+                    text=f"{AI_DISCLOSURE_WITH_HUMAN} Am I speaking with the account holder?"
                 )
             if not self._disclosed(messages):
                 return LLMResponse(
                     text=(
-                        f"{AI_DISCLOSURE_TEXT} {MINI_MIRANDA_TEXT} I'm calling about an "
+                        f"{AI_DISCLOSURE_WITH_HUMAN} {MINI_MIRANDA_TEXT} I'm calling about an "
                         "overdue account, and I'd like to find something that works for you."
                     )
                 )
             return LLMResponse(
-                text=f"{AI_DISCLOSURE_TEXT} Now, back to your account — what would work for you?"
+                text=(
+                    f"{AI_DISCLOSURE_WITH_HUMAN} Now, back to your account — "
+                    "what would work for you?"
+                )
             )
 
         # Identity, then the Mini-Miranda, then anything about the account. The

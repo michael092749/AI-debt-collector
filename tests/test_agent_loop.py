@@ -18,10 +18,14 @@ from pathlib import Path
 
 import pytest
 
-from collector.agent import NegotiationAgent
+from collector.agent import _CONFIDENTIAL_REFERENCE, NegotiationAgent
 from collector.audit.store import AuditStore
 from collector.decision_engine import RationaleCode
 from collector.guardrails.disclosures import (
+    AI_DISCLOSURE_TEXT,
+    AI_DISCLOSURE_WITH_HUMAN,
+    HUMAN_AVAILABLE_TEXT,
+    MINI_MIRANDA_TEXT,
     DisclosureId,
     confirms_identity,
     denies_identity,
@@ -29,7 +33,12 @@ from collector.guardrails.disclosures import (
     fires_mini_miranda,
 )
 from collector.guardrails.numeric import FigureKind, extract_figures
-from collector.guardrails.rings import EscalationTrigger, PreCallContext
+from collector.guardrails.rings import (
+    SAFE_FALLBACK_TEXT,
+    EscalationTrigger,
+    PreCallContext,
+    _contains_verbatim_leak,
+)
 from collector.llm.anthropic_client import _to_anthropic
 from collector.llm.base import LLMResponse, Message, ToolCall, system_prompt
 from collector.llm.mock_client import MockLLMClient, parse_proposal
@@ -358,7 +367,12 @@ class TestTurnLoop:
         agent = _run(["Yes, this is her.", "What do you want?"])
         spoken = [m.content for m in agent.messages if m.role == "agent"]
 
-        assert "AI assistant" in spoken[0], "AI disclosure opens the call"
+        # Asked of the detector, not of a substring. The opening's wording is
+        # free to change — it since became one merged breath that says
+        # "automated assistant" rather than "AI assistant" — but what has to
+        # stay true is that the disclosure *fires*, and that is not a property
+        # of any particular phrase.
+        assert fires_ai_disclosure(spoken[0]), "AI disclosure opens the call"
         mini_miranda_turn = next(
             i for i, text in enumerate(spoken) if fires_mini_miranda(text) is not None
         )
@@ -479,6 +493,51 @@ class TestTurnLoop:
         check = agent._guard_and_speak(leak)
         spoken, blocked = check
         assert spoken != leak or blocked, "a verbatim system-prompt leak must not be spoken"
+
+    @pytest.mark.parametrize(
+        "script",
+        [
+            MINI_MIRANDA_TEXT,
+            AI_DISCLOSURE_TEXT,
+            HUMAN_AVAILABLE_TEXT,
+            AI_DISCLOSURE_WITH_HUMAN,
+            SAFE_FALLBACK_TEXT,
+        ],
+    )
+    def test_no_required_script_reads_as_a_prompt_leak(self, script: str) -> None:
+        """A line the agent is *required* to say must never be quotable from the
+        confidential reference.
+
+        The leak check blocks any turn sharing an eight-word run with the system
+        prompt or the tool schemas. So writing a required script into the prompt
+        as an example turns the guard against the very line it is guarding: the
+        compliant turn gets blocked, the agent strikes out, and the fallback
+        speaks instead. That is precisely what happened when the opening was
+        collapsed and its example sentence went into the prompt verbatim — five
+        blocked turns and an abandoned call, from a prompt edit that looked like
+        documentation. The prompt describes these lines; it must not quote them.
+        """
+        assert not _contains_verbatim_leak(script, _CONFIDENTIAL_REFERENCE), (
+            "this script is quotable from the system prompt or tool schemas, "
+            "so speaking it would be blocked as a leak"
+        )
+
+    def test_the_opening_turn_is_not_quotable_from_the_prompt(self) -> None:
+        """The regression itself: the opening is the turn that broke.
+
+        Collapsing the opening into one breath came with an example of that
+        breath written into the system prompt. The stand-in model said the
+        example, the leak check recognised its own prompt, and the opening was
+        blocked — every call abandoned before the first question. The example is
+        gone, and this asserts it stays gone.
+        """
+        agent = _agent()
+        _, opening = agent.open_call(
+            PreCallContext(account_loaded=True, within_calling_window=True)
+        )
+        assert opening is not None, "the opening turn was blocked outright"
+        assert fires_ai_disclosure(opening), "the opening must still disclose"
+        assert not _contains_verbatim_leak(opening, _CONFIDENTIAL_REFERENCE)
 
     def test_pre_call_block_means_no_call_is_placed(self) -> None:
         agent = _agent()

@@ -44,7 +44,7 @@ from collector.audit.store import AuditStore
 from collector.decision_engine import Verdict
 from collector.guardrails.confirmation import confirmation_line, repeats_back
 from collector.guardrails.disclosures import (
-    AI_DISCLOSURE_TEXT,
+    AI_DISCLOSURE_WITH_HUMAN,
     confirms_identity,
     denies_identity,
 )
@@ -1017,7 +1017,12 @@ class NegotiationAgent:
         """
         line = fallback_for(self.guard)
         if self.guard.disclosures.ai_disclosure_requested:
-            return f"{AI_DISCLOSURE_TEXT} {line}"
+            # The full disclosure, human offer included. This branch runs only
+            # because the consumer asked what they are talking to, which is
+            # exactly the moment the offer of a person is relevant — and it is
+            # code speaking because the model has already been blocked, so it
+            # is the wrong turn to be saying less than the whole thing.
+            return f"{AI_DISCLOSURE_WITH_HUMAN} {line}"
         return line
 
     def _speak_fallback(self) -> str:

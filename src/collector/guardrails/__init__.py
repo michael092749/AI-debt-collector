@@ -19,6 +19,8 @@ from collector.guardrails.confirmation import (
 )
 from collector.guardrails.disclosures import (
     AI_DISCLOSURE_TEXT,
+    AI_DISCLOSURE_WITH_HUMAN,
+    HUMAN_AVAILABLE_TEXT,
     MINI_MIRANDA_TEXT,
     DisclosureId,
     DisclosureRuleId,
@@ -71,6 +73,8 @@ from collector.guardrails.rings import (
 
 __all__ = [
     "AI_DISCLOSURE_TEXT",
+    "AI_DISCLOSURE_WITH_HUMAN",
+    "HUMAN_AVAILABLE_TEXT",
     "MAX_REGENERATION_STRIKES",
     "MINI_MIRANDA_TEXT",
     "SAFE_FALLBACK_TEXT",

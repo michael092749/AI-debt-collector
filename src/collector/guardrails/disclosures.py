@@ -44,10 +44,17 @@ MINI_MIRANDA_TEXT = (
     "This is an attempt to collect a debt, and any information obtained "
     "will be used for that purpose."
 )
-AI_DISCLOSURE_TEXT = (
-    "Before we go further: I'm an AI assistant calling on behalf of the creditor, "
-    "and you can ask for a human at any time."
-)
+# Split in two so the opening can be one breath. What the rule requires is that
+# the caller says it is not a person, and ``fires_ai_disclosure`` is what tests
+# for that; the offer of a human is a second promise riding along behind it.
+# Carrying both in the opening cost a sentence the consumer had no way to act on.
+AI_DISCLOSURE_TEXT = "I'm an automated assistant calling on behalf of the creditor."
+# Held back until it is relevant — the consumer asks, objects, or sounds
+# confused about what they are talking to. Whenever code speaks the disclosure
+# unprompted, it speaks both: see ``AI_DISCLOSURE_WITH_HUMAN``.
+HUMAN_AVAILABLE_TEXT = "You can ask to speak with a person at any time."
+# The full disclosure, for the paths where the question has actually been asked.
+AI_DISCLOSURE_WITH_HUMAN = f"{AI_DISCLOSURE_TEXT} {HUMAN_AVAILABLE_TEXT}"
 
 _MINI_MIRANDA_ATTEMPT_RE = re.compile(r"attempt\s+to\s+collect\s+a\s+debt", re.IGNORECASE)
 _MINI_MIRANDA_PURPOSE_RE = re.compile(

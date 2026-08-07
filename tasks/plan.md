@@ -52,14 +52,39 @@ any figure, which was only ever a proxy for the real rule. Collapsing the turns
 made a correct call fail it. It now compares offsets, which is what the guard
 itself compares.
 
-### Left open — needs a decision
+## Task 6 — Hold the human-availability line until it is relevant — DONE
 
-Dropping "you can ask for a human at any time" from the opening was **not**
-done. It would mean editing `AI_DISCLOSURE_TEXT`, which is a compliance script,
-and `agent.py:1020` prepends that same constant on the safe-fallback path —
-the path that speaks when the guard has already blocked the model twice.
-Shortening the constant silently narrows what the fallback discloses, on
-exactly the turns where the full text matters most. Asked separately.
+Raised as a compliance question, reaffirmed, and built.
+
+`AI_DISCLOSURE_TEXT` is now the tight "I'm an automated assistant calling on
+behalf of the creditor." `HUMAN_AVAILABLE_TEXT` carries the offer of a person,
+and `AI_DISCLOSURE_WITH_HUMAN` joins them. Every path where the consumer has
+actually asked speaks the joined version — `agent.py::_fallback_line` and the
+`requests_ai_disclosure` branches of the mock. Only the unprompted opening
+holds the second half back, which is exactly the scope of the request.
+
+Also from the same round: the prompt now tells the model not to narrate its own
+bookkeeping ("let me note this as declined and see what else is available").
+
+### The bug this round produced, and the test that now prevents it
+
+Writing the new opening into `SYSTEM_PROMPT` *as a verbatim example* broke every
+call. `_contains_verbatim_leak` blocks any turn sharing an eight-word run with
+the confidential reference, and the confidential reference is the system prompt.
+So the model said the example, the guard recognised its own prompt, the opening
+was blocked, the agent struck out, and the call abandoned before the first
+question — 30 tests red from what looked like a documentation edit.
+
+The rule is now explicit: **the prompt may describe a required line but must
+never quote it.** That is why `MINI_MIRANDA_TEXT` and the disclosure scripts
+were never in the prompt to begin with. Two tests hold it:
+`test_no_required_script_reads_as_a_prompt_leak` over every script constant,
+and `test_the_opening_turn_is_not_quotable_from_the_prompt` over the live
+opening — the latter verified to fail when the example is put back.
+
+`test_disclosures_fire_in_order_and_before_any_substance` also stopped asserting
+the substring "AI assistant" and now asks `fires_ai_disclosure`. The opening's
+wording is free to change; that the disclosure fires is not.
 
 ## Task 2 — Post-call artifact — PENDING
 
