@@ -49,7 +49,9 @@ closed agreement no lower than $800 total / $250 per payment.
 
 ## The policy
 
-Every limit is a field or property of `PolicyConfig` in `policy.py`, and nowhere else:
+Every *policy* limit is a field or property of `PolicyConfig` in `policy.py`, and nowhere
+else. (The turn-loop caps are separate and live in `agent.py`: `MAX_TOOL_ROUNDS = 4`,
+`MAX_REGENERATION_STRIKES = 2`.)
 
 | Field | Value | Source |
 |---|---|---|
@@ -85,7 +87,8 @@ arithmetic, and each one is a test:
    $500.
 3. **The per-payment floor binds harder than the discount.** Every instalment of an $800
    settlement must clear $250, so 200/300/300 is illegal. The engine splits evenly —
-   266.67/266.67/266.66 — and pins to the floor only when an even split would fall below it.
+   266.67/266.67/266.66 — and leads with a capacity the consumer named when that still
+   leaves every later instalment above the floor: $300 signalled gives 300/250/250.
 4. **T2 maximizes the downpayment.** Given signalled capacity `c`, the counter is
    `downpayment = clamp(c, 250, 750)` with the remainder in one further payment.
 
@@ -105,7 +108,7 @@ these by ID.
 | **A4** | Concessions are monotonic. The ladder runs T1→T4 and never back up, and a withdrawn term is never re-offered. Negotiation integrity, not a brief requirement. |
 | **A5** | No payment capture. The agent closes and logs an *agreement*; it never touches a card or bank account. Keeps PCI scope at zero. |
 | **A6** | Escalation terminates the call. No human queue in this build: on dispute, hardship, distress, attorney, or cease-and-desist the agent stops negotiating, says a human will follow up, and writes an `escalation` record. A real deployment swaps in a warm transfer; the trigger logic is identical. |
-| **A7** | Legal is not the same as agreeable. A proposal that clears every floor but sits below the current ladder position is *countered* at the ladder rather than accepted (`LADDER` condition, rationale `PREFERRED_TIER_AVAILABLE`). Without this the first figure a consumer names decides the call. Exception: a tier they already proposed, that was countered for the ladder alone, on terms no worse than before — they have heard the better ask and held to legal terms. Known limit: the engine is turn-free, so a model that validates the same proposal twice inside one turn satisfies that repeat without the counter ever reaching the consumer's ear. `max_negotiation_rounds` bounds it; closing it properly needs a turn index the engine deliberately does not have. |
+| **A7** | Legal is not the same as agreeable. A proposal that clears every floor but sits below the current ladder position is *countered* at the ladder rather than accepted (`LADDER` condition, rationale `PREFERRED_TIER_AVAILABLE`). Without this the first figure a consumer names decides the call. Exception: a tier they already proposed, that was countered for the ladder alone, on terms no worse than before — they have heard the better ask and held to legal terms. Known limit: the engine is turn-free, so a model that validates the same proposal twice inside one turn satisfies that repeat without the counter ever reaching the consumer's ear. `MAX_TOOL_ROUNDS` bounds the repeats inside a turn and `max_negotiation_rounds` the call as a whole; closing it properly needs a turn index the engine deliberately does not have. |
 
 ## Architecture
 
@@ -256,7 +259,9 @@ tests/evals`.
 - **Tier 2** (`tests/evals/`) — eight adversarial personas (lowballer, impossible-schedule, rage,
   evasive/silent, hardship, verbal dispute, jailbreaker, serial re-negotiator) driven by
   `claude-sonnet-5` for genuinely unpredictable pressure when a key is configured, with scripted
-  transcripts as the offline fallback — so `pytest -m evals` stays green either way. Assertions run
+  transcripts as the offline fallback. Offline it is deterministic and green; against live
+  models it is a real gate and can fail — a `coherence_judge` fail on the rage persona is a
+  result, not a flake. Assertions run
   over the *whole transcript*: no prohibited phrase, no unauthorized figure, no agreement below
   the floors, disclosures fired in order, escalation where the persona calls for it, and the
   post-call compliance verdict itself. One transcript per persona is built once per session and
@@ -326,7 +331,8 @@ cp .env.example .env
 | `COLLECTOR_TRACING` | OpenTelemetry span export. `off` (default) or `otlp` — see Observability |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_HEADERS` | Where `COLLECTOR_TRACING=otlp` sends spans, and how it authenticates |
 
-Everything through the tier-2 eval suite runs with none of the above set.
+Everything through the tier-2 eval suite runs with none of the above set — the personas fall
+back to scripted transcripts and the LLM judges skip.
 
 ## Boundaries
 
