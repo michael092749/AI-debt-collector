@@ -38,8 +38,8 @@ The spec's build order lists `negotiation.py` at step 3, but `validate_offer()` 
 ```python
 @dataclass(frozen=True)
 class NegotiationState:
-    ladder_floor: Tier          # best tier still on the table (A4 monotonicity)
-    signaled_capacity: Money | None   # what the consumer said they can afford
+    ladder_floor: Tier  # best tier still on the table (A4 monotonicity)
+    signaled_capacity: Money | None  # what the consumer said they can afford
     offers_made: tuple[Offer, ...]
 ```
 

@@ -274,11 +274,33 @@ class TestNumericAuthorization:
         (violation,) = check_numeric("That's $250 now and $350 in 30 days.", authorized)
         assert violation.span == "$350"
 
-    def test_policy_figures_are_authorized(self, policy: PolicyConfig) -> None:
+    def test_the_balance_is_authorized_but_the_policy_limits_are_not(
+        self, policy: PolicyConfig
+    ) -> None:
+        """SPEC §5.2: a figure must be in the engine's *currently*-authorized set.
+
+        The balance is an account fact handed over with the file. The $250
+        minimum and the 20% discount ceiling are the engine's private
+        thresholds — sayable only once the engine has actually surfaced them.
+        """
         authorized = authorized_for(policy)
         assert check_numeric("The balance is $1,000.00.", authorized) == ()
-        assert check_numeric("Payments can't be under $250.", authorized) == ()
-        assert check_numeric("The most I can discount is 20%.", authorized) == ()
+
+        (floor,) = check_numeric("Payments can't be under $250.", authorized)
+        assert floor.rule_id == NumericRuleId.UNAUTHORIZED_AMOUNT
+        (discount,) = check_numeric("The most I can discount is 20%.", authorized)
+        assert discount.rule_id == NumericRuleId.UNAUTHORIZED_PERCENT
+
+    def test_a_policy_figure_unlocks_once_the_engine_surfaces_it(
+        self, policy: PolicyConfig, settlement_offer: Offer
+    ) -> None:
+        """The gate is temporal, not permanent: $800 is unsayable until the
+        engine puts an $800 settlement on the table, and sayable after."""
+        before = authorized_for(policy)
+        assert check_numeric("I could settle this at $800.", before) != ()
+
+        after = authorized_for(policy, offers=(settlement_offer,))
+        assert check_numeric("I could settle this at $800.", after) == ()
 
     def test_unauthorized_percent_blocks(self, policy: PolicyConfig) -> None:
         (violation,) = check_numeric("I can knock 50% off.", authorized_for(policy))
@@ -287,10 +309,23 @@ class TestNumericAuthorization:
     def test_duration_units_are_compared_in_days(self, policy: PolicyConfig) -> None:
         """'three months' and '90 days' are the same authorization; rephrasing an
         engine figure in friendlier units is not the failure mode we're chasing."""
-        authorized = authorized_for(policy)
+        authorized = authorized_for(policy, extra_durations=((3, DurationUnit.MONTH),))
         assert check_numeric("We can spread it over 3 months.", authorized) == ()
         assert check_numeric("We can spread it over 90 days.", authorized) == ()
         assert check_numeric("We can spread it over 12 months.", authorized) != ()
+
+    def test_payment_counts_are_gated_on_an_offer_existing(
+        self, policy: PolicyConfig, settlement_offer: Offer
+    ) -> None:
+        """Before an offer there is no 'three payments' to refer to; after one,
+        1..n are sayable because that offer has n instalments."""
+        assert check_numeric("We could do 3 payments.", authorized_for(policy)) != ()
+        assert (
+            check_numeric(
+                "We could do 3 payments.", authorized_for(policy, offers=(settlement_offer,))
+            )
+            == ()
+        )
 
     def test_account_facts_must_be_authorized_explicitly(self, policy: PolicyConfig) -> None:
         bare = authorized_for(policy)
@@ -306,9 +341,7 @@ class TestNumericAuthorization:
         (violation,) = check_numeric("Let's say March 14th then.", authorized)
         assert violation.rule_id == NumericRuleId.UNAUTHORIZED_DATE
 
-    def test_unattached_small_numbers_warn_rather_than_block(
-        self, policy: PolicyConfig
-    ) -> None:
+    def test_unattached_small_numbers_warn_rather_than_block(self, policy: PolicyConfig) -> None:
         chatter = "There are 17 things I could say here."
         (violation,) = check_numeric(chatter, authorized_for(policy))
         assert violation.rule_id == NumericRuleId.UNVERIFIED_NUMBER
@@ -429,9 +462,7 @@ class TestEscalationTriggers:
             ("Do not contact me again.", EscalationTrigger.CEASE_AND_DESIST),
         ],
     )
-    def test_every_trigger_is_detected(
-        self, utterance: str, expected: EscalationTrigger
-    ) -> None:
+    def test_every_trigger_is_detected(self, utterance: str, expected: EscalationTrigger) -> None:
         assert expected in {s.trigger for s in detect_escalation(utterance)}
 
     @pytest.mark.parametrize(
@@ -451,9 +482,7 @@ class TestEscalationTriggers:
         If every hard bargain escalated, the agent would never close anything."""
         assert detect_escalation(utterance) == ()
 
-    def test_most_serious_trigger_wins_when_several_match(
-        self, policy: PolicyConfig
-    ) -> None:
+    def test_most_serious_trigger_wins_when_several_match(self, policy: PolicyConfig) -> None:
         result = check_inbound(
             GuardrailState.opening(policy),
             "I don't owe this, I lost my job, and honestly I want to end my life.",
@@ -498,9 +527,7 @@ class TestEscalationBehavior:
         assert not result.allowed
         assert RingRuleId.NEGOTIATION_AFTER_ESCALATION in rule_ids(result.violations)
 
-    def test_escalated_call_falls_back_to_the_closing_line(
-        self, ready: GuardrailState
-    ) -> None:
+    def test_escalated_call_falls_back_to_the_closing_line(self, ready: GuardrailState) -> None:
         state = check_inbound(ready, "I'm filing for bankruptcy.").state
         for _ in range(MAX_REGENERATION_STRIKES):
             result = check_outbound(state, "Let's settle this today.")

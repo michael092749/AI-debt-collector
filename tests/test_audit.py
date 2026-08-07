@@ -104,9 +104,7 @@ def record_call(store: AuditStore, lowball: Verdict, accepted: Verdict) -> None:
             at="2026-01-01T12:00:00+00:00",
         )
     )
-    store.record(
-        TurnRecorded(CALL_ID, 0, Speaker.AGENT, "This is a call about a debt.", at="t0")
-    )
+    store.record(TurnRecorded(CALL_ID, 0, Speaker.AGENT, "This is a call about a debt.", at="t0"))
     store.record(TurnRecorded(CALL_ID, 1, Speaker.CONSUMER, "I can do two hundred.", at="t1"))
     store.record(
         DecisionRecorded(
@@ -266,9 +264,7 @@ class TestTrace:
         self, store: AuditStore, agreement: AgreementRecord
     ) -> None:
         del agreement
-        row = store._conn.execute(
-            "SELECT * FROM calls WHERE call_id = ?", (CALL_ID,)
-        ).fetchone()
+        row = store._conn.execute("SELECT * FROM calls WHERE call_id = ?", (CALL_ID,)).fetchone()
 
         assert row["original_balance"] == "1000.00"
         assert row["outcome"] == CallOutcome.AGREED.value
@@ -316,9 +312,7 @@ class TestAgreementRecord:
         # The rejection's full trail rides along, not just its outcome.
         assert len(rejected.conditions) == len(RuleId)
 
-    def test_carries_guardrail_events_and_escalations(
-        self, agreement: AgreementRecord
-    ) -> None:
+    def test_carries_guardrail_events_and_escalations(self, agreement: AgreementRecord) -> None:
         assert [g.rule_id for g in agreement.guardrail_events] == ["PROHIBITED_THREAT"]
         assert [e.trigger for e in agreement.escalations] == [EscalationTrigger.DISPUTE]
 
@@ -326,9 +320,7 @@ class TestAgreementRecord:
         assert agreement.confirmation.confirmed is True
         assert agreement.confirmation.turn_index == 8
 
-    def test_refuses_an_unconfirmed_arrangement(
-        self, accepted: Verdict, store: AuditStore
-    ) -> None:
+    def test_refuses_an_unconfirmed_arrangement(self, accepted: Verdict, store: AuditStore) -> None:
         with pytest.raises(ValueError, match="unconfirmed"):
             store.finalize_agreement(
                 call_id=CALL_ID,

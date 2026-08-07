@@ -22,7 +22,9 @@ together — "what was said, and what stopped being said" is one timeline.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 from typing import Any, cast
@@ -36,6 +38,8 @@ from collector.audit.events import (
     Escalated,
     EventType,
     GuardrailTripped,
+    ModelCalled,
+    ToolInvoked,
     TraceEvent,
     TurnRecorded,
     dumps,
@@ -47,6 +51,26 @@ from collector.offers import Offer
 
 DEFAULT_DB_PATH = Path("data/collector.db")
 
+#: Overrides the CWD-relative default. A container's working directory is
+#: whatever the entrypoint happens to be, so the deploy target sets this rather
+#: than hoping ``data/`` resolves somewhere writable and persistent.
+DB_PATH_ENV_VAR = "COLLECTOR_DB_PATH"
+
+# Concurrency and durability, set once per connection:
+#   WAL          - readers never block the writer, so the post-call report can
+#                  read the trace back while the turn loop is still writing it.
+#   NORMAL       - one fsync per checkpoint instead of one per commit. A crash
+#                  can lose the last commits; the alternative is an fsync on the
+#                  voice critical path, several times a turn.
+#   busy_timeout - wait rather than raise if another process holds the write lock.
+_PRAGMAS = ("journal_mode = WAL", "synchronous = NORMAL", "busy_timeout = 5000")
+
+
+def default_db_path() -> Path:
+    """Where the log lives unless a caller says otherwise (``$COLLECTOR_DB_PATH``)."""
+    return Path(os.environ.get(DB_PATH_ENV_VAR) or DEFAULT_DB_PATH)
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
     call_id          TEXT PRIMARY KEY,
@@ -57,7 +81,13 @@ CREATE TABLE IF NOT EXISTS calls (
     started_at       TEXT NOT NULL,
     ended_at         TEXT,
     outcome          TEXT,
-    turn_count       INTEGER
+    turn_count       INTEGER,
+    -- Post-call compliance score (SPEC §5.3). NULL until the call is closed
+    -- out; a call whose process died before finalize_call has no score, and
+    -- saying so is more honest than defaulting it to compliant.
+    compliant        INTEGER,
+    blocked_turns    INTEGER,
+    violation_count  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS turns (
@@ -107,7 +137,61 @@ _TRACE_EVENT_TYPES = (
     EventType.TURN.value,
     EventType.GUARDRAIL_TRIP.value,
     EventType.ESCALATION.value,
+    EventType.TOOL_CALL.value,
+    EventType.MODEL_CALL.value,
 )
+
+
+@dataclass(frozen=True)
+class CallCompliance:
+    """The ``calls`` row's post-call score, read back out.
+
+    ``finalize_call`` computes this at the end of every call; keeping it only
+    in memory meant the log could not answer "was this call compliant?" — the
+    one question the log exists to answer.
+    """
+
+    call_id: str
+    outcome: str | None
+    compliant: bool
+    turn_count: int
+    blocked_turns: int
+    violation_count: int
+
+
+_TraceRow = TurnRecorded | GuardrailTripped | Escalated | ToolInvoked | ModelCalled
+
+
+def _trace_row_text(event: _TraceRow) -> str:
+    """The one-line human summary for the ``turns.text`` column.
+
+    The verbatim event is in ``payload_json`` either way; this is what a
+    reviewer scanning the timeline in a SQL client actually reads.
+    """
+    match event:
+        case TurnRecorded():
+            return event.text
+        case GuardrailTripped() | Escalated():
+            return event.detail
+        case ToolInvoked():
+            outcome = "ok" if event.ok else f"failed: {event.error}"
+            return f"{event.tool} -> {outcome} ({event.latency_ms}ms)"
+        case ModelCalled():
+            tokens = f"{event.input_tokens} in / {event.output_tokens} out"
+            failure = f" failed: {event.error}" if event.error else ""
+            return f"{event.model} {tokens} ({event.latency_ms}ms){failure}"
+
+
+# Columns added after the first release, applied by ``_add_missing_columns``.
+# Keep every entry nullable: an ALTER on a populated table cannot invent a
+# value for rows written before the column existed.
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "calls": {
+        "compliant": "INTEGER",
+        "blocked_turns": "INTEGER",
+        "violation_count": "INTEGER",
+    },
+}
 
 
 class AuditStore:
@@ -119,16 +203,18 @@ class AuditStore:
 
     def __init__(
         self,
-        db_path: Path | str = DEFAULT_DB_PATH,
+        db_path: Path | str | None = None,
         *,
         json_dir: Path | str | None = None,
     ) -> None:
-        self.db_path = Path(db_path)
+        self.db_path = Path(db_path) if db_path is not None else default_db_path()
         default_json_dir = self.db_path.parent / "agreements"
         self.json_dir = Path(json_dir) if json_dir is not None else default_json_dir
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
+        for pragma in _PRAGMAS:
+            self._conn.execute(f"PRAGMA {pragma}")
         self.create_schema()
 
     def create_schema(self) -> None:
@@ -136,6 +222,22 @@ class AuditStore:
         existing database is a no-op rather than an error or a truncation."""
         with self._conn:
             self._conn.executescript(SCHEMA)
+            self._add_missing_columns()
+
+    def _add_missing_columns(self) -> None:
+        """Bring an older database up to the current schema.
+
+        ``CREATE TABLE IF NOT EXISTS`` silently skips a table that already
+        exists, columns and all, so a log written before a column was added
+        would keep failing every INSERT that names it. Adding them one at a
+        time is the whole migration story this needs; the evidence already in
+        the table is never rewritten.
+        """
+        for table, columns in _ADDED_COLUMNS.items():
+            existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            for name, ddl in columns.items():
+                if name not in existing:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     # -- recording ---------------------------------------------------------
 
@@ -148,7 +250,7 @@ class AuditStore:
                 self._record_call_ended(event)
             case DecisionRecorded():
                 self._record_decision(event)
-            case TurnRecorded() | GuardrailTripped() | Escalated():
+            case TurnRecorded() | GuardrailTripped() | Escalated() | ToolInvoked() | ModelCalled():
                 self._record_trace_row(event)
             case _:
                 raise TypeError(f"not a trace event: {type(event).__name__}")
@@ -185,19 +287,32 @@ class AuditStore:
                 """
                 INSERT INTO calls
                     (call_id, account_ref, consumer_ref, channel, original_balance,
-                     started_at, ended_at, outcome, turn_count)
-                VALUES (?, '', '', '', '', ?, ?, ?, ?)
+                     started_at, ended_at, outcome, turn_count,
+                     compliant, blocked_turns, violation_count)
+                VALUES (?, '', '', '', '', ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(call_id) DO UPDATE SET
                     ended_at = excluded.ended_at,
                     outcome = excluded.outcome,
-                    turn_count = excluded.turn_count
+                    turn_count = excluded.turn_count,
+                    compliant = excluded.compliant,
+                    blocked_turns = excluded.blocked_turns,
+                    violation_count = excluded.violation_count
                 """,
-                (event.call_id, event.at, event.at, event.outcome.value, event.turn_count),
+                (
+                    event.call_id,
+                    event.at,
+                    event.at,
+                    event.outcome.value,
+                    event.turn_count,
+                    None if event.compliant is None else int(event.compliant),
+                    event.blocked_turns,
+                    event.violation_count,
+                ),
             )
 
-    def _record_trace_row(self, event: TurnRecorded | GuardrailTripped | Escalated) -> None:
+    def _record_trace_row(self, event: _TraceRow) -> None:
         speaker = event.speaker.value if isinstance(event, TurnRecorded) else None
-        text = event.text if isinstance(event, TurnRecorded) else event.detail
+        text = _trace_row_text(event)
         with self._conn:
             self._conn.execute(
                 """
@@ -324,9 +439,7 @@ class AuditStore:
         return tuple(event_from_json(_loads(r["payload_json"])) for r in rows)
 
     def turns(self, call_id: str) -> tuple[TurnRecorded, ...]:
-        return cast(
-            tuple[TurnRecorded, ...], self._trace_events(call_id, EventType.TURN)
-        )
+        return cast(tuple[TurnRecorded, ...], self._trace_events(call_id, EventType.TURN))
 
     def guardrail_events(self, call_id: str) -> tuple[GuardrailTripped, ...]:
         return cast(
@@ -335,8 +448,31 @@ class AuditStore:
         )
 
     def escalations(self, call_id: str) -> tuple[Escalated, ...]:
-        return cast(
-            tuple[Escalated, ...], self._trace_events(call_id, EventType.ESCALATION)
+        return cast(tuple[Escalated, ...], self._trace_events(call_id, EventType.ESCALATION))
+
+    def tool_calls(self, call_id: str) -> tuple[ToolInvoked, ...]:
+        return cast(tuple[ToolInvoked, ...], self._trace_events(call_id, EventType.TOOL_CALL))
+
+    def model_calls(self, call_id: str) -> tuple[ModelCalled, ...]:
+        return cast(tuple[ModelCalled, ...], self._trace_events(call_id, EventType.MODEL_CALL))
+
+    def compliance(self, call_id: str) -> CallCompliance | None:
+        """The persisted post-call score. ``None`` if the call was never closed out."""
+        rows = self._rows(
+            "SELECT outcome, turn_count, compliant, blocked_turns, violation_count"
+            " FROM calls WHERE call_id = ?",
+            (call_id,),
+        )
+        if not rows or rows[0]["compliant"] is None:
+            return None
+        row = rows[0]
+        return CallCompliance(
+            call_id=call_id,
+            outcome=row["outcome"],
+            compliant=bool(row["compliant"]),
+            turn_count=int(row["turn_count"] or 0),
+            blocked_turns=int(row["blocked_turns"] or 0),
+            violation_count=int(row["violation_count"] or 0),
         )
 
     def trace(self, call_id: str) -> tuple[TraceEvent, ...]:
@@ -354,9 +490,7 @@ class AuditStore:
             "SELECT payload_json FROM decisions WHERE call_id = ? ORDER BY decision_id",
             (call_id,),
         )
-        return tuple(
-            _as_decision(event_from_json(_loads(r["payload_json"]))) for r in rows
-        )
+        return tuple(_as_decision(event_from_json(_loads(r["payload_json"]))) for r in rows)
 
     def agreement(self, call_id: str) -> AgreementRecord | None:
         rows = self._rows("SELECT record_json FROM agreements WHERE call_id = ?", (call_id,))

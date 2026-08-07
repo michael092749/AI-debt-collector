@@ -71,8 +71,10 @@ class TestToolWhitelist:
     def test_malformed_arguments_return_a_payload_not_an_exception(self) -> None:
         """A typo must not end a call."""
         result = execute(
-            ToolCall(name="validate_consumer_offer", arguments={"payment_count": 2,
-                                                               "cadence": "fortnightly"}),
+            ToolCall(
+                name="validate_consumer_offer",
+                arguments={"payment_count": 2, "cadence": "fortnightly"},
+            ),
             ToolContext.opening(POLICY),
         )
         assert not result.ok
@@ -159,9 +161,7 @@ class TestTurnLoop:
         mini_miranda_turn = next(
             i for i, text in enumerate(spoken) if "attempt to collect a debt" in text
         )
-        substantive_turns = [
-            i for i, text in enumerate(spoken) if "$" in text
-        ]
+        substantive_turns = [i for i, text in enumerate(spoken) if "$" in text]
         assert all(i > mini_miranda_turn for i in substantive_turns), (
             "no figure may be spoken before the Mini-Miranda"
         )
@@ -224,9 +224,7 @@ class TestTurnLoop:
             def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
                 self.calls += 1
                 if self.calls == 1:
-                    return LLMResponse(
-                        text="Pay today or we will garnish your wages and sue you."
-                    )
+                    return LLMResponse(text="Pay today or we will garnish your wages and sue you.")
                 return LLMResponse(text="Am I speaking with the account holder?")
 
         llm = ThreateningClient()
@@ -331,9 +329,7 @@ class TestMockClient:
 
 
 class TestIdentityGate:
-    @pytest.mark.parametrize(
-        "said", ["Yes.", "Speaking.", "That's me.", "yeah, go ahead"]
-    )
+    @pytest.mark.parametrize("said", ["Yes.", "Speaking.", "That's me.", "yeah, go ahead"])
     def test_affirmations_confirm(self, said: str) -> None:
         assert confirms_identity(said)
 

@@ -85,9 +85,7 @@ class TestInvariantsHoldEverywhere:
     def test_build_counter_is_total_over_every_tier_and_capacity(self) -> None:
         state = NegotiationState.opening(POLICY)
         for tier, cap in itertools.product(Tier, CAPACITIES):
-            offer = build_counter(
-                state, POLICY, tier=tier, capacity=Money(cap) if cap else None
-            )
+            offer = build_counter(state, POLICY, tier=tier, capacity=Money(cap) if cap else None)
             _assert_offer_legal(offer, f"tier={tier.name} cap={cap}")
 
     def test_ladder_never_moves_backwards(self) -> None:
@@ -139,9 +137,27 @@ class TestNoFloats:
 CORE_MODULES = ["money", "offers", "policy", "negotiation", "decision_engine"]
 
 FORBIDDEN_IMPORTS = {
-    "llm", "agent", "audit", "guardrails", "voice_app", "text_app", "tools",
-    "sqlite3", "random", "time", "datetime", "os", "sys", "socket", "pathlib",
-    "requests", "httpx", "anthropic", "openai", "livekit", "logging",
+    "llm",
+    "agent",
+    "audit",
+    "guardrails",
+    "voice_app",
+    "text_app",
+    "tools",
+    "sqlite3",
+    "random",
+    "time",
+    "datetime",
+    "os",
+    "sys",
+    "socket",
+    "pathlib",
+    "requests",
+    "httpx",
+    "anthropic",
+    "openai",
+    "livekit",
+    "logging",
 }
 
 
@@ -174,7 +190,11 @@ class TestEnginePurity:
     def test_engine_exposes_the_documented_entry_point(self) -> None:
         assert callable(validate_offer)
         assert Verdict.__dataclass_fields__.keys() >= {
-            "outcome", "tier", "conditions", "counter", "rationale_code"
+            "outcome",
+            "tier",
+            "conditions",
+            "counter",
+            "rationale_code",
         }
 
 

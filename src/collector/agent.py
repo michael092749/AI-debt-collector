@@ -20,6 +20,9 @@ they stay code decisions.
 
 from __future__ import annotations
 
+import re
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from collector.audit.events import (
@@ -30,7 +33,9 @@ from collector.audit.events import (
     Escalated,
     GuardrailAction,
     GuardrailTripped,
+    ModelCalled,
     Speaker,
+    ToolInvoked,
     TurnRecorded,
     dumps,
 )
@@ -44,14 +49,25 @@ from collector.guardrails.rings import (
     EscalationRecord,
     GuardrailRing,
     GuardrailState,
+    InboundCheck,
     PreCallCheck,
     PreCallContext,
     check_inbound,
     check_outbound,
     check_pre_call,
+    fallback_for,
     finalize_call,
 )
-from collector.llm.base import LLMClient, Message, ToolCall, system_prompt
+from collector.llm.base import (
+    LLMClient,
+    LLMResponse,
+    Message,
+    StreamCompleted,
+    TextDelta,
+    ToolCall,
+    stream_response,
+    system_prompt,
+)
 from collector.negotiation import CallOutcome
 from collector.offers import Offer
 from collector.policy import PolicyConfig
@@ -59,6 +75,29 @@ from collector.tools import ToolContext, ToolResult, execute
 
 # A turn that has made this many engine round trips is looping, not thinking.
 MAX_TOOL_ROUNDS = 4
+
+# A sentence ends at terminal punctuation followed by whitespace. The trailing
+# whitespace is what keeps "$250.00 a month" and "3 p.m." in one piece: a
+# decimal point has a digit after it, not a space. Good enough for speech, which
+# is what this splits — an abbreviation mid-sentence costs one early TTS flush,
+# not a compliance failure, because every fragment is guarded either way.
+_SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]]*\s+")
+
+
+def _split_sentences(buffer: str) -> tuple[list[str], str]:
+    """Complete sentences in ``buffer``, and whatever is still being written.
+
+    Called on every delta, so the first sentence reaches the guard — and from
+    there TTS — while the model is still generating the second.
+    """
+    sentences: list[str] = []
+    cursor = 0
+    for match in _SENTENCE_END.finditer(buffer):
+        sentence = buffer[cursor : match.start()].strip()
+        if sentence:
+            sentences.append(sentence)
+        cursor = match.end()
+    return sentences, buffer[cursor:]
 
 
 @dataclass(frozen=True)
@@ -172,6 +211,162 @@ class NegotiationAgent:
         if self.ended:
             raise ValueError("the call has ended; start a new one")
 
+        inbound = self._perceive(consumer_utterance)
+        if inbound.escalated and inbound.escalation is not None:
+            return self._escalate(consumer_utterance, inbound.escalation)
+
+        spoken, results, blocked = self._act()
+        turn = AgentTurn(
+            consumer=consumer_utterance,
+            spoken=spoken,
+            tool_results=results,
+            blocked=blocked,
+            ended=self.ended,
+        )
+        self.turns.append(turn)
+        return turn
+
+    def stream_turn(self, consumer_utterance: str) -> Iterator[str]:
+        """One full exchange, emitted a sentence at a time — the voice path.
+
+        Same rings, same engine, same whitelist as ``turn()``. What moves is
+        where the guard sits: ``turn()`` guards a finished paragraph, this
+        guards each sentence the moment it completes, so the first one is in
+        the consumer's ear while the rest is still being written. That is the
+        entire sub-500ms first-audio budget.
+
+        One rule differs, and it is not negotiable. ``turn()`` can regenerate a
+        blocked turn because nothing was spoken yet and the contract holds —
+        "blocked, so the consumer did not hear it". Mid-stream that contract is
+        already false: earlier sentences are audio. So a block here **aborts the
+        stream and speaks the scripted fallback**. Retrying would mean
+        contradicting something the consumer just heard, which is worse than the
+        sentence that was blocked.
+
+        The completed turn is appended to ``self.turns`` when the iterator is
+        exhausted, so a caller that abandons it early leaves no turn recorded —
+        which is correct: an abandoned stream is a dropped call, not a turn.
+        """
+        if self.ended:
+            raise ValueError("the call has ended; start a new one")
+
+        inbound = self._perceive(consumer_utterance)
+        if inbound.escalated and inbound.escalation is not None:
+            yield self._escalate(consumer_utterance, inbound.escalation).spoken or ""
+            return
+
+        spoken: list[str] = []
+        blocked: list[str] = []
+        results: list[ToolResult] = []
+        # Set when a tool closed the call. One more round is still owed: the
+        # consumer has to hear the arrangement read back, and a turn that ends
+        # the call in silence is a dead line, not a goodbye.
+        closing = False
+
+        for _ in range(MAX_TOOL_ROUNDS + 1):
+            response: LLMResponse | None = None
+            buffer = ""
+            halted = False
+
+            for event in stream_response(self.llm, tuple(self.messages)):
+                match event:
+                    case TextDelta():
+                        buffer += event.text
+                        sentences, buffer = _split_sentences(buffer)
+                        for sentence in sentences:
+                            allowed = self._guard_sentence(sentence)
+                            if allowed is None:
+                                blocked.append(sentence)
+                                halted = True
+                                break
+                            spoken.append(allowed)
+                            yield allowed
+                        if halted:
+                            break
+                    case StreamCompleted():
+                        response = event.response
+                        self._record_model_call(response)
+
+            # Whatever the model left without terminal punctuation is still a
+            # sentence; a turn ending "so let me know" must not be swallowed.
+            if not halted and buffer.strip():
+                allowed = self._guard_sentence(buffer)
+                if allowed is None:
+                    blocked.append(buffer.strip())
+                    halted = True
+                else:
+                    spoken.append(allowed)
+                    yield allowed
+
+            if halted:
+                fallback = fallback_for(self.guard)
+                self._speak_verbatim(fallback)
+                spoken.append(fallback)
+                yield fallback
+                break
+
+            if closing or response is None or not response.wants_tools:
+                break
+            for call in response.tool_calls:
+                results.append(self._run_tool(call))
+            closing = self.ended
+
+        if spoken:
+            # One assistant turn in the transcript, not one per sentence: the
+            # model wrote a paragraph and the next round trip should see it that
+            # way, whatever granularity TTS consumed it at.
+            self.messages.append(Message(role="agent", content=" ".join(spoken)))
+
+        self.turns.append(
+            AgentTurn(
+                consumer=consumer_utterance,
+                spoken=" ".join(spoken) or None,
+                tool_results=tuple(results),
+                blocked=tuple(blocked),
+                ended=self.ended,
+            )
+        )
+
+    def _guard_sentence(self, sentence: str) -> str | None:
+        """The pre-TTS gate for one sentence. ``None`` means do not speak it.
+
+        Records the trip as ``BLOCKED`` rather than ``REGENERATED``: on the
+        streaming path there is no retry, and an audit log that says
+        "regenerated" about a turn that was abandoned is a false record.
+        """
+        candidate = sentence.strip()
+        if not candidate:
+            return None
+
+        check = check_outbound(self.guard, candidate, authorized=self.authorized)
+        self.guard = check.state
+        if check.allowed:
+            self._record(
+                TurnRecorded(
+                    call_id=self.call_id,
+                    turn_index=self._turn_index,
+                    speaker=Speaker.AGENT,
+                    text=candidate,
+                )
+            )
+            return candidate
+
+        for violation in check.blocking_violations:
+            self._record(
+                GuardrailTripped(
+                    call_id=self.call_id,
+                    turn_index=self._turn_index,
+                    ring=GuardrailRing.DURING_CALL,
+                    rule_id=violation.rule_id,
+                    action=GuardrailAction.BLOCKED,
+                    detail=violation.detail,
+                    blocked_text=candidate,
+                )
+            )
+        return None
+
+    def _perceive(self, consumer_utterance: str) -> InboundCheck:
+        """The inbound half of a turn, shared by the text and voice paths."""
         self.last_consumer_utterance = consumer_utterance
         self._turn_index += 1
 
@@ -190,20 +385,7 @@ class NegotiationAgent:
         # Identity is settled in code, before anything substantive can be said.
         if not self.guard.identity_confirmed and confirms_identity(consumer_utterance):
             self.guard = self.guard.with_identity_confirmed()
-
-        if inbound.escalated and inbound.escalation is not None:
-            return self._escalate(consumer_utterance, inbound.escalation)
-
-        spoken, results, blocked = self._act()
-        turn = AgentTurn(
-            consumer=consumer_utterance,
-            spoken=spoken,
-            tool_results=results,
-            blocked=blocked,
-            ended=self.ended,
-        )
-        self.turns.append(turn)
-        return turn
+        return inbound
 
     def _escalate(self, consumer_utterance: str, escalation: EscalationRecord) -> AgentTurn:
         """A6: negotiation stops here. The closing line is code-authored, so
@@ -230,15 +412,11 @@ class NegotiationAgent:
                 detail=detail,
             )
         )
-        self.tools = ToolContext(
-            policy=self.policy, state=self.tools.state.escalate(str(trigger))
-        )
+        self.tools = ToolContext(policy=self.policy, state=self.tools.state.escalate(str(trigger)))
         self._speak_verbatim(closing)
         self.ended = True
 
-        turn = AgentTurn(
-            consumer=consumer_utterance, spoken=closing, escalated=True, ended=True
-        )
+        turn = AgentTurn(consumer=consumer_utterance, spoken=closing, escalated=True, ended=True)
         self.turns.append(turn)
         return turn
 
@@ -247,7 +425,7 @@ class NegotiationAgent:
     def _act(self) -> tuple[str | None, tuple[ToolResult, ...], tuple[str, ...]]:
         results: list[ToolResult] = []
         for _ in range(MAX_TOOL_ROUNDS):
-            response = self.llm.respond(tuple(self.messages))
+            response = self._ask_model()
             if not response.wants_tools:
                 spoken, blocked = self._guard_and_speak(response.text)
                 return spoken, tuple(results), blocked
@@ -258,13 +436,60 @@ class NegotiationAgent:
 
         # Out of round trips, or the call closed inside a tool. Ask once more
         # for words; a turn that produces nothing to say is a dead phone line.
-        response = self.llm.respond(tuple(self.messages))
+        response = self._ask_model()
         spoken, blocked = self._guard_and_speak(response.text)
         return spoken, tuple(results), blocked
 
+    def _ask_model(self) -> LLMResponse:
+        """One model round trip, with its cost on the record.
+
+        Every call goes through here so the log accounts for all of them — a
+        turn can spend four tool rounds and two regeneration strikes, and a
+        latency budget you cannot attribute is one you cannot defend.
+        """
+        response = self.llm.respond(tuple(self.messages))
+        self._record_model_call(response)
+        return response
+
+    def _record_model_call(self, response: LLMResponse) -> None:
+        usage = response.usage
+        if usage is not None:
+            self._record(
+                ModelCalled(
+                    call_id=self.call_id,
+                    turn_index=self._turn_index,
+                    model=usage.model,
+                    latency_ms=usage.latency_ms,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cache_read_tokens=usage.cache_read_tokens,
+                    cache_write_tokens=usage.cache_write_tokens,
+                    cost_usd=usage.cost_usd,
+                    stop_reason=usage.stop_reason,
+                    error=response.error,
+                )
+            )
+
     def _run_tool(self, call: ToolCall) -> ToolResult:
+        started = time.monotonic()
         result = execute(call, self.tools)
+        latency_ms = int((time.monotonic() - started) * 1000)
         self.tools = result.context
+
+        # Every tool, not just the two that produce a verdict. ``propose_offer``,
+        # ``record_refusal``, ``concede`` and ``end_call`` move the negotiation
+        # and previously left no trace of having been called.
+        self._record(
+            ToolInvoked(
+                call_id=self.call_id,
+                turn_index=self._turn_index,
+                tool=call.name,
+                arguments=dict(call.arguments),
+                ok=result.ok,
+                latency_ms=latency_ms,
+                error=None if result.ok else str(result.payload.get("error", "")),
+            )
+        )
 
         if result.verdict is not None:
             self.verdicts.append(result.verdict)
@@ -302,7 +527,7 @@ class NegotiationAgent:
         return result
 
     def _generate_and_speak(self) -> str | None:
-        response = self.llm.respond(tuple(self.messages))
+        response = self._ask_model()
         spoken, _ = self._guard_and_speak(response.text)
         return spoken
 
@@ -360,7 +585,7 @@ class NegotiationAgent:
                     ),
                 )
             )
-            candidate = self.llm.respond(tuple(self.messages)).text
+            candidate = self._ask_model().text
 
         return None, tuple(blocked)
 
@@ -390,8 +615,18 @@ class NegotiationAgent:
         if outcome is CallOutcome.IN_PROGRESS:
             outcome = CallOutcome.ABANDONED
 
+        # The score reaches the log rather than only the caller: "was this call
+        # compliant?" is the question the log exists to answer, and computing
+        # it and then dropping it left that answer nowhere (SPEC §5.3).
         self._record(
-            CallEnded(call_id=self.call_id, outcome=outcome, turn_count=len(self.turns))
+            CallEnded(
+                call_id=self.call_id,
+                outcome=outcome,
+                turn_count=len(self.turns),
+                compliant=summary.compliant,
+                blocked_turns=summary.blocked_turns,
+                violation_count=len(summary.violations),
+            )
         )
 
         if self.store is not None and self.agreed_offer is not None:

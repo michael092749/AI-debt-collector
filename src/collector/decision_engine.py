@@ -202,9 +202,7 @@ def validate_offer(
 
 # Violating one of these means the *amount* is unacceptable -> reject.
 # Anything else means the amount is fine but the *structure* is wrong -> counter.
-_HARD_FLOORS = frozenset(
-    {RuleId.TOTAL_FLOOR, RuleId.MIN_PAYMENT, RuleId.NO_UNAUTHORIZED_DISCOUNT}
-)
+_HARD_FLOORS = frozenset({RuleId.TOTAL_FLOOR, RuleId.MIN_PAYMENT, RuleId.NO_UNAUTHORIZED_DISCOUNT})
 
 
 def effective_capacity(proposal: ConsumerProposal) -> Money:

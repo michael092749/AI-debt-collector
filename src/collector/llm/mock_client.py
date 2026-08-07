@@ -62,8 +62,10 @@ _CADENCE_WORDS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(bi-?weekly|fortnight|every (other|two) weeks?|paycheck)\b", re.I), "biweekly"),
     (re.compile(r"\b(week(ly)?|a week|per week|/\s*wk)\b", re.I), "weekly"),
     (re.compile(r"\b(month(ly)?|a month|per month|/\s*mo)\b", re.I), "monthly"),
-    (re.compile(r"\b(now|today|right away|up ?front|lump sum|one (payment|shot|go))\b", re.I),
-     "immediate"),
+    (
+        re.compile(r"\b(now|today|right away|up ?front|lump sum|one (payment|shot|go))\b", re.I),
+        "immediate",
+    ),
 )
 _COUNT_RE = re.compile(
     r"\b(?:in|over|across|split (?:it )?(?:in)?to|make it)\s+"
@@ -72,8 +74,17 @@ _COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 _WORD_COUNTS = {
-    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
 }
 # "for a year" carries no numeral, so the guardrail's figure extractor does not
 # see it — correctly, since it exists to catch figures in *agent* speech. Here
@@ -136,9 +147,7 @@ def parse_proposal(text: str) -> ParsedProposal | None:
             cadence=cadence,
             signaled_capacity=amount,
         )
-    return ParsedProposal(
-        total=amount, payment_count=1, cadence=cadence, signaled_capacity=amount
-    )
+    return ParsedProposal(total=amount, payment_count=1, cadence=cadence, signaled_capacity=amount)
 
 
 def _span_days(text: str, figures: tuple[Figure, ...]) -> Decimal | None:
@@ -211,9 +220,11 @@ class MockLLMClient:
             )
 
         if _DONE_RE.search(said):
-            return LLMResponse(tool_calls=(ToolCall(name="end_call", arguments={
-                "reason": "consumer ended the call"
-            }),))
+            return LLMResponse(
+                tool_calls=(
+                    ToolCall(name="end_call", arguments={"reason": "consumer ended the call"}),
+                )
+            )
 
         proposal = parse_proposal(said)
         if proposal is not None:
@@ -225,19 +236,21 @@ class MockLLMClient:
                 arguments["total"] = str(proposal.total)
             if proposal.signaled_capacity is not None:
                 arguments["signaled_capacity"] = str(proposal.signaled_capacity)
-            return LLMResponse(tool_calls=(
-                ToolCall(name="validate_consumer_offer", arguments=arguments),
-            ))
+            return LLMResponse(
+                tool_calls=(ToolCall(name="validate_consumer_offer", arguments=arguments),)
+            )
 
         offer_standing = self._standing_offer(messages) is not None
         if _AGREE_RE.search(said) and offer_standing:
             return LLMResponse(tool_calls=(ToolCall(name="confirm_agreement"),))
         if _REFUSE_RE.search(said):
             if offer_standing:
-                return LLMResponse(tool_calls=(
-                    ToolCall(name="record_refusal"),
-                    ToolCall(name="concede"),
-                ))
+                return LLMResponse(
+                    tool_calls=(
+                        ToolCall(name="record_refusal"),
+                        ToolCall(name="concede"),
+                    )
+                )
             return LLMResponse(tool_calls=(ToolCall(name="record_refusal"),))
         if not offer_standing:
             return LLMResponse(tool_calls=(ToolCall(name="propose_offer"),))
@@ -310,10 +323,7 @@ class MockLLMClient:
 
     def _identity_confirmed(self, messages: tuple[Message, ...]) -> bool:
         """Confirmed once they have answered the opening question affirmatively."""
-        return any(
-            m.role == "consumer" and confirms_identity(m.content)
-            for m in messages
-        )
+        return any(m.role == "consumer" and confirms_identity(m.content) for m in messages)
 
     def _disclosed(self, messages: tuple[Message, ...]) -> bool:
         """Has the Mini-Miranda already been spoken? Asked of the transcript
@@ -336,7 +346,7 @@ class MockLLMClient:
 def _load(content: str) -> dict[str, object]:
     try:
         loaded = json.loads(content)
-    except (json.JSONDecodeError, TypeError):
+    except json.JSONDecodeError, TypeError:
         return {}
     return loaded if isinstance(loaded, dict) else {}
 

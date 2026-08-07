@@ -176,18 +176,19 @@ def validate_offer(
 ```python
 @dataclass(frozen=True)
 class Condition:
-    rule_id: str          # "MIN_PAYMENT", "SETTLEMENT_FLOOR", "MAX_DURATION", ...
+    rule_id: str  # "MIN_PAYMENT", "SETTLEMENT_FLOOR", "MAX_DURATION", ...
     passed: bool
-    actual: str           # "$150.00"
-    limit: str            # ">= $250.00"
+    actual: str  # "$150.00"
+    limit: str  # ">= $250.00"
+
 
 @dataclass(frozen=True)
 class Verdict:
     outcome: Literal["accept", "counter", "reject"]
-    tier: Tier | None                        # tier the proposal landed in, if any
-    conditions: tuple[Condition, ...]        # EVERY rule evaluated, pass and fail alike
-    counter: Offer | None                    # engine-computed counter-offer
-    rationale_code: str                      # stable code the LLM phrases, never invents
+    tier: Tier | None  # tier the proposal landed in, if any
+    conditions: tuple[Condition, ...]  # EVERY rule evaluated, pass and fail alike
+    counter: Offer | None  # engine-computed counter-offer
+    rationale_code: str  # stable code the LLM phrases, never invents
 ```
 
 `conditions` is non-negotiable. The research report's vendor test is: *"Show me the decision

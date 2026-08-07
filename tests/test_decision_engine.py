@@ -58,9 +58,7 @@ class TestFullPayment:
     ) -> None:
         from collector.decision_engine import validate_offer
 
-        proposal = ConsumerProposal(
-            total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE
-        )
+        proposal = ConsumerProposal(total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE)
         verdict = validate_offer(proposal, fresh, policy)
 
         assert verdict.outcome == "accept"
@@ -74,9 +72,7 @@ class TestFullPayment:
         research report - it is what proves the engine decided, not the model."""
         from collector.decision_engine import validate_offer
 
-        proposal = ConsumerProposal(
-            total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE
-        )
+        proposal = ConsumerProposal(total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE)
         verdict = validate_offer(proposal, fresh, policy)
 
         assert len(verdict.conditions) > 0
@@ -90,17 +86,13 @@ class TestFullPayment:
     ) -> None:
         from collector.decision_engine import validate_offer
 
-        proposal = ConsumerProposal(
-            total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE
-        )
+        proposal = ConsumerProposal(total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE)
         assert validate_offer(proposal, fresh, policy).counter is None
 
     def test_verdict_is_frozen(self, policy: PolicyConfig, fresh: NegotiationState) -> None:
         from collector.decision_engine import validate_offer
 
-        proposal = ConsumerProposal(
-            total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE
-        )
+        proposal = ConsumerProposal(total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE)
         verdict = validate_offer(proposal, fresh, policy)
         with pytest.raises(AttributeError):
             verdict.outcome = "reject"  # type: ignore[misc]
