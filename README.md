@@ -318,6 +318,16 @@ turn stop re-paying for the prefix the first one sent. It is scoped to one call:
 carries the consumer's name, so there is no cross-call sharing. `cache_read_tokens` on the
 `ModelCalled` row is the signal that it is working; zero across a call means it is not.
 
+**Streaming is per route, and a route that cannot stream gets none of this.** `stream_response`
+degrades a non-streaming client to a single delta carrying the finished turn: the per-sentence
+guard still runs, but on everything at once, and the voice path waits exactly as long as it did
+before. `anthropic` and `livekit` (Gemini 3 Flash on LiveKit Inference) both stream;
+`openrouter` does not yet, so choosing it costs the latency win. **A faster model is not by
+itself a latency fix** — the route has to stream for the model's speed to reach the consumer's
+ear any sooner. Neither alternate route is certified either way: `MAX_TOOL_ROUNDS` and the
+regeneration-strike budget were tuned against Claude, so `tests/evals/` and the adversarial pass
+have to be re-run before either carries a real call.
+
 **Tracing is off by default and it fails loudly.** `COLLECTOR_TRACING` accepts `off`/unset and
 `otlp` and nothing else: any other value raises at start-up rather than reading as "off", and
 `otlp` without `OTEL_EXPORTER_OTLP_ENDPOINT` raises too, because the exporter's own default is
@@ -343,7 +353,7 @@ cp .env.example .env
 |---|---|
 | `ANTHROPIC_API_KEY` | `--claude` mode, tier-2 evals with live adversarial pressure, and any real voice call |
 | `COLLECTOR_MODEL` | Overrides the Anthropic model id (default `claude-sonnet-5`) |
-| `COLLECTOR_LLM` | Which route the voice worker uses: `anthropic` (default), `openrouter`, `livekit` |
+| `COLLECTOR_LLM` | Which route the voice worker uses: `anthropic` (default), `openrouter`, `livekit`. Only `anthropic` and `livekit` stream — see below |
 | `OPENROUTER_API_KEY` | `--claude`'s alternate route (`--openrouter`, `COLLECTOR_LLM=openrouter`) |
 | `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | `collector-voice` (transport, STT, TTS), the LLM judges, and `--livekit` / `COLLECTOR_LLM=livekit` |
 | `COLLECTOR_DB_PATH` | Moving the audit log off the CWD-relative `data/` — set it to the encrypted volume |

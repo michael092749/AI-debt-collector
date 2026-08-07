@@ -14,8 +14,8 @@ the OpenRouter route:
    mid-negotiation because a token aged out would be indistinguishable to the
    consumer from the agent hanging up.
 2. **No reasoning/thinking parameter is sent.** `reasoning_effort` maps to
-   thinking budgets of 1024 tokens and up on this gateway. `NegotiationAgent.turn()`
-   can stack up to seven sequential round trips into one spoken reply, so the
+   thinking budgets of 1024 tokens and up on this gateway. One spoken reply can
+   stack five sequential round trips (`stream_turn`) or seven (`turn`), so the
    right budget on a phone call is none, not a small one.
 3. **Zero data retention by default.** Prompts and outputs pass through the
    gateway without being logged, stored, or trained on. That matters here for
@@ -24,8 +24,8 @@ the OpenRouter route:
    the consumer said.
 
 The gateway is reached over plain HTTP rather than through the SDK's
-`inference.LLM` deliberately: that class is async, and `NegotiationAgent.turn()`
-is synchronous and already dispatched to a worker thread by `voice_app.py`.
+`inference.LLM` deliberately: that class is async, and the turn loop is
+synchronous — `voice_app.py` already drives it from a worker thread.
 Going through the raw endpoint also keeps `text_app.py` — which has no LiveKit
 job context and no event loop — able to use this route unchanged.
 
@@ -38,13 +38,16 @@ from __future__ import annotations
 
 import datetime
 import os
+import time
+from collections.abc import Iterator
 from typing import Any, cast
 
-from collector.llm.base import LLMResponse, Message
+from collector.llm.base import LLMResponse, Message, StreamEvent
 from collector.llm.openai_shape import (
     load_env,
     to_llm_response,
     to_openai_messages,
+    to_stream_events,
     tool_definitions,
 )
 
@@ -115,3 +118,36 @@ class LiveKitInferenceClient:
             tools=self._tools,
         )
         return to_llm_response(response.choices[0].message)
+
+    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        """The same turn, emitted as it is written.
+
+        Without this, ``stream_response`` treats the route as non-streaming and
+        hands ``stream_turn`` the finished paragraph as a single delta: the
+        per-sentence guard still runs, but it runs on everything at once and the
+        voice path waits for the whole turn before any audio. So the streaming
+        transport buys this route nothing until the route can stream — which is
+        the only reason a faster model here would be a latency win rather than
+        just a different model.
+
+        Same request as ``respond`` plus ``stream=True``, deliberately: a route
+        whose streaming and non-streaming paths ask for different things is a
+        route where the guardrail behaviour certified on one is not the
+        behaviour running on the other.
+
+        **Still uncertified.** Streaming does not change what the README says
+        about this route — ``MAX_TOOL_ROUNDS`` and the strike budget were tuned
+        against Claude, and ``tests/evals/`` plus the adversarial pass have to
+        be re-run before it carries a real call.
+        """
+        self._client.api_key = _access_token(self._api_key, self._api_secret)
+        conversation = to_openai_messages(messages)
+        started = time.monotonic()
+        chunks = self._client.chat.completions.create(
+            model=self._model,
+            max_tokens=self._max_tokens,
+            messages=cast(Any, conversation),
+            tools=self._tools,
+            stream=True,
+        )
+        yield from to_stream_events(chunks, model=self._model, started=started)

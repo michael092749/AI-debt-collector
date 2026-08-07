@@ -14,10 +14,20 @@ provider-specific request extras. Everything below is identical for both.
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Iterable, Iterator
 from hashlib import sha256
 from typing import Any, cast
 
-from collector.llm.base import LLMResponse, Message, ToolCall
+from collector.llm.base import (
+    LLMResponse,
+    LLMUsage,
+    Message,
+    StreamCompleted,
+    StreamEvent,
+    TextDelta,
+    ToolCall,
+)
 from collector.tools import TOOL_SCHEMAS
 
 JsonDict = dict[str, Any]
@@ -118,6 +128,81 @@ def to_llm_response(message: Any) -> LLMResponse:
             )
         )
     return LLMResponse(text=(message.content or "").strip(), tool_calls=tuple(calls))
+
+
+def to_stream_events(chunks: Iterable[Any], *, model: str, started: float) -> Iterator[StreamEvent]:
+    """Read an OpenAI-shape chunk stream into the loop's own stream events.
+
+    The counterpart to ``to_llm_response`` for ``stream=True``, and the reason
+    an OpenAI-shape route is worth anything on the voice path: without it
+    ``stream_response`` degrades the route to one delta carrying the finished
+    turn, the per-sentence guard runs on the whole paragraph at once, and the
+    streaming transport waits exactly as long as the blocking one did.
+
+    Two shapes have to be reassembled rather than read:
+
+    * **Tool calls arrive in fragments**, keyed by ``index`` — the id and name
+      in the first chunk, the JSON arguments a few characters at a time after
+      it. A malformed or truncated ``arguments`` raises here, the same as on the
+      non-streaming path: the model asking the engine for something and the
+      transport quietly dropping the request is the one failure this
+      architecture cannot absorb, and a raise degrades to the scripted line
+      with the round on the record.
+    * **Usage is synthesized, not read.** Token counts need
+      ``stream_options={"include_usage": True}``, which is not sent — an
+      unrecognized request field against this gateway is a 400 that would take
+      the turn down, and neither route is certified enough to gamble a live
+      call on the shape. Latency and the model name are measured here, so the
+      round still leaves a ``ModelCalled`` row rather than none.
+    """
+    text_parts: list[str] = []
+    refused = False
+    # index -> the fragments of one tool call, in arrival order.
+    calls: dict[int, dict[str, str]] = {}
+
+    for chunk in chunks:
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            continue
+
+        if getattr(delta, "refusal", None):
+            refused = True
+
+        for fragment in getattr(delta, "tool_calls", None) or []:
+            slot = calls.setdefault(fragment.index, {"id": "", "name": "", "arguments": ""})
+            if fragment.id:
+                slot["id"] = fragment.id
+            function = getattr(fragment, "function", None)
+            if function is not None:
+                slot["name"] += function.name or ""
+                slot["arguments"] += function.arguments or ""
+
+        content = getattr(delta, "content", None)
+        if content:
+            text_parts.append(content)
+            yield TextDelta(content)
+
+    usage = LLMUsage(model=model, latency_ms=int((time.monotonic() - started) * 1000))
+    if refused:
+        # The model declined. Say nothing rather than something unvetted, the
+        # same as ``to_llm_response``.
+        yield StreamCompleted(LLMResponse(usage=usage))
+        return
+
+    tool_calls = tuple(
+        ToolCall(
+            name=slot["name"],
+            arguments=json.loads(slot["arguments"]) if slot["arguments"] else {},
+            call_id=slot["id"],
+        )
+        for _, slot in sorted(calls.items())
+    )
+    yield StreamCompleted(
+        LLMResponse(text="".join(text_parts).strip(), tool_calls=tool_calls, usage=usage)
+    )
 
 
 def _tool_exchange(message: Message) -> list[JsonDict]:
