@@ -12,6 +12,7 @@ escalation trigger.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from decimal import Decimal
 from pathlib import Path
@@ -400,6 +401,31 @@ class TestTurnLoop:
 
         notice_turn = next(i for i, t in enumerate(spoken) if fires_mini_miranda(t) is not None)
         assert "$" in spoken[notice_turn], "the notice turn must also carry the balance"
+
+    def test_the_notice_survives_a_failed_tool_round(self) -> None:
+        """Collapsing the notice into the offer turn must not make it
+        *conditional* on that turn succeeding.
+
+        It briefly was. The notice had its own turn before any tool ran, so it
+        was always on record; riding it out with the first figures meant a tool
+        round that errored left it unsaid for the rest of the call — the
+        consumer heard a filler line instead of the one sentence that is
+        required, and the audit trail recorded a call that never disclosed.
+        """
+        agent = _agent()
+        agent.open_call(PreCallContext(account_loaded=True, within_calling_window=True))
+        # Exhaust the negotiation so the first post-identity tool round errors.
+        agent.tools = dataclasses.replace(
+            agent.tools, state=dataclasses.replace(agent.tools.state, max_rounds=0)
+        )
+
+        turn = agent.turn("Yes, this is her.")
+
+        assert turn.spoken is not None
+        assert fires_mini_miranda(turn.spoken) is not None, (
+            "a failed tool round swallowed the required notice"
+        )
+        assert DisclosureId.MINI_MIRANDA in agent.guard.disclosures.fired
 
     def test_the_collapsed_turn_survives_sentence_streaming(self) -> None:
         """The voice path guards a sentence at a time and holds a chunk back

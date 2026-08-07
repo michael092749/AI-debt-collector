@@ -351,6 +351,21 @@ class MockLLMClient:
 
     def _speak_from_tool(self, content: str, messages: tuple[Message, ...]) -> LLMResponse:
         payload = _load(content)
+        # The notice rides out with the first figures, so it must not ride out
+        # *only* with them: a tool round that errors used to leave it unsaid for
+        # the whole call, and the consumer heard a filler line instead of the
+        # one sentence the law requires. It goes on the front of whatever this
+        # turn says, successful round or not.
+        #
+        # Gated on identity as well as on having disclosed, because the notice
+        # says "collect a debt" and that is substantive — prepending it to the
+        # refusal an identity-gated tool just returned would be blocked, and
+        # spend strikes doing it.
+        notice = (
+            ""
+            if self._disclosed(messages) or not self._identity_confirmed(messages)
+            else f"Thank you. {MINI_MIRANDA_TEXT} "
+        )
         if not payload.get("ok"):
             if "end_call" in str(payload.get("error", "")):
                 # Every tool refuses this way once the round cap is hit
@@ -366,7 +381,9 @@ class MockLLMClient:
                         ),
                     )
                 )
-            return LLMResponse(text="Give me one moment — let me check what I can do here.")
+            return LLMResponse(
+                text=f"{notice}Give me one moment — let me check what I can do here."
+            )
 
         if payload.get("agreed"):
             agreement = payload.get("agreement") or {}
@@ -380,11 +397,9 @@ class MockLLMClient:
         # for a compliant model has to be able to close a call.
         confirm = payload.get("you_must_confirm")
         ask = str(confirm) if isinstance(confirm, str) else "Can I get your okay on that?"
-        # The notice rides out with the first figures rather than costing a turn
-        # of its own. It has to lead the sentence: the ordering check compares
-        # where it fired against where the money talk starts, so a notice that
-        # trails the balance is blocked even though the words were all said.
-        notice = "" if self._disclosed(messages) else f"Thank you. {MINI_MIRANDA_TEXT} "
+        # The notice has to lead the sentence: the ordering check compares where
+        # it fired against where the money talk starts, so a notice that trails
+        # the balance is blocked even though the words were all said.
 
         if payload.get("outcome") == "accept":
             return LLMResponse(text=f"{notice}{self._describe(offer)} {ask}")
@@ -410,7 +425,7 @@ class MockLLMClient:
                 )
             reason = self._reason(payload.get("rationale_code"))
             return LLMResponse(text=f"{notice}{reason} {self._describe(offer)} {ask}")
-        return LLMResponse(text="Thank you for that. Let me see what I can do.")
+        return LLMResponse(text=f"{notice}Let me see what I can do.")
 
     def _describe(self, offer: object, *, lead: str = "That's") -> str:
         """Read back an engine-authored offer using only its own figures."""
