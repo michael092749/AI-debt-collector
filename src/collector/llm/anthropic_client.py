@@ -203,6 +203,8 @@ class AnthropicClient:
         self._model = resolve_model(model)
         self._max_tokens = max_tokens
         self._effort = effort
+        # One warning per client if the cache breakpoints turn out inert.
+        self._cache_warned = False
         self._tools: list[Any] = [
             {
                 "name": schema.name,
@@ -319,6 +321,44 @@ class AnthropicClient:
             usage=usage,
         )
 
+    def _warn_if_caching_is_doing_nothing(
+        self, model: str, cache_read: int, cache_write: int, input_tokens: int
+    ) -> None:
+        """Say so, once, when the ``cache_control`` breakpoints bought nothing.
+
+        Every request this client sends carries two breakpoints, so a response
+        that reports neither a read nor a write means the caching is inert. The
+        failure has no error attached to it — a prefix under the model's minimum
+        silently declines to cache — which is why it needs detecting at runtime
+        rather than asserting offline. The one thing an offline test cannot
+        check is exactly the thing this checks.
+
+        The likeliest cause is a model swap. The minimum cacheable prefix is
+        per-model and *not* monotonic across generations: 1024 tokens on
+        ``claude-sonnet-5``, 512 on ``claude-opus-5``, but 4096 on
+        ``claude-haiku-4-5``. This system prompt plus six tool schemas is on the
+        order of two thousand tokens — comfortably over the default model's
+        minimum and comfortably under Haiku's. So the obvious latency move,
+        ``COLLECTOR_MODEL=claude-haiku-4-5``, silently trades the caching win
+        away for the faster model, and partly cancels itself.
+
+        Once per client, not per call: this runs on every model call of every
+        turn, and a warning that repeats a hundred times a call is one an
+        operator learns to filter.
+        """
+        if self._cache_warned or cache_read or cache_write:
+            return
+        # An empty or absent usage block is a missing measurement, not evidence
+        # that caching is off — `_usage` defaults every counter to zero.
+        if not input_tokens:
+            return
+        self._cache_warned = True
+        logger.warning(
+            "prompt caching reported no read and no write; the breakpoints are "
+            "buying nothing on this model",
+            extra={"model": model, "input_tokens": input_tokens},
+        )
+
     def _usage(self, response: Any, latency_ms: int) -> LLMUsage:
         """Read the SDK's ``usage`` block rather than discarding it.
 
@@ -331,6 +371,7 @@ class AnthropicClient:
         cache_read = int(getattr(raw, "cache_read_input_tokens", 0) or 0)
         cache_write = int(getattr(raw, "cache_creation_input_tokens", 0) or 0)
         model = getattr(response, "model", None) or self._model
+        self._warn_if_caching_is_doing_nothing(model, cache_read, cache_write, input_tokens)
         return LLMUsage(
             model=model,
             latency_ms=latency_ms,

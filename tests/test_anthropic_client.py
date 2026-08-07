@@ -18,6 +18,7 @@ through and killed the call. These tests pin the statuses, not the hierarchy.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -262,6 +263,18 @@ class TestPromptCaching:
         return seen
 
     @staticmethod
+    def _replied_on(client: AnthropicClient, message: _Message) -> None:
+        """Drive one response through an existing client, so per-client state
+        (the once-only cache warning) is observable across calls."""
+
+        class _Returns:
+            def create(self, **kwargs: Any) -> Any:
+                return message
+
+        client._client.messages = _Returns()  # type: ignore[assignment]
+        client.respond(())
+
+    @staticmethod
     def _breakpoints(request: dict[str, Any]) -> int:
         """Every marked block in the request, ``tools`` included — the API's
         ceiling of four counts those too, so a count that skipped them could
@@ -390,3 +403,94 @@ class TestPromptCaching:
 
         assert seen["system"][-1]["cache_control"] == {"type": "ephemeral"}
         assert seen["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_a_model_whose_prefix_never_caches_says_so(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The one failure mode an offline test cannot certify, detected at
+        runtime instead.
+
+        Every request carries two breakpoints, so a response reporting neither a
+        read nor a write means they bought nothing — and the API attaches no
+        error to that, because a prefix under the model's minimum simply declines
+        to cache. The trap is a model swap: the minimum is per-model and not
+        monotonic (1024 on ``claude-sonnet-5``, 4096 on ``claude-haiku-4-5``),
+        and this prefix sits between the two. So the obvious latency move to
+        Haiku silently trades the caching away.
+        """
+        client = _client()
+        with caplog.at_level(logging.WARNING, logger="collector.llm.anthropic_client"):
+            self._replied_on(
+                client,
+                _Message(
+                    content=[_Block(type="text", text="Hello.")],
+                    stop_reason="end_turn",
+                    usage=_Usage(input_tokens=1800, output_tokens=10),
+                    model="claude-haiku-4-5",
+                ),
+            )
+
+        assert "buying nothing" in caplog.text
+        # On the record as a field, not spliced into the sentence: this line's
+        # job is to be filterable in a drain, the same as every other `extra=`
+        # in this project.
+        (warning,) = [r for r in caplog.records if "buying nothing" in r.getMessage()]
+        assert warning.model == "claude-haiku-4-5"  # type: ignore[attr-defined]
+
+    def test_a_working_cache_says_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A cold first call still *writes*, so the warning must not fire on the
+        request that populates the entry — otherwise it fires on every call."""
+        client = _client()
+        with caplog.at_level(logging.WARNING, logger="collector.llm.anthropic_client"):
+            self._replied_on(
+                client,
+                _Message(
+                    content=[_Block(type="text", text="Hello.")],
+                    stop_reason="end_turn",
+                    usage=_Usage(
+                        input_tokens=40, output_tokens=10, cache_creation_input_tokens=1800
+                    ),
+                    model="claude-sonnet-5",
+                ),
+            )
+
+        assert "buying nothing" not in caplog.text
+
+    def test_the_warning_fires_once_not_once_per_round(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """This runs on every model call of every turn, and a turn makes up to
+        five. A warning repeated a hundred times a call is one an operator
+        learns to filter."""
+        client = _client()
+        message = _Message(
+            content=[_Block(type="text", text="Hello.")],
+            stop_reason="end_turn",
+            usage=_Usage(input_tokens=1800, output_tokens=10),
+            model="claude-haiku-4-5",
+        )
+        with caplog.at_level(logging.WARNING, logger="collector.llm.anthropic_client"):
+            for _ in range(4):
+                self._replied_on(client, message)
+
+        assert caplog.text.count("buying nothing") == 1
+
+    def test_a_missing_usage_block_is_not_read_as_a_cache_failure(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``_usage`` defaults every counter to zero, so an absent usage block
+        looks identical to "cached nothing". A missing measurement is not
+        evidence, and warning on it would cry wolf on every transport hiccup."""
+        client = _client()
+        with caplog.at_level(logging.WARNING, logger="collector.llm.anthropic_client"):
+            self._replied_on(
+                client,
+                _Message(
+                    content=[_Block(type="text", text="Hello.")],
+                    stop_reason="end_turn",
+                    usage=_Usage(),
+                    model="claude-sonnet-5",
+                ),
+            )
+
+        assert "buying nothing" not in caplog.text
