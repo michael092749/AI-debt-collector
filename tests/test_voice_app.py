@@ -78,6 +78,17 @@ from collector.voice_app import (
     entrypoint,
 )
 
+# These tests park a pump thread on a gate and then release it, so every wait
+# below is a *hang detector*, not a performance assertion. They have to be
+# generous: `asyncio.to_thread` draws on the default executor, which the rest of
+# this suite is also using for `AuditStore` workers and other pumps, so how long
+# a pump waits for a thread — and how long the loop takes to reach `release.set()`
+# — depends on what else is running. A budget tight enough to double as a speed
+# check fails under load and says nothing useful when it does. This one still
+# catches a genuine hang, just later.
+_HANG = 30
+
+
 POLICY = PolicyConfig.default()
 
 
@@ -288,7 +299,7 @@ class _GatedStreamClient:
     def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
         yield TextDelta(f"{self.FIRST} ")
         self.first_delta_sent.set()
-        assert self.release.wait(timeout=5), "the test never released the gate"
+        assert self.release.wait(timeout=_HANG), "the test never released the gate"
         yield TextDelta(f"{self.SECOND} ")
         yield StreamCompleted(LLMResponse(text=f"{self.FIRST} {self.SECOND}"))
 
@@ -309,7 +320,7 @@ async def test_the_first_sentence_arrives_before_the_turn_completes(store: Audit
 
     stream = agent.llm_node(ctx, [], {})  # type: ignore[arg-type]
     try:
-        first = await asyncio.wait_for(anext(stream), timeout=5)
+        first = await asyncio.wait_for(anext(stream), timeout=_HANG)
 
         assert first == _GatedStreamClient.FIRST
         # The round is provably mid-flight: the client is parked on the gate,
@@ -361,7 +372,7 @@ class _ClosingStreamClient:
             )
             return
         yield TextDelta(f"{self.GOODBYE} ")
-        assert self.release.wait(timeout=5), "the test never released the gate"
+        assert self.release.wait(timeout=_HANG), "the test never released the gate"
         yield TextDelta(f"{self.TAIL} ")
         yield StreamCompleted(LLMResponse(text=f"{self.GOODBYE} {self.TAIL}"))
 
@@ -388,7 +399,7 @@ async def test_a_barge_in_on_the_closing_turn_still_hangs_up(
 
     stream = agent.llm_node(ctx, [], {})  # type: ignore[arg-type]
     try:
-        assert await asyncio.wait_for(anext(stream), timeout=5) == _ClosingStreamClient.GOODBYE
+        assert await asyncio.wait_for(anext(stream), timeout=_HANG) == _ClosingStreamClient.GOODBYE
         # The precondition that makes the barge-in dangerous rather than
         # ordinary: the call is already closed out, and only this generator
         # knows to shut the room.
@@ -404,7 +415,7 @@ async def test_a_barge_in_on_the_closing_turn_still_hangs_up(
     # And the turn is still on the record — those sentences were audio, so
     # abandoning the stream must not lose the exchange. It lands once the pump
     # has closed the generator, which is what ``drain()`` waits for.
-    await asyncio.wait_for(agent.drain(timeout=5), timeout=10)
+    await asyncio.wait_for(agent.drain(timeout=_HANG), timeout=_HANG * 2)
     assert negotiation_agent.turns
     assert negotiation_agent.turns[-1].ended
 
@@ -434,7 +445,7 @@ async def test_an_abandoned_turn_finishes_writing_before_the_store_closes(
     ctx.add_message(role="user", content="Yes, that's fine.")
 
     stream = agent.llm_node(ctx, [], {})  # type: ignore[arg-type]
-    await asyncio.wait_for(anext(stream), timeout=5)
+    await asyncio.wait_for(anext(stream), timeout=_HANG)
     turns_before = len(negotiation_agent.turns)
 
     await stream.aclose()
@@ -443,7 +454,7 @@ async def test_an_abandoned_turn_finishes_writing_before_the_store_closes(
     assert len(negotiation_agent.turns) == turns_before
     client.release.set()
 
-    await asyncio.wait_for(agent.drain(timeout=5), timeout=10)
+    await asyncio.wait_for(agent.drain(timeout=_HANG), timeout=_HANG * 2)
 
     assert len(negotiation_agent.turns) == turns_before + 1
 
@@ -468,7 +479,7 @@ async def test_drain_waits_for_every_pump_not_just_the_last(store: AuditStore) -
     try:
         # Generation one: started, parked on its gate, then abandoned.
         stale = agent.llm_node(ctx, [], {})  # type: ignore[arg-type]
-        await asyncio.wait_for(anext(stale), timeout=5)
+        await asyncio.wait_for(anext(stale), timeout=_HANG)
         (stale_pump,) = agent._pumps
         await stale.aclose()
 
@@ -491,7 +502,7 @@ async def test_drain_waits_for_every_pump_not_just_the_last(store: AuditStore) -
     finally:
         first.release.set()
 
-    await asyncio.wait_for(agent.drain(timeout=5), timeout=10)
+    await asyncio.wait_for(agent.drain(timeout=_HANG), timeout=_HANG * 2)
 
     # Waited, not merely returned — so the store is safe to close.
     assert stale_pump.done()
