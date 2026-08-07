@@ -231,9 +231,13 @@ class TestModelInstrumentation:
         assert call.latency_ms == 412
         assert (call.input_tokens, call.output_tokens) == (1200, 30)
 
-    def test_a_failed_model_call_is_logged_and_does_not_kill_the_turn(self, tmp_path: Path) -> None:
-        """An unhandled transient error used to end the call with no spoken
-        turn and no logged reason. Now the reason is on the record."""
+    def test_a_failed_model_call_speaks_the_fallback_and_logs_the_reason(
+        self, tmp_path: Path
+    ) -> None:
+        """A transient error used to kill the turn with no fallback and no
+        logged reason. Silence is not the fix either: on a phone line silence
+        *is* the dropped call, so the scripted line goes out and the reason is
+        recorded against the turn."""
 
         class FailingClient:
             def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
@@ -246,14 +250,29 @@ class TestModelInstrumentation:
             agent = _agent(store, llm=FailingClient())
             check, opening = agent.open_call()
             assert check.allowed
-            assert opening is None  # nothing said, but the call is still alive
-            assert not agent.ended
+            assert opening == SAFE_FALLBACK_TEXT
+            assert not agent.ended, "a failed call is recoverable from the next utterance"
 
             call = store.model_calls(agent.call_id)[0]
 
         assert call.error is not None
         assert "APITimeoutError" in call.error
         assert call.latency_ms == 6000
+
+    def test_a_failed_model_call_mid_stream_still_says_something(self) -> None:
+        class FailingStreamer:
+            def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+                return LLMResponse(text=_GREETING)
+
+            def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+                yield StreamCompleted(LLMResponse(error="APIConnectionError: reset"))
+
+        agent = _agent(llm=FailingStreamer())
+        agent.open_call()
+        spoken = list(agent.stream_turn("Yes, this is Dana."))
+
+        assert spoken == [SAFE_FALLBACK_TEXT]
+        assert not agent.ended
 
     def test_every_round_trip_in_a_turn_is_accounted_for(self, tmp_path: Path) -> None:
         """A turn spends several calls — tool rounds plus the closing words.
@@ -464,6 +483,36 @@ class TestStreamAdapter:
         assert isinstance(Streamer(), StreamingLLMClient)
         events = list(stream_response(Streamer(), ()))
         assert [e.text for e in events if isinstance(e, TextDelta)] == ["Hi. ", "Speaking?"]
+
+
+class TestOpeningIsNotStreamed:
+    def test_the_greeting_is_guarded_whole_because_the_rule_is_turn_scoped(self) -> None:
+        """The AI-disclosure rule governs the first agent *turn*. A first
+        sentence that is not the disclosure cannot be judged against it without
+        knowing what the second sentence will say, so the opening is guarded as
+        one unit — sentence-by-sentence guarding would block every greeting
+        whose disclosure is not its opening clause.
+        """
+        agent = _agent()
+        greeting = agent.messages  # capture identity before the call
+        _, spoken = agent.open_call()
+
+        assert spoken is not None
+        assert spoken != SAFE_FALLBACK_TEXT, "guarded whole, this clears; per sentence it would not"
+        assert AI_DISCLOSURE_TEXT.split(":")[0] in spoken
+        assert greeting is agent.messages
+
+    def test_the_mini_miranda_rule_does_compose_sentence_by_sentence(self) -> None:
+        """It constrains *order* within a turn, and a per-sentence guard
+        enforces order by construction — so mid-call turns stream fine."""
+        agent = _agent()
+        agent.open_call()
+        sentences = list(agent.stream_turn("Yes, this is Dana."))
+
+        assert len(sentences) > 1
+        spoken = " ".join(sentences)
+        assert "attempt to collect a debt" in spoken
+        assert spoken != SAFE_FALLBACK_TEXT
 
 
 class TestStreamingTurn:

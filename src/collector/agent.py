@@ -102,6 +102,29 @@ def _split_sentences(buffer: str) -> tuple[list[str], str]:
     return sentences, buffer[cursor:].lstrip()
 
 
+@dataclass
+class _Round:
+    """What one streamed round produced, beside the sentences it yielded.
+
+    A generator cannot hand a return value to a caller that is iterating it,
+    and stashing this on the agent would make two concurrent turns share it.
+    So the caller passes one of these in and reads it once the round is done.
+    """
+
+    response: LLMResponse | None = None
+    blocked: str | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self.response is not None and self.response.error is not None
+
+    def needs_fallback(self, spoken: list[str]) -> bool:
+        """A blocked sentence always falls back; a failed call only if the
+        round said nothing, since a scripted line after real speech reads as a
+        non-sequitur rather than a recovery."""
+        return self.blocked is not None or (self.failed and not spoken)
+
+
 @dataclass(frozen=True)
 class AgentTurn:
     """One exchange, from the consumer's words to what was actually spoken."""
@@ -165,6 +188,11 @@ class NegotiationAgent:
         Returns the check alongside the greeting so a refusal to dial is a
         value the caller handles, not an exception it has to catch.
         """
+        check = self._dial(context)
+        return check, None if not check.allowed else self._generate_and_speak()
+
+    def _dial(self, context: PreCallContext | None) -> PreCallCheck:
+        """The pre-call ring plus the ``CallStarted`` record, shared by both paths."""
         check = check_pre_call(
             context
             if context is not None
@@ -193,7 +221,7 @@ class NegotiationAgent:
                     )
                 )
             self._record(CallEnded(self.call_id, CallOutcome.ABANDONED, turn_count=0))
-            return check, None
+            return check
 
         self._record(
             CallStarted(
@@ -204,7 +232,7 @@ class NegotiationAgent:
                 channel=self.channel,
             )
         )
-        return check, self._generate_and_speak()
+        return check
 
     # -- ring 2 ------------------------------------------------------------
 
@@ -248,6 +276,20 @@ class NegotiationAgent:
         The completed turn is appended to ``self.turns`` when the iterator is
         exhausted, so a caller that abandons it early leaves no turn recorded —
         which is correct: an abandoned stream is a dropped call, not a turn.
+
+        **The greeting is not streamed, and cannot be.** ``open_call`` stays
+        synchronous because the AI-disclosure rule is scoped to the *turn*: the
+        first agent turn must disclose that the caller is an AI, and a first
+        sentence that is not the disclosure cannot be judged against that rule
+        without knowing what the second sentence will say. Guarding it whole is
+        the only way to hold it. The Mini-Miranda rule does compose sentence by
+        sentence — it constrains order within a turn, and a per-sentence guard
+        enforces order by construction — so mid-call turns stream fine.
+
+        A deployment chasing first-audio latency on the greeting should not
+        reach for streaming here; it should pre-render it. The opening is the
+        one utterance whose required content is fixed, so it does not need the
+        model at all.
         """
         if self.ended:
             raise ValueError("the call has ended; start a new one")
@@ -266,48 +308,22 @@ class NegotiationAgent:
         closing = False
 
         for _ in range(MAX_TOOL_ROUNDS + 1):
-            response: LLMResponse | None = None
-            buffer = ""
-            halted = False
+            round_ = _Round()
+            for sentence in self._stream_round(round_):
+                spoken.append(sentence)
+                yield sentence
 
-            for event in stream_response(self.llm, tuple(self.messages)):
-                match event:
-                    case TextDelta():
-                        buffer += event.text
-                        sentences, buffer = _split_sentences(buffer)
-                        for sentence in sentences:
-                            allowed = self._guard_sentence(sentence)
-                            if allowed is None:
-                                blocked.append(sentence)
-                                halted = True
-                                break
-                            spoken.append(allowed)
-                            yield allowed
-                        if halted:
-                            break
-                    case StreamCompleted():
-                        response = event.response
-                        self._record_model_call(response)
-
-            # Whatever the model left without terminal punctuation is still a
-            # sentence; a turn ending "so let me know" must not be swallowed.
-            if not halted and buffer.strip():
-                allowed = self._guard_sentence(buffer)
-                if allowed is None:
-                    blocked.append(buffer.strip())
-                    halted = True
-                else:
-                    spoken.append(allowed)
-                    yield allowed
-
-            if halted:
+            if round_.blocked is not None:
+                blocked.append(round_.blocked)
+            if round_.needs_fallback(spoken):
                 fallback = fallback_for(self.guard)
                 self._speak_verbatim(fallback)
                 spoken.append(fallback)
                 yield fallback
                 break
 
-            if closing or response is None or not response.wants_tools:
+            response = round_.response
+            if closing or response is None or round_.failed or not response.wants_tools:
                 break
             for call in response.tool_calls:
                 results.append(self._run_tool(call))
@@ -328,6 +344,38 @@ class NegotiationAgent:
                 ended=self.ended,
             )
         )
+
+    def _stream_round(self, round_: _Round) -> Iterator[str]:
+        """One streamed round, yielding each sentence that clears the guard.
+
+        Stops at the first blocked sentence — the abort the streaming contract
+        requires. What the round produced besides speech (the assembled
+        response, the blocked sentence) lands on ``round_``.
+        """
+        buffer = ""
+        for event in stream_response(self.llm, tuple(self.messages)):
+            match event:
+                case TextDelta():
+                    buffer += event.text
+                    sentences, buffer = _split_sentences(buffer)
+                    for sentence in sentences:
+                        allowed = self._guard_sentence(sentence)
+                        if allowed is None:
+                            round_.blocked = sentence
+                            return
+                        yield allowed
+                case StreamCompleted():
+                    round_.response = event.response
+                    self._record_model_call(event.response)
+
+        # Whatever the model left without terminal punctuation is still a
+        # sentence; a turn ending "so let me know" must not be swallowed.
+        if buffer.strip():
+            allowed = self._guard_sentence(buffer)
+            if allowed is None:
+                round_.blocked = buffer.strip()
+            else:
+                yield allowed
 
     def _guard_sentence(self, sentence: str) -> str | None:
         """The pre-TTS gate for one sentence. ``None`` means do not speak it.
@@ -428,8 +476,8 @@ class NegotiationAgent:
         results: list[ToolResult] = []
         for _ in range(MAX_TOOL_ROUNDS):
             response = self._ask_model()
-            if not response.wants_tools:
-                spoken, blocked = self._guard_and_speak(response.text)
+            if response.error is not None or not response.wants_tools:
+                spoken, blocked = self._speak_or_fall_back(response)
                 return spoken, tuple(results), blocked
             for call in response.tool_calls:
                 results.append(self._run_tool(call))
@@ -438,8 +486,7 @@ class NegotiationAgent:
 
         # Out of round trips, or the call closed inside a tool. Ask once more
         # for words; a turn that produces nothing to say is a dead phone line.
-        response = self._ask_model()
-        spoken, blocked = self._guard_and_speak(response.text)
+        spoken, blocked = self._speak_or_fall_back(self._ask_model())
         return spoken, tuple(results), blocked
 
     def _ask_model(self) -> LLMResponse:
@@ -529,9 +576,23 @@ class NegotiationAgent:
         return result
 
     def _generate_and_speak(self) -> str | None:
-        response = self._ask_model()
-        spoken, _ = self._guard_and_speak(response.text)
+        spoken, _ = self._speak_or_fall_back(self._ask_model())
         return spoken
+
+    def _speak_or_fall_back(self, response: LLMResponse) -> tuple[str | None, tuple[str, ...]]:
+        """Guard what the model produced, or speak the scripted line if it
+        produced nothing because the call to it failed.
+
+        A transport failure must not become silence. On a phone line silence
+        *is* the dropped call, which is the outcome the timeout and the retry
+        exist to avoid — so a failed call spends the same fallback the guard
+        reaches for after two strikes.
+        """
+        if response.error is not None:
+            fallback = fallback_for(self.guard)
+            self._speak_verbatim(fallback)
+            return fallback, ()
+        return self._guard_and_speak(response.text)
 
     def _guard_and_speak(self, candidate: str) -> tuple[str | None, tuple[str, ...]]:
         """The pre-TTS gate, with the regeneration loop behind it.

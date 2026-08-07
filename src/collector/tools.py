@@ -352,9 +352,11 @@ def _cadence_arg(args: JsonDict, default: Cadence = Cadence.MONTHLY) -> Cadence:
 def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult:
     name = "validate_consumer_offer"
     proposal = ConsumerProposal(
-        # No sum named means they proposed a shape, not a discount: the balance
-        # stands, and the structure is what gets ruled on.
-        total=args.get("total") or context.policy.original_balance,
+        # Membership, not truthiness. "They proposed $0" and "they named no sum
+        # at all" are different negotiation states — the first is a lowball to
+        # rule on, the second means the balance stands and only the structure
+        # is in question — and a falsy-zero would silently merge them.
+        total=args.get("total", context.policy.original_balance),
         payment_count=args["payment_count"],
         cadence=args["cadence"],
         signaled_capacity=args.get("signaled_capacity"),

@@ -150,7 +150,16 @@ class AnthropicClient:
         # the SDK already backs off on the retryable statuses (408/409/429/5xx)
         # and reads ``retry-after``, and duplicating that is how the two drift.
         self._client = anthropic.Anthropic(api_key=key, timeout=timeout, max_retries=max_retries)
-        self._api_error = anthropic.AnthropicError
+        # Only the transient failures are absorbed. A 401, 404 or 400 is
+        # misconfiguration — a bad key, a model name that does not exist — and
+        # swallowing one would leave the agent silently mute on every turn
+        # while the call reported itself compliant. Those propagate, loudly,
+        # on the first call. ``APITimeoutError`` is an ``APIConnectionError``.
+        self._retryable_errors = (
+            anthropic.APIConnectionError,
+            anthropic.RateLimitError,
+            anthropic.InternalServerError,
+        )
         self._model = resolve_model(model)
         self._max_tokens = max_tokens
         self._effort = effort
@@ -180,11 +189,11 @@ class AnthropicClient:
                 thinking={"type": "adaptive"},
                 output_config=cast(Any, {"effort": self._effort}),
             )
-        except self._api_error as exc:
-            # Timeout, rate limit, connection drop — all of them already retried
-            # by the SDK. Killing the turn over one would drop the call; instead
-            # the loop gets an empty response it can fall back from, and the
-            # reason reaches the audit log via ``LLMResponse.error``.
+        except self._retryable_errors as exc:
+            # Timeout, rate limit, connection drop — already retried by the SDK
+            # and still failing. Killing the turn over one would drop the call;
+            # instead the loop gets a response it can speak a scripted line
+            # from, and the reason reaches the log via ``LLMResponse.error``.
             detail = f"{type(exc).__name__}: {exc}"
             logger.warning("model call failed after retries: %s", detail)
             return LLMResponse(
@@ -222,7 +231,7 @@ class AnthropicClient:
                     if text:
                         yield TextDelta(text)
                 final = stream.get_final_message()
-        except self._api_error as exc:
+        except self._retryable_errors as exc:
             detail = f"{type(exc).__name__}: {exc}"
             logger.warning("streamed model call failed after retries: %s", detail)
             yield StreamCompleted(
