@@ -518,8 +518,12 @@ class GuardrailState:
     def with_identity_revoked(self) -> GuardrailState:
         """A later explicit denial undoes an earlier confirmation. Not a
         latch: substantive content must not keep flowing to someone who has
-        since said they are not the account holder (ADVERSARIAL_TESTING.md C1)."""
-        return replace(self, identity_confirmed=False)
+        since said they are not the account holder (ADVERSARIAL_TESTING.md C1).
+
+        Takes the acknowledgment set with it: whoever was speaking is not the
+        account holder, so nothing they named is the account holder's number.
+        """
+        return replace(self, identity_confirmed=False, acknowledged=AuthorizedFigures())
 
     def _record(self, event: GuardrailEvent) -> GuardrailState:
         return replace(self, events=(*self.events, event))
@@ -630,6 +634,12 @@ def check_inbound(state: GuardrailState, utterance: str) -> InboundCheck:
             turn_index=turn_index,
             closing_line=escalation_closing(trigger),
         )
+
+    # Negotiation stops at escalation (A6), so the vocabulary it ran on goes
+    # with it: a figure the consumer floated before disputing the debt must
+    # not still be speakable afterwards.
+    if escalation is not None:
+        acknowledged = AuthorizedFigures()
 
     event = GuardrailEvent(
         ring=GuardrailRing.DURING_CALL,

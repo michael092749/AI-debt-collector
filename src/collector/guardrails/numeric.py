@@ -293,17 +293,35 @@ def consumer_stated_money(utterance: str, *, ceiling: Decimal | None = None) -> 
     * **Money only.** "I could do twelve months" must not make 12 sayable as
       a duration or a payment count — a term the consumer floated is not a
       term the engine agreed to.
+    * **An explicit currency marker.** ``_classify`` reads any bare number at
+      or above $100 as money, which is the right default for screening what
+      the *agent* says and the wrong one here: "999 problems", "850 a week"
+      and a case reference are not amounts on the table. The cost is that
+      bare slang ("a grand", "a G") no longer widens anything, which is a
+      thin loss — it resolves to the balance, already authorized.
     * **Bounded by ``ceiling``**, the largest already-authorized amount (the
       balance). Nothing the consumer says widens the guard past the account.
     * **Nothing suspicious.** A digit run against a letter is an evasion
       shape whoever typed it; it never widens anything.
 
-    What this cannot do is tell an *acknowledgment* from an *offer*. Both are
-    the agent saying "$200", and the guard sees only the figure. "Two hundred
-    dollars, understood" and "Two hundred dollars works" are indistinguishable
-    here — the rule that the agent must not accept terms the engine has not
-    priced lives in the decision engine and the system prompt, not in this
-    function. Widening this set makes that rule matter more, not less.
+    Three things it still cannot do, and none of them are detectable from the
+    text of a figure:
+
+    * Tell an *acknowledgment* from an *offer*. Both are the agent saying
+      "$200". "Two hundred dollars, understood" and "Two hundred dollars
+      works" are the same figure to this guard — the rule that the agent must
+      not accept terms the engine has not priced lives in the decision engine
+      and the system prompt.
+    * Tell who named it. A figure the consumer *relayed* ("my neighbour
+      settled his for four hundred dollars") reads exactly like one they
+      offered.
+    * Tell why. A figure named to refuse it ("I definitely can't do $900"),
+      or one carried in on injected instructions, is still a figure the
+      consumer's channel contains.
+
+    So this widens the agent's vocabulary to amounts that were *said near the
+    consumer*, not amounts the consumer agreed to. Everything above keeps
+    that set small; nothing above makes it exact.
     """
     values = {
         figure.value
@@ -311,6 +329,7 @@ def consumer_stated_money(utterance: str, *, ceiling: Decimal | None = None) -> 
         if figure.kind is FigureKind.MONEY
         and figure.value is not None
         and not figure.suspicious
+        and _CURRENCY_MARKER_RE.search(figure.text) is not None
         and (ceiling is None or figure.value <= ceiling)
     }
     return AuthorizedFigures(money=frozenset(values))
@@ -519,7 +538,24 @@ _CONTEXT_CHARS = 24
 # What may sit between the dollars half and the cents half of one amount.
 # Anything else ("$250 and we can talk about the thirty cents") is two
 # amounts that happen to be adjacent, not one amount said in two parts.
-_CENTS_JOINER_RE = re.compile(r"^[\s,]*(?:and[\s]*)?$", re.IGNORECASE)
+# Spaces and commas only, never ``\s`` — a line break is not the same clause.
+_CENTS_JOINER_RE = re.compile(r"^[ ,]*(?:and[ ]*)?$", re.IGNORECASE)
+
+# A cents word the sentence keeps building on is a rate or a share, not the
+# tail of an amount: "$800 and forty cents of every dollar" is not $800.40.
+_CENTS_CONTINUATION_RE = re.compile(r"^\s*(?:of|on|per|in|to|for|off)\b", re.IGNORECASE)
+
+# Money the consumer may be taken to have *named*. Any bare number at or
+# above ``_MONEY_INFERENCE_FLOOR`` classifies as money, which is the right
+# default when screening what the agent says and the wrong one for deciding
+# the consumer put a figure on the table — "999 problems", "850 a week" and
+# a case reference are not amounts.
+#
+# Dollar markers only. A figure denominated purely in cents is either
+# immaterial ("thirty cents") or a unit trick: "eighty thousand cents" is
+# $800, the settlement floor, which the engine withholds until it offers it.
+# A composed "$250 and thirty cents" still carries its dollar marker.
+_CURRENCY_MARKER_RE = re.compile(r"\$|\b(?:dollars?|bucks?|usd)\b", re.IGNORECASE)
 
 # Below this, an unattached number is chatter ("two things"); at or above it, in
 # a call about a $1,000 balance, it is an amount.
@@ -644,9 +680,15 @@ def _compose_dollars_and_cents(text: str, figures: list[Figure]) -> list[Figure]
             and following.value is not None
             # Whole dollars only: "$250.50 and thirty cents" is not one amount.
             and current.value == current.value.to_integral_value()
+            # Cents are cents: a half worth a dollar or more ("ten thousand
+            # cents") would carry into the dollars column and compose an
+            # unauthorized amount into an authorized total, while the amount
+            # actually spoken aloud went unchecked.
+            and following.value < 1
             and not _is_cents(current)
             and _is_cents(following)
             and _CENTS_JOINER_RE.match(text[current.end : following.start]) is not None
+            and _CENTS_CONTINUATION_RE.match(text[following.end :]) is None
         ):
             composed.append(
                 replace(

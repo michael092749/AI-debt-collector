@@ -337,15 +337,50 @@ class TestFigureExtraction:
             "I'll pay $250 and we can talk about the thirty cents later.",
             "That's $250.50 and thirty cents of interest.",
             "Thirty cents on the dollar is all I can do.",
+            # A line break is not the same clause, whatever \s says.
+            "$250\n\nand\nthirty cents",
         ],
     )
     def test_unrelated_cents_are_not_folded_into_a_neighbouring_amount(
         self, utterance: str
     ) -> None:
-        """Composition is adjacency-gated: only whitespace, a comma or "and"
+        """Composition is adjacency-gated: only a space, a comma or "and"
         may sit between the two halves, and the dollars side must be whole."""
         values = [f.value for f in extract_figures(utterance) if f.kind is FigureKind.MONEY]
         assert Decimal("250.30") not in values
+
+    @pytest.mark.parametrize(
+        ("utterance", "intact"),
+        [
+            ("Your balance is $1,000, and thirty cents of that is interest.", Decimal(1000)),
+            ("The settlement is $800 and forty cents of every dollar is principal.", Decimal(800)),
+            ("That's $250 and thirty cents per day in fees.", Decimal(250)),
+        ],
+    )
+    def test_a_cents_clause_that_keeps_going_is_not_part_of_the_amount(
+        self, utterance: str, intact: Decimal
+    ) -> None:
+        """ "$800 and forty cents of every dollar" is a rate, not $800.40.
+        Reading it as one amount blocks the agent for stating the engine's own
+        settlement total — the exact false positive composition exists to fix,
+        reintroduced one clause to the right."""
+        values = [f.value for f in extract_figures(utterance) if f.kind is FigureKind.MONEY]
+        assert intact in values
+
+    def test_a_cents_half_of_a_dollar_or_more_does_not_carry(self) -> None:
+        """The cents half is ``words / 100`` with nothing stopping it at a
+        dollar, so "ten thousand cents" carried $100 into the dollars column
+        and composed $900 — unauthorized — into $1,000, which is the balance.
+        Only the sum was ever checked, so the amount actually spoken aloud
+        was not."""
+        authorized = AuthorizedFigures(money=frozenset({Decimal(1000)}))
+        utterance = "That leaves nine hundred dollars and ten thousand cents."
+        assert Decimal(900) in [
+            f.value for f in extract_figures(utterance) if f.kind is FigureKind.MONEY
+        ]
+        assert NumericRuleId.UNAUTHORIZED_AMOUNT in rule_ids(
+            check_numeric(utterance, authorized)
+        )
 
 
 class TestNumericAuthorization:
@@ -1327,6 +1362,47 @@ class TestAcknowledgingCallerStatedAmounts:
             AuthorizedFigures.empty().with_offer(settlement_offer)
         )
         assert check_outbound(repointed, "Two hundred dollars, understood.").allowed
+
+    @pytest.mark.parametrize(
+        ("utterance", "value"),
+        [
+            ("I've got 999 problems and this bill is one.", Decimal(999)),
+            ("I make 850 a week before taxes.", Decimal(850)),
+            ("My account number ends 4417 and the case is 621.", Decimal(621)),
+            # A unit trick, not a stated amount: $800 is the settlement floor,
+            # which the engine withholds until it puts a settlement on the table.
+            ("Eighty thousand cents is all I have.", Decimal(800)),
+        ],
+    )
+    def test_a_bare_number_is_not_a_stated_amount(
+        self, ready: GuardrailState, utterance: str, value: Decimal
+    ) -> None:
+        """``_classify`` calls any bare number at or above $100 money, which is
+        the right default for *screening the agent* and the wrong one for
+        deciding the consumer named a figure. Chatter, income and reference
+        numbers are not amounts on the table — an explicit currency marker is
+        what separates them."""
+        heard = check_inbound(ready, utterance)
+        assert value not in heard.state.acknowledged.money
+
+    def test_escalation_clears_what_was_acknowledged(self, ready: GuardrailState) -> None:
+        """Negotiation stops at escalation (A6). A figure the consumer floated
+        before disputing the debt must not still be speakable after."""
+        heard = check_inbound(ready, "I could maybe do four hundred dollars.")
+        assert Decimal(400) in heard.state.acknowledged.money
+
+        escalated = check_inbound(heard.state, "I dispute this debt, I don't owe it.")
+        assert escalated.state.escalated
+        assert not escalated.state.acknowledged.money
+
+    def test_identity_revocation_clears_what_was_acknowledged(
+        self, ready: GuardrailState
+    ) -> None:
+        """Whoever was speaking is not the account holder, so nothing they
+        said is the account holder's number."""
+        heard = check_inbound(ready, "Sure, I can do four hundred dollars.")
+        assert Decimal(400) in heard.state.acknowledged.money
+        assert not heard.state.with_identity_revoked().acknowledged.money
 
     def test_acknowledgment_persists_across_later_turns(self, ready: GuardrailState) -> None:
         """Said on turn two, still echoable on turn four — figures age out of
