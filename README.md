@@ -302,8 +302,47 @@ Every line the worker logs carries `call_id`, `room`, `account_ref`, `channel` a
 as structured fields, so one call can be pulled out of a worker handling several. The consumer's
 *name* is deliberately not among them: it buys nothing a reader of the audit store cannot get,
 and logs leave the process by routes that carry none of the consent posture the store does.
-Turn latency is measured from the framework's own metrics (`e2e_latency`, and `llm_node_ttft`,
-which on this design is the whole seven-round-trip turn rather than time-to-first-token).
+Turn latency is measured from the framework's own metrics: `e2e_latency` (consumer stopped
+speaking to agent audio playing), `llm_node_ttft`, and `tts_node_ttfb`.
+
+**The voice path streams.** `llm_node` drives `NegotiationAgent.stream_turn()`, which guards each
+sentence the moment it completes and hands it to TTS while the model is still writing the next
+one — so `llm_node_ttft` is a genuine time-to-first-token and the remaining round trips of a
+multi-tool turn overlap with audio the consumer is already hearing, instead of preceding it.
+
+This moves the LLM leg off the critical path; it does not move the others. Because
+`preemptive_tts` is off (and must stay off — see `voice_app.py`), synthesis starts after the
+speech handle is *scheduled*, not the instant the first chunk exists. Scheduling is speech
+ordering, not this turn's model calls, and generation is already running by then — so the win is
+real, but `e2e_ms` still carries the endpointing and scheduling legs. Read `turn_ms` against
+`e2e_ms` rather than expecting the two to converge.
+
+Two consequences worth knowing before reading a log:
+
+* **The audit log records sentences, not turns.** Each `TurnRecorded` row is one chunk released
+  to TTS. Joined with single spaces they are exactly the turn's spoken text — that identity is
+  what `test_successful_turn_is_recorded_once` pins.
+* **A barge-in can over-record by one sentence.** The guard fires when a sentence is *released*
+  and the generator is a step ahead of the ear, so an interruption leaves at most one recorded
+  line the consumer did not hear. It cannot be eliminated without giving up the latency win; it
+  is bounded at one, and the non-streaming path it replaced recorded a whole turn the consumer
+  heard only part of.
+
+Prompt caching is on (`cache_control` on the system prompt — which by render order covers the
+tool schemas — and on the end of the transcript), so the second through fifth model calls of a
+turn stop re-paying for the prefix the first one sent. It is scoped to one call: the system prompt
+carries the consumer's name, so there is no cross-call sharing. `cache_read_tokens` on the
+`ModelCalled` row is the signal that it is working; zero across a call means it is not.
+
+**Streaming is per route, and a route that cannot stream gets none of this.** `stream_response`
+degrades a client with no `stream()` to a single delta carrying the finished turn: the
+per-sentence guard still runs, but on everything at once, and the voice path waits exactly as
+long as it did before. Only `anthropic` implements `stream()`, so `COLLECTOR_LLM=openrouter`
+keeps working and keeps the old latency. **A faster model is not by itself a latency fix** — the
+route has to stream for the model's speed to reach the consumer's ear any sooner, and the
+`openrouter` route is uncertified besides (`MAX_TOOL_ROUNDS` and the regeneration-strike budget
+were tuned against Claude, so `tests/evals/` and the adversarial pass have to be re-run before it
+carries a real call).
 
 **Tracing is off by default and it fails loudly.** `COLLECTOR_TRACING` accepts `off`/unset and
 `otlp` and nothing else: any other value raises at start-up rather than reading as "off", and
@@ -330,7 +369,7 @@ cp .env.example .env
 |---|---|
 | `ANTHROPIC_API_KEY` | `--claude` mode, tier-2 evals with live adversarial pressure, and any real voice call |
 | `COLLECTOR_MODEL` | Overrides the Anthropic model id (default `claude-sonnet-5`) |
-| `COLLECTOR_LLM` | Which route the voice worker uses: `anthropic` (default) or `openrouter` |
+| `COLLECTOR_LLM` | Which route the voice worker uses: `anthropic` (default) or `openrouter`. Only `anthropic` streams — see below |
 | `OPENROUTER_API_KEY` | `--claude`'s alternate route (`--openrouter`, `COLLECTOR_LLM=openrouter`) |
 | `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | `collector-voice` (transport, STT, TTS) and the LLM judges |
 | `COLLECTOR_DB_PATH` | Moving the audit log off the CWD-relative `data/` — set it to the encrypted volume |

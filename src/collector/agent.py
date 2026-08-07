@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
 
 from collector.audit.events import (
@@ -370,7 +370,7 @@ class NegotiationAgent:
         self._log_turn(turn)
         return turn
 
-    def stream_turn(self, consumer_utterance: str) -> Iterator[str]:
+    def stream_turn(self, consumer_utterance: str) -> Generator[str]:
         """One full exchange, emitted a sentence at a time — the voice path.
 
         Same rings, same engine, same whitelist as ``turn()``. What moves is
@@ -426,6 +426,14 @@ class NegotiationAgent:
         # consumer has to hear the arrangement read back, and a turn that ends
         # the call in silence is a dead line, not a goodbye.
         closing = False
+        # Cleared only by a *failure* that produced no speech. That one case
+        # belongs to the transport: it is the only party that knows whether a
+        # scripted apology reached TTS, and ``record_fallback_speech`` appends
+        # the turn when it did — appending here too would count one exchange
+        # twice in ``CallEnded.turn_count``. ``turn()`` behaves the same way,
+        # by never reaching its own append when ``_act()`` raises. A caller
+        # that merely stops listening is *not* this case; see the docstring.
+        record_turn = True
 
         try:
             for _ in range(MAX_TOOL_ROUNDS + 1):
@@ -461,17 +469,21 @@ class NegotiationAgent:
                 fallback = self._stream_fallback()
                 spoken.append(fallback)
                 yield fallback
+        except BaseException as exc:
+            record_turn = bool(spoken) or isinstance(exc, GeneratorExit)
+            raise
         finally:
-            self._transcribe(spoken, transcribed)
-            self.turns.append(
-                AgentTurn(
-                    consumer=consumer_utterance,
-                    spoken=" ".join(spoken) or None,
-                    tool_results=tuple(results),
-                    blocked=tuple(blocked),
-                    ended=self.ended,
+            if record_turn:
+                self._transcribe(spoken, transcribed)
+                self.turns.append(
+                    AgentTurn(
+                        consumer=consumer_utterance,
+                        spoken=" ".join(spoken) or None,
+                        tool_results=tuple(results),
+                        blocked=tuple(blocked),
+                        ended=self.ended,
+                    )
                 )
-            )
 
     def _transcribe(self, spoken: list[str], already: int) -> int:
         """Put what has been spoken since ``already`` into the transcript.

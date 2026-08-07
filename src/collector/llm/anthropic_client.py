@@ -80,6 +80,37 @@ _PER_MILLION = Decimal(1_000_000)
 
 JsonDict = dict[str, Any]
 
+# Prompt caching. Two breakpoints, and the ceiling is four.
+#
+# The reason it is worth the write premium here is the shape of a turn, not
+# volume: ``stream_turn`` can make up to five sequential calls for one spoken
+# reply, and each one re-sends the whole growing transcript plus the system
+# prompt plus six tool schemas. Uncached, round three pays full input latency
+# for text rounds one and two already sent. A 5-minute entry breaks even at two
+# requests (1.25x to write plus 0.1x to read, against 2x); the shortest useful
+# turn makes two.
+#
+# 1. **The last system block**, which by the API's render order (tools, then
+#    system, then messages) covers the tool schemas too. Those are built once
+#    in ``__init__`` from ``TOOL_SCHEMAS`` in a fixed order, so the prefix is
+#    byte-stable for the life of the process — a re-serialization with a
+#    different key order would silently cost every hit.
+# 2. **The end of the transcript**, so each round reads the prefix the round
+#    before it wrote. Within a turn that is where the compounding is.
+#
+# Scoped to one call, deliberately and unavoidably: ``system_prompt()``
+# interpolates the consumer's name and account reference, so the prefix differs
+# per consumer and there is no cross-call sharing to claim. The greeting's
+# request is what writes the entry the first turn then reads.
+#
+# The minimum cacheable prefix on this model is 1024 tokens and the system
+# prompt plus tool schemas clear it with room to spare. A prefix under the
+# minimum does not error — it silently never caches — so the signal to watch is
+# ``cache_read_tokens`` on the ``ModelCalled`` row, which is already recorded
+# and already priced by ``estimate_cost``. Zero across a whole call means this
+# is buying nothing.
+_CACHE_CONTROL: JsonDict = {"type": "ephemeral"}
+
 
 def resolve_model(explicit: str | None = None) -> str:
     """Explicit argument, then ``$COLLECTOR_MODEL``, then the default."""
@@ -195,10 +226,10 @@ class AnthropicClient:
             response = self._client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
-                system=system,
+                system=cast(Any, _cached_system(system)),
                 # Cast, not coercion: the turn shapes are built above and the SDK's
                 # TypedDicts cannot be satisfied by a dict assembled at runtime.
-                messages=cast(Any, conversation),
+                messages=cast(Any, _cached_transcript(conversation)),
                 tools=self._tools,
                 # Stated rather than left to the default, so the intent survives a
                 # future model swap: thinking on, held shallow for call latency.
@@ -239,8 +270,8 @@ class AnthropicClient:
             with self._client.messages.stream(
                 model=self._model,
                 max_tokens=self._max_tokens,
-                system=system,
-                messages=cast(Any, conversation),
+                system=cast(Any, _cached_system(system)),
+                messages=cast(Any, _cached_transcript(conversation)),
                 tools=self._tools,
                 thinking={"type": "adaptive"},
                 output_config=cast(Any, {"effort": self._effort}),
@@ -321,6 +352,41 @@ class AnthropicClient:
 def _elapsed_ms(started: float) -> int:
     """Monotonic, so a clock adjustment mid-call cannot produce a negative latency."""
     return int((time.monotonic() - started) * 1000)
+
+
+def _cached_system(system: str) -> list[JsonDict]:
+    """The system prompt as a single cache-marked block.
+
+    A list rather than the bare string ``_to_anthropic`` returns, because
+    ``cache_control`` lives on a content block and there is nowhere to put it on
+    a string. One block, so the breakpoint is unambiguously the last one and the
+    tool schemas rendered ahead of it come along.
+    """
+    return [{"type": "text", "text": system, "cache_control": dict(_CACHE_CONTROL)}]
+
+
+def _cached_transcript(conversation: list[JsonDict]) -> list[JsonDict]:
+    """Mark the end of the transcript, so the next round in this turn reads the
+    prefix this one wrote.
+
+    Copies the entry it touches rather than mutating in place: ``_to_anthropic``
+    is a pure mapping the tests read directly, and a caching concern that
+    reached back into its output would make it lie about what it returns.
+    A string ``content`` is promoted to a one-block list first, since that is
+    the only shape ``cache_control`` attaches to.
+    """
+    if not conversation:
+        return conversation
+    last = dict(conversation[-1])
+    content = last["content"]
+    blocks: list[JsonDict] = (
+        [{"type": "text", "text": content}]
+        if isinstance(content, str)
+        else [dict(block) for block in content]
+    )
+    blocks[-1] = {**blocks[-1], "cache_control": dict(_CACHE_CONTROL)}
+    last["content"] = blocks
+    return [*conversation[:-1], last]
 
 
 def _to_anthropic(messages: tuple[Message, ...]) -> tuple[str, list[JsonDict]]:
