@@ -17,8 +17,10 @@ Two properties hold by construction:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
+from enum import StrEnum
 from typing import Any
 
 from collector.audit.events import to_jsonable
@@ -40,14 +42,159 @@ JsonDict = dict[str, Any]
 # -- schemas the model sees ------------------------------------------------
 
 
+_CADENCE_ENUM = [c.value for c in Cadence]
+
+# A sanity ceiling, not a policy one. "Weekly for a year" is 52 payments and the
+# engine must be allowed to *rule* on it — countering an impossible schedule is
+# the job. What this rejects is a value no consumer uttered: a five-digit count
+# from a malformed generation. Policy lives in decision_engine.py; this layer
+# only guarantees the engine receives the types it declares.
+MAX_PROPOSED_PAYMENTS = 1000
+
+
+class ArgumentError(ValueError):
+    """A tool argument that could not be read as its declared type."""
+
+
+class ParamKind(StrEnum):
+    MONEY = "money"
+    COUNT = "count"
+    CADENCE = "cadence"
+    TEXT = "text"
+
+
+@dataclass(frozen=True)
+class Param:
+    """One tool argument, declared once.
+
+    The JSON schema the model sees, the coercion out of JSON's loose types, and
+    the bounds check are all generated from this declaration. They used to be
+    three separate statements of the same fact — a ``"minimum": 1`` in the
+    schema, an ``if count < 1`` in a coercion helper, and an assumption in the
+    engine — and three statements of one fact drift.
+    """
+
+    name: str
+    kind: ParamKind
+    description: str
+    required: bool = False
+    minimum: int | None = None
+    maximum: int | None = None
+
+    @property
+    def json_schema(self) -> JsonDict:
+        """The property as the model sees it."""
+        schema: JsonDict = {"type": _JSON_TYPES[self.kind], "description": self.description}
+        if self.kind is ParamKind.CADENCE:
+            schema["enum"] = _CADENCE_ENUM
+        if self.minimum is not None:
+            schema["minimum"] = self.minimum
+        if self.maximum is not None:
+            schema["maximum"] = self.maximum
+        return schema
+
+    def parse(self, value: object) -> object:
+        """Coerce and bounds-check one supplied value.
+
+        Raises ``ArgumentError`` naming the parameter, because the message is
+        handed back to the model as a tool result and it has to be actionable.
+        """
+        try:
+            parsed = _PARSERS[self.kind](value)
+        except (ValueError, TypeError, ArithmeticError, InvalidOperation) as exc:
+            raise ArgumentError(f"{self.name}: {exc}") from exc
+        if isinstance(parsed, int) and not isinstance(parsed, bool):
+            if self.minimum is not None and parsed < self.minimum:
+                raise ArgumentError(f"{self.name} must be at least {self.minimum}; got {parsed}")
+            if self.maximum is not None and parsed > self.maximum:
+                raise ArgumentError(f"{self.name} must be at most {self.maximum}; got {parsed}")
+        return parsed
+
+
+def _parse_money(value: object) -> Money:
+    """Parse an amount from tool arguments.
+
+    JSON has one number type and it decodes to ``float``, which ``Money``
+    refuses on purpose (SPEC §9). Routing through ``str`` at this boundary
+    keeps the exact digits the model actually emitted — ``str(50.5)`` is
+    "50.5" — without letting a float any further into the system.
+    """
+    if isinstance(value, Money):
+        return value
+    if isinstance(value, float | int | str | Decimal):
+        return Money(Decimal(str(value)))
+    raise ValueError(f"expected an amount, got {type(value).__name__}")
+
+
+def _parse_count(value: object) -> int:
+    if not isinstance(value, int | float | str | Decimal):
+        raise ValueError(f"expected a whole number, got {type(value).__name__}")
+    return int(Decimal(str(value)))
+
+
+def _parse_cadence(value: object) -> Cadence:
+    try:
+        return Cadence(str(value).strip().lower())
+    except ValueError as exc:
+        raise ValueError(f"must be one of {', '.join(_CADENCE_ENUM)}; got {value!r}") from exc
+
+
+def _parse_text(value: object) -> str:
+    return str(value)
+
+
+_JSON_TYPES: dict[ParamKind, str] = {
+    ParamKind.MONEY: "string",
+    ParamKind.COUNT: "integer",
+    ParamKind.CADENCE: "string",
+    ParamKind.TEXT: "string",
+}
+
+_PARSERS: dict[ParamKind, Callable[[object], object]] = {
+    ParamKind.MONEY: _parse_money,
+    ParamKind.COUNT: _parse_count,
+    ParamKind.CADENCE: _parse_cadence,
+    ParamKind.TEXT: _parse_text,
+}
+
+
 @dataclass(frozen=True)
 class ToolSchema:
     name: str
     description: str
-    input_schema: JsonDict
+    params: tuple[Param, ...] = ()
+
+    @property
+    def input_schema(self) -> JsonDict:
+        """JSON Schema for the model, generated from ``params``."""
+        return {
+            "type": "object",
+            "properties": {p.name: p.json_schema for p in self.params},
+            "required": [p.name for p in self.params if p.required],
+        }
+
+    def parse(self, arguments: JsonDict) -> JsonDict:
+        """Validate and coerce the model's arguments in one pass.
+
+        Absent optional arguments stay absent rather than becoming ``None``:
+        the tools distinguish "they named no sum" from "they named nothing",
+        and a default injected here would erase that distinction.
+        """
+        parsed: JsonDict = {}
+        for param in self.params:
+            if param.name not in arguments or arguments[param.name] is None:
+                if param.required:
+                    raise ArgumentError(f"{param.name} is required")
+                continue
+            parsed[param.name] = param.parse(arguments[param.name])
+        return parsed
 
 
-_CADENCE_ENUM = [c.value for c in Cadence]
+_PREFERRED_CADENCE = Param(
+    name="preferred_cadence",
+    kind=ParamKind.CADENCE,
+    description="Cadence the consumer asked for, honoured where possible.",
+)
 
 TOOL_SCHEMAS: tuple[ToolSchema, ...] = (
     ToolSchema(
@@ -59,38 +206,39 @@ TOOL_SCHEMAS: tuple[ToolSchema, ...] = (
             "condition that was evaluated, and a counter-offer when the proposal "
             "cannot be accepted."
         ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "total": {
-                    "type": "string",
-                    "description": (
-                        "Total they offered to pay, as a decimal string, e.g. '500.00'. "
-                        "Omit it when they proposed only a structure and no sum — "
-                        "'weekly for a year' — and the full balance is assumed."
-                    ),
-                },
-                "payment_count": {
-                    "type": "integer",
-                    "description": "How many payments to split it into. 1 for a lump sum.",
-                    "minimum": 1,
-                    "maximum": 1000,
-                },
-                "cadence": {
-                    "type": "string",
-                    "enum": _CADENCE_ENUM,
-                    "description": "How often they proposed to pay.",
-                },
-                "signaled_capacity": {
-                    "type": "string",
-                    "description": (
-                        "What they said they can afford at one time, if they said it "
-                        "at all, as a decimal string. Omit rather than guessing."
-                    ),
-                },
-            },
-            "required": ["payment_count", "cadence"],
-        },
+        params=(
+            Param(
+                name="total",
+                kind=ParamKind.MONEY,
+                description=(
+                    "Total they offered to pay, as a decimal string, e.g. '500.00'. "
+                    "Omit it when they proposed only a structure and no sum — "
+                    "'weekly for a year' — and the full balance is assumed."
+                ),
+            ),
+            Param(
+                name="payment_count",
+                kind=ParamKind.COUNT,
+                description="How many payments to split it into. 1 for a lump sum.",
+                required=True,
+                minimum=1,
+                maximum=MAX_PROPOSED_PAYMENTS,
+            ),
+            Param(
+                name="cadence",
+                kind=ParamKind.CADENCE,
+                description="How often they proposed to pay.",
+                required=True,
+            ),
+            Param(
+                name="signaled_capacity",
+                kind=ParamKind.MONEY,
+                description=(
+                    "What they said they can afford at one time, if they said it "
+                    "at all, as a decimal string. Omit rather than guessing."
+                ),
+            ),
+        ),
     ),
     ToolSchema(
         name="propose_offer",
@@ -98,17 +246,7 @@ TOOL_SCHEMAS: tuple[ToolSchema, ...] = (
             "Ask for the offer to put on the table now. Use it to open the "
             "negotiation and any time you need the current terms restated."
         ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "preferred_cadence": {
-                    "type": "string",
-                    "enum": _CADENCE_ENUM,
-                    "description": "Cadence the consumer asked for, honoured where possible.",
-                }
-            },
-            "required": [],
-        },
+        params=(_PREFERRED_CADENCE,),
     ),
     ToolSchema(
         name="record_refusal",
@@ -117,7 +255,6 @@ TOOL_SCHEMAS: tuple[ToolSchema, ...] = (
             "back on it. This is what earns the right to concede later; without it "
             "concede will refuse."
         ),
-        input_schema={"type": "object", "properties": {}, "required": []},
     ),
     ToolSchema(
         name="concede",
@@ -125,17 +262,7 @@ TOOL_SCHEMAS: tuple[ToolSchema, ...] = (
             "Move to the next arrangement down. Returns the new offer, which is the "
             "only one you may now describe. Fails if nothing has been refused."
         ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "preferred_cadence": {
-                    "type": "string",
-                    "enum": _CADENCE_ENUM,
-                    "description": "Cadence the consumer asked for, honoured where possible.",
-                }
-            },
-            "required": [],
-        },
+        params=(_PREFERRED_CADENCE,),
     ),
     ToolSchema(
         name="confirm_agreement",
@@ -143,25 +270,22 @@ TOOL_SCHEMAS: tuple[ToolSchema, ...] = (
             "The consumer has accepted the offer currently on the table. Closes the "
             "negotiation and returns the agreed schedule for you to read back."
         ),
-        input_schema={"type": "object", "properties": {}, "required": []},
     ),
     ToolSchema(
         name="end_call",
         description="End the call without an agreement.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "reason": {
-                    "type": "string",
-                    "description": "Short note on why the call is ending, for the log.",
-                }
-            },
-            "required": [],
-        },
+        params=(
+            Param(
+                name="reason",
+                kind=ParamKind.TEXT,
+                description="Short note on why the call is ending, for the log.",
+            ),
+        ),
     ),
 )
 
 TOOL_NAMES: frozenset[str] = frozenset(s.name for s in TOOL_SCHEMAS)
+_SCHEMAS: dict[str, ToolSchema] = {s.name: s for s in TOOL_SCHEMAS}
 
 
 # -- context and results ---------------------------------------------------
@@ -212,52 +336,14 @@ def _error(name: str, context: ToolContext, detail: str, **extra: Any) -> ToolRe
     return ToolResult(name=name, payload={"ok": False, "error": detail, **extra}, context=context)
 
 
-# -- argument coercion -----------------------------------------------------
+def _cadence_arg(args: JsonDict, default: Cadence = Cadence.MONTHLY) -> Cadence:
+    """``preferred_cadence`` is a hint, so its absence is not an error.
 
-
-def _money(value: object) -> Money:
-    """Parse an amount from tool arguments.
-
-    JSON has one number type and it decodes to ``float``, which ``Money``
-    refuses on purpose (SPEC §9). Routing through ``str`` at this boundary
-    keeps the exact digits the model actually emitted — ``str(50.5)`` is
-    "50.5" — without letting a float any further into the system.
+    Already validated by the schema layer if present — this only supplies the
+    fallback for a model that named a structure without naming a rhythm.
     """
-    if isinstance(value, Money):
-        return value
-    if isinstance(value, float | int | str | Decimal):
-        return Money(Decimal(str(value)))
-    raise ValueError(f"expected an amount, got {type(value).__name__}")
-
-
-def _cadence(value: object, default: Cadence = Cadence.MONTHLY) -> Cadence:
-    if value is None:
-        return default
-    try:
-        return Cadence(str(value).strip().lower())
-    except ValueError as exc:
-        raise ValueError(
-            f"cadence must be one of {', '.join(_CADENCE_ENUM)}; got {value!r}"
-        ) from exc
-
-
-# Far above any legal payment count (the ladder tops out at 4), but low
-# enough that Money.allocate() on it is still cheap. Rejected here, before
-# ConsumerProposal.smallest_payment ever calls allocate() on the raw value —
-# a payment_count in the millions took 3+ seconds to reject otherwise
-# (ADVERSARIAL_TESTING.md M4).
-_MAX_SANE_PAYMENT_COUNT = 1000
-
-
-def _payment_count(value: object) -> int:
-    if not isinstance(value, int | float | str | Decimal):
-        raise ValueError(f"expected a payment count, got {type(value).__name__}")
-    count = int(Decimal(str(value)))
-    if count < 1:
-        raise ValueError("payment_count must be at least 1")
-    if count > _MAX_SANE_PAYMENT_COUNT:
-        raise ValueError(f"payment_count must be at most {_MAX_SANE_PAYMENT_COUNT}")
-    return count
+    cadence = args.get("preferred_cadence")
+    return cadence if isinstance(cadence, Cadence) else default
 
 
 # -- the tools -------------------------------------------------------------
@@ -276,19 +362,16 @@ def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult
             "this call has run its course; close it out with end_call rather than "
             "evaluating another proposal",
         )
-    try:
-        capacity_arg = args.get("signaled_capacity")
-        total_arg = args.get("total")
-        proposal = ConsumerProposal(
-            # No sum named means they proposed a shape, not a discount: the
-            # balance stands, and the structure is what gets ruled on.
-            total=_money(total_arg) if total_arg is not None else context.policy.original_balance,
-            payment_count=_payment_count(args["payment_count"]),
-            cadence=_cadence(args.get("cadence")),
-            signaled_capacity=_money(capacity_arg) if capacity_arg is not None else None,
-        )
-    except (KeyError, ValueError, TypeError, ArithmeticError, InvalidOperation) as exc:
-        return _error(name, context, f"could not read the proposal: {exc}")
+    proposal = ConsumerProposal(
+        # Membership, not truthiness. "They proposed $0" and "they named no sum
+        # at all" are different negotiation states — the first is a lowball to
+        # rule on, the second means the balance stands and only the structure
+        # is in question — and a falsy-zero would silently merge them.
+        total=args.get("total", context.policy.original_balance),
+        payment_count=args["payment_count"],
+        cadence=args["cadence"],
+        signaled_capacity=args.get("signaled_capacity"),
+    )
 
     verdict = validate_offer(proposal, context.state, context.policy)
 
@@ -357,12 +440,7 @@ def _propose_offer(args: JsonDict, context: ToolContext) -> ToolResult:
             "this call has run its course; close it out with end_call rather than "
             "putting another offer up",
         )
-    try:
-        cadence = _cadence(args.get("preferred_cadence"))
-    except ValueError as exc:
-        return _error(name, context, str(exc))
-
-    offer = build_counter(context.state, context.policy, preferred_cadence=cadence)
+    offer = build_counter(context.state, context.policy, preferred_cadence=_cadence_arg(args))
     state = context.state.record_round(None, offer, None)
     return ToolResult(
         name=name,
@@ -408,10 +486,7 @@ def _concede(args: JsonDict, context: ToolContext) -> ToolResult:
         )
     if context.state.is_exhausted:
         return _error(name, context, "round limit reached; close the call out with end_call")
-    try:
-        cadence = _cadence(args.get("preferred_cadence"))
-    except ValueError as exc:
-        return _error(name, context, str(exc))
+    cadence = _cadence_arg(args)
 
     # Step until the terms actually improve for the consumer. Two ways a step
     # can fail to be a concession: the offer comes back identical (capacity had
@@ -579,9 +654,16 @@ _DISPATCH = {
 
 
 def execute(call: ToolCall, context: ToolContext) -> ToolResult:
-    """Run one tool call. The only way the model can affect anything."""
+    """Run one tool call. The only way the model can affect anything.
+
+    Arguments clear the schema layer before a handler sees them, so every
+    handler below can assume its arguments are already the types it declared.
+    A malformed argument comes back as an ``ok: false`` payload naming the
+    parameter, which the model can read and correct on the next round trip.
+    """
     handler = _DISPATCH.get(call.name)
-    if handler is None:
+    schema = _SCHEMAS.get(call.name)
+    if handler is None or schema is None:
         return _error(
             call.name,
             context,
@@ -593,7 +675,11 @@ def execute(call: ToolCall, context: ToolContext) -> ToolResult:
             context,
             f"the call is already closed ({context.state.outcome.value}); nothing further",
         )
-    return handler(call.arguments, context)
+    try:
+        arguments = schema.parse(call.arguments)
+    except ArgumentError as exc:
+        return _error(call.name, context, f"could not read that call: {exc}")
+    return handler(arguments, context)
 
 
 # -- rendering for the model ----------------------------------------------

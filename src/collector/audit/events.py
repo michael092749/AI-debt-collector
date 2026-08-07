@@ -49,6 +49,8 @@ class EventType(StrEnum):
     CALL_STARTED = "call_started"
     TURN = "turn"
     DECISION = "decision"
+    TOOL_CALL = "tool_call"
+    MODEL_CALL = "model_call"
     GUARDRAIL_TRIP = "guardrail_trip"
     ESCALATION = "escalation"
     CALL_ENDED = "call_ended"
@@ -157,6 +159,58 @@ class DecisionRecorded:
 
 
 @dataclass(frozen=True)
+class ToolInvoked:
+    """Every trip through the whitelist, whatever the tool.
+
+    ``DecisionRecorded`` is the *compliance* record and only the engine-ruling
+    tools produce one. This is the *operational* record and every tool produces
+    one: what the model asked for, what came back, and how long it took. Without
+    it the four tools that never touch ``validate_offer`` — the ones that end
+    calls and move the ladder — leave no trace of having been called at all.
+    """
+
+    EVENT_TYPE: ClassVar[EventType] = EventType.TOOL_CALL
+
+    call_id: str
+    turn_index: int
+    tool: str
+    arguments: JsonDict
+    ok: bool
+    latency_ms: int
+    # The tool's own ``error`` payload, not an exception: tools.py returns
+    # failures as values, and this is where that value is kept.
+    error: str | None = None
+    at: str = field(default_factory=utc_now)
+
+
+@dataclass(frozen=True)
+class ModelCalled:
+    """One round trip to the model: tokens, money, milliseconds.
+
+    A voice turn has a hang-up budget measured in hundreds of milliseconds and
+    a turn can make several of these, so latency here is the number that
+    decides whether the architecture works. ``cost_usd`` is ``None`` when the
+    model has no entry in the price table rather than guessed at.
+    """
+
+    EVENT_TYPE: ClassVar[EventType] = EventType.MODEL_CALL
+
+    call_id: str
+    turn_index: int
+    model: str
+    latency_ms: int
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    cost_usd: Decimal | None = None
+    stop_reason: str | None = None
+    # Set when the call failed outright. The turn still gets a logged reason.
+    error: str | None = None
+    at: str = field(default_factory=utc_now)
+
+
+@dataclass(frozen=True)
 class GuardrailTripped:
     EVENT_TYPE: ClassVar[EventType] = EventType.GUARDRAIL_TRIP
 
@@ -188,11 +242,23 @@ class CallEnded:
     call_id: str
     outcome: CallOutcome
     turn_count: int
+    # The post-call compliance score (SPEC §5.3). ``None`` means the call never
+    # reached the post-call ring — a dropped process, not a clean sheet.
+    compliant: bool | None = None
+    blocked_turns: int = 0
+    violation_count: int = 0
     at: str = field(default_factory=utc_now)
 
 
 TraceEvent = (
-    CallStarted | TurnRecorded | DecisionRecorded | GuardrailTripped | Escalated | CallEnded
+    CallStarted
+    | TurnRecorded
+    | DecisionRecorded
+    | ToolInvoked
+    | ModelCalled
+    | GuardrailTripped
+    | Escalated
+    | CallEnded
 )
 
 
@@ -339,6 +405,12 @@ class AgreementRecord:
 # -- decoding --------------------------------------------------------------
 
 
+def _optional_bool(value: object) -> bool | None:
+    """``None`` and ``False`` are different answers here — a call with no
+    compliance score is not a call that failed one."""
+    return None if value is None else bool(value)
+
+
 def money_from_json(value: str | None) -> Money | None:
     return None if value is None else Money(value)
 
@@ -414,6 +486,33 @@ def event_from_json(data: JsonDict) -> TraceEvent:
                 verdict=verdict_from_json(data["verdict"]),
                 at=data["at"],
             )
+        case EventType.TOOL_CALL:
+            return ToolInvoked(
+                call_id=data["call_id"],
+                turn_index=int(data["turn_index"]),
+                tool=data["tool"],
+                arguments=dict(data["arguments"]),
+                ok=bool(data["ok"]),
+                latency_ms=int(data["latency_ms"]),
+                error=data["error"],
+                at=data["at"],
+            )
+        case EventType.MODEL_CALL:
+            cost = data["cost_usd"]
+            return ModelCalled(
+                call_id=data["call_id"],
+                turn_index=int(data["turn_index"]),
+                model=data["model"],
+                latency_ms=int(data["latency_ms"]),
+                input_tokens=int(data["input_tokens"]),
+                output_tokens=int(data["output_tokens"]),
+                cache_read_tokens=int(data["cache_read_tokens"]),
+                cache_write_tokens=int(data["cache_write_tokens"]),
+                cost_usd=None if cost is None else Decimal(cost),
+                stop_reason=data["stop_reason"],
+                error=data["error"],
+                at=data["at"],
+            )
         case EventType.GUARDRAIL_TRIP:
             return GuardrailTripped(
                 call_id=data["call_id"],
@@ -438,6 +537,9 @@ def event_from_json(data: JsonDict) -> TraceEvent:
                 call_id=data["call_id"],
                 outcome=CallOutcome(data["outcome"]),
                 turn_count=int(data["turn_count"]),
+                compliant=_optional_bool(data.get("compliant")),
+                blocked_turns=int(data.get("blocked_turns") or 0),
+                violation_count=int(data.get("violation_count") or 0),
                 at=data["at"],
             )
         case EventType.AGREEMENT:

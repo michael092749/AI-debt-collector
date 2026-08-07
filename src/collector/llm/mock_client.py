@@ -439,7 +439,7 @@ class MockLLMClient:
 def _load(content: str) -> dict[str, object]:
     try:
         loaded = json.loads(content)
-    except (json.JSONDecodeError, TypeError):
+    except json.JSONDecodeError, TypeError:
         return {}
     return loaded if isinstance(loaded, dict) else {}
 

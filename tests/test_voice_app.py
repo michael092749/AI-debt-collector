@@ -830,7 +830,7 @@ def test_escalation_keyterms_key_on_a_real_trigger(term: str, utterance: str) ->
 
 
 def test_cadence_keyterms_name_a_real_cadence() -> None:
-    """"biweekly" is the one the recognizer actually gets wrong ("by weekly"),
+    """ "biweekly" is the one the recognizer actually gets wrong ("by weekly"),
     and a misheard cadence is a misheard schedule."""
     assert "biweekly" in STT_KEYTERMS
     assert "biweekly" in {c.value for c in Cadence}

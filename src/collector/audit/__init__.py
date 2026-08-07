@@ -16,7 +16,9 @@ from collector.audit.events import (
     EventType,
     GuardrailAction,
     GuardrailTripped,
+    ModelCalled,
     Speaker,
+    ToolInvoked,
     TraceEvent,
     TurnRecorded,
     dumps,
@@ -25,7 +27,14 @@ from collector.audit.events import (
     to_jsonable,
     utc_now,
 )
-from collector.audit.store import DEFAULT_DB_PATH, SCHEMA, AuditStore
+from collector.audit.store import (
+    DB_PATH_ENV_VAR,
+    DEFAULT_DB_PATH,
+    SCHEMA,
+    AuditStore,
+    CallCompliance,
+    default_db_path,
+)
 
 # Re-exported from the modules that own them, so the log and the runtime cannot
 # drift apart: escalation triggers are whatever the guardrails detect, and a
@@ -34,10 +43,12 @@ from collector.guardrails.rings import EscalationTrigger, GuardrailRing
 from collector.negotiation import CallOutcome
 
 __all__ = [
+    "DB_PATH_ENV_VAR",
     "DEFAULT_DB_PATH",
     "SCHEMA",
     "AgreementRecord",
     "AuditStore",
+    "CallCompliance",
     "CallEnded",
     "CallOutcome",
     "CallStarted",
@@ -49,9 +60,12 @@ __all__ = [
     "GuardrailAction",
     "GuardrailRing",
     "GuardrailTripped",
+    "ModelCalled",
     "Speaker",
+    "ToolInvoked",
     "TraceEvent",
     "TurnRecorded",
+    "default_db_path",
     "dumps",
     "event_from_json",
     "event_json",

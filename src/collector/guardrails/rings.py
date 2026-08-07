@@ -115,6 +115,19 @@ _ESCALATION_PATTERNS: tuple[_TriggerRule, ...] = (
         r"\bending\s+it\s+all\b",
         r"\bpanic\s+attack\b",
         r"\bhaving\s+a\s+breakdown\b",
+        # Indirect phrasings. People in distress rarely use the clinical words
+        # above, and a keyword guard that only catches the explicit forms is a
+        # guard that fires after it mattered.
+        r"\bfalling\s+apart\b",
+        r"\bat\s+(?:my|the)\s+breaking\s+point\b",
+        r"\bcan'?t\s+cope\b",
+        r"\bcan'?t\s+deal\s+with\s+(?:this|it)\s+any\s?more\b",
+        r"\bi'?m\s+drowning\b",
+        r"\b(?:i'?m\s+)?(?:at\s+)?rock\s+bottom\b",
+        r"\bnothing\s+left\b",
+        r"\bgiving\s+up\b",
+        r"\bwhat'?s\s+the\s+point\s+any\s?more\b",
+        r"\bi\s+don'?t\s+know\s+what\s+(?:else\s+)?to\s+do\s+any\s?more\b",
     ),
     _trigger(
         EscalationTrigger.CEASE_AND_DESIST,
@@ -183,6 +196,25 @@ _ESCALATION_PATTERNS: tuple[_TriggerRule, ...] = (
         r"\bwe\s+lost\s+(?:the|our)\s+house\b",
         r"\bmy\s+(?:husband|wife|spouse|son|daughter)\s+(?:died|passed\s+away)\b",
         r"\bi'?m\s+(?:a\s+)?(?:widow|widower)\b",
+        # Indirect hardship: the consumer describing a situation rather than
+        # naming it. Still distinct from haggling — "I can't afford $500 a
+        # month" is a capacity signal and stays out of this list.
+        r"\b(?:being\s+|getting\s+)?evicted\b",
+        r"\beviction\s+notice\b",
+        r"\babout\s+to\s+lose\s+(?:my|our)\s+(?:home|house|car|apartment)\b",
+        r"\b(?:power|electricity|water|gas|heat)\s+(?:is\s+|was\s+|got\s+)?(?:shut|cut)\s+off\b",
+        r"\bbehind\s+on\s+(?:everything|rent|the\s+mortgage|all\s+my\s+bills)\b",
+        r"\bcan'?t\s+keep\s+up\s+with\s+(?:anything|everything|the\s+bills|my\s+bills)\b",
+        r"\bliving\s+in\s+my\s+car\b",
+        r"\bfood\s+(?:bank|stamps)\b",
+        r"\b(?:on\s+)?(?:welfare|food\s+assistance|snap\s+benefits)\b",
+        r"\bmedical\s+bills\s+(?:wiped|cleaned)\s+me\s+out\b",
+        r"\bgoing\s+through\s+a\s+divorce\b",
+        r"\bhours\s+(?:got\s+)?cut\s+(?:at\s+work|back)\b",
+        # "got" is required, not optional: "I laid off the sauce" is an idiom
+        # for quitting drinking, not a job loss. The bare form matched it.
+        r"\bgot\s+laid\s+off\b",
+        r"\bmy\s+(?:hours|shifts)\s+(?:were|got)\s+cut\b",
     ),
 )
 
@@ -238,7 +270,18 @@ class EscalationRecord:
 
 
 def detect_escalation(utterance: str) -> tuple[EscalationSignal, ...]:
-    """Escalation triggers in a *consumer* utterance, most serious first."""
+    """Escalation triggers in a *consumer* utterance, most serious first.
+
+    Pattern matching, deliberately. A classifier would catch phrasings this
+    misses, but it is a second model call on the turn's critical path and it
+    can be wrong in the direction that matters — an escalation that fires late
+    is worse than one that fires on a false positive, and a hand-off is cheap.
+
+    The known limit: a consumer who conveys distress purely through tone, or
+    through a phrasing nobody anticipated, is not caught here. The patterns
+    above cover the direct forms and the common indirect ones; a live
+    deployment should be mining transcripts for the rest.
+    """
     signals: list[EscalationSignal] = []
     for trigger, pattern in _ESCALATION_PATTERNS:
         for match in pattern.finditer(utterance):
@@ -547,7 +590,7 @@ def check_outbound(
     blocking = [v for v in violations if v.blocking]
     allowed = not blocking
     strikes = 0 if allowed else state.strikes + 1
-    fallback = None if allowed or strikes < MAX_REGENERATION_STRIKES else _fallback_for(state)
+    fallback = None if allowed or strikes < MAX_REGENERATION_STRIKES else fallback_for(state)
 
     event = GuardrailEvent(
         ring=GuardrailRing.DURING_CALL,
@@ -576,7 +619,12 @@ def check_outbound(
     )
 
 
-def _fallback_for(state: GuardrailState) -> str:
+def fallback_for(state: GuardrailState) -> str:
+    """The scripted line to speak when a generated one cannot be.
+
+    Public because both paths need it: the text loop reaches it after two
+    strikes, the streaming loop the moment a sentence is blocked.
+    """
     if state.escalation is not None:
         return state.escalation.closing_line
     return SAFE_FALLBACK_TEXT

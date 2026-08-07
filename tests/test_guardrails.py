@@ -342,11 +342,33 @@ class TestNumericAuthorization:
         (violation,) = check_numeric("That's $250 now and $350 in 30 days.", authorized)
         assert violation.span == "$350"
 
-    def test_policy_figures_are_authorized(self, policy: PolicyConfig) -> None:
+    def test_the_balance_is_authorized_but_the_policy_limits_are_not(
+        self, policy: PolicyConfig
+    ) -> None:
+        """SPEC §5.2: a figure must be in the engine's *currently*-authorized set.
+
+        The balance is an account fact handed over with the file. The $250
+        minimum and the 20% discount ceiling are the engine's private
+        thresholds — sayable only once the engine has actually surfaced them.
+        """
         authorized = authorized_for(policy)
         assert check_numeric("The balance is $1,000.00.", authorized) == ()
-        assert check_numeric("Payments can't be under $250.", authorized) == ()
-        assert check_numeric("The most I can discount is 20%.", authorized) == ()
+
+        (floor,) = check_numeric("Payments can't be under $250.", authorized)
+        assert floor.rule_id == NumericRuleId.UNAUTHORIZED_AMOUNT
+        (discount,) = check_numeric("The most I can discount is 20%.", authorized)
+        assert discount.rule_id == NumericRuleId.UNAUTHORIZED_PERCENT
+
+    def test_a_policy_figure_unlocks_once_the_engine_surfaces_it(
+        self, policy: PolicyConfig, settlement_offer: Offer
+    ) -> None:
+        """The gate is temporal, not permanent: $800 is unsayable until the
+        engine puts an $800 settlement on the table, and sayable after."""
+        before = authorized_for(policy)
+        assert check_numeric("I could settle this at $800.", before) != ()
+
+        after = authorized_for(policy, offers=(settlement_offer,))
+        assert check_numeric("I could settle this at $800.", after) == ()
 
     def test_unauthorized_percent_blocks(self, policy: PolicyConfig) -> None:
         (violation,) = check_numeric("I can knock 50% off.", authorized_for(policy))
@@ -355,10 +377,23 @@ class TestNumericAuthorization:
     def test_duration_units_are_compared_in_days(self, policy: PolicyConfig) -> None:
         """'three months' and '90 days' are the same authorization; rephrasing an
         engine figure in friendlier units is not the failure mode we're chasing."""
-        authorized = authorized_for(policy)
+        authorized = authorized_for(policy, extra_durations=((3, DurationUnit.MONTH),))
         assert check_numeric("We can spread it over 3 months.", authorized) == ()
         assert check_numeric("We can spread it over 90 days.", authorized) == ()
         assert check_numeric("We can spread it over 12 months.", authorized) != ()
+
+    def test_payment_counts_are_gated_on_an_offer_existing(
+        self, policy: PolicyConfig, settlement_offer: Offer
+    ) -> None:
+        """Before an offer there is no 'three payments' to refer to; after one,
+        1..n are sayable because that offer has n instalments."""
+        assert check_numeric("We could do 3 payments.", authorized_for(policy)) != ()
+        assert (
+            check_numeric(
+                "We could do 3 payments.", authorized_for(policy, offers=(settlement_offer,))
+            )
+            == ()
+        )
 
     def test_account_facts_must_be_authorized_explicitly(self, policy: PolicyConfig) -> None:
         bare = authorized_for(policy)
@@ -411,8 +446,12 @@ class TestNumericAuthorization:
         assert rule_ids(violations) >= {NumericRuleId.INVISIBLE_CHARACTER}
 
     def test_ordinary_ascii_whitespace_is_not_flagged(self, policy: PolicyConfig) -> None:
+        # The balance, not the settlement floor: authorized_for deliberately
+        # withholds the policy limits until the engine surfaces them, so a
+        # spelled-out $800 is legitimately UNAUTHORIZED_AMOUNT here and would
+        # mask the whitespace property this test is actually about.
         authorized = authorized_for(policy)
-        assert check_numeric("You would pay eight hundred dollars.", authorized) == ()
+        assert check_numeric("You would pay one thousand dollars.", authorized) == ()
 
     def test_a_multiline_turn_is_not_flagged_as_an_invisible_character_leak(
         self, policy: PolicyConfig
@@ -739,6 +778,49 @@ class TestEscalationTriggers:
         missing 32/35 realistic phrasings including self-harm disclosures
         (ADVERSARIAL_TESTING.md C4)."""
         assert expected in {s.trigger for s in detect_escalation(utterance)}
+
+    @pytest.mark.parametrize(
+        ("utterance", "expected"),
+        [
+            # Distress, indirectly. Nobody in distress says "I am experiencing
+            # distress", and a guard that only catches the clinical phrasing is
+            # a guard that fires after it mattered.
+            ("Honestly, everything's falling apart right now.", EscalationTrigger.DISTRESS),
+            ("I'm drowning here.", EscalationTrigger.DISTRESS),
+            ("I'm at my breaking point with all of this.", EscalationTrigger.DISTRESS),
+            ("I don't know what else to do anymore.", EscalationTrigger.DISTRESS),
+            ("I just can't cope with this.", EscalationTrigger.DISTRESS),
+            # Hardship described rather than named.
+            ("We're being evicted at the end of the month.", EscalationTrigger.HARDSHIP),
+            ("I got laid off back in March.", EscalationTrigger.HARDSHIP),
+            ("My hours were cut and I'm behind on everything.", EscalationTrigger.HARDSHIP),
+            ("The power got shut off last week.", EscalationTrigger.HARDSHIP),
+            ("I'm living in my car at the moment.", EscalationTrigger.HARDSHIP),
+        ],
+    )
+    def test_indirect_phrasings_are_detected_too(
+        self, utterance: str, expected: EscalationTrigger
+    ) -> None:
+        """Regex enumeration was previously undersized for open-ended paraphrase,
+        missing 32/35 realistic phrasings including self-harm disclosures
+        (ADVERSARIAL_TESTING.md C4)."""
+        assert expected in {s.trigger for s in detect_escalation(utterance)}
+
+    @pytest.mark.parametrize(
+        "utterance",
+        [
+            # The line the broadened patterns must not cross: haggling and
+            # capacity signals are the decision engine's input, not escalations.
+            "That's more than I can manage right now.",
+            "Two fifty a month is a stretch for me.",
+            "Can you do any better on the total?",
+            "My car payment lands the same week as that.",
+            "Things are tight but I want to get this sorted.",
+            "I'd rather pay it off than drag it out.",
+        ],
+    )
+    def test_haggling_is_still_not_an_escalation(self, utterance: str) -> None:
+        assert detect_escalation(utterance) == ()
 
     @pytest.mark.parametrize(
         "utterance",

@@ -12,7 +12,9 @@ carries is register and procedure — how to sound, and which tool to reach for.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Literal, Protocol, runtime_checkable
 
 Role = Literal["system", "consumer", "agent", "tool"]
@@ -42,16 +44,45 @@ class Message:
 
 
 @dataclass(frozen=True)
+class LLMUsage:
+    """What one model call cost, in the three currencies a voice turn spends.
+
+    Latency is the one that decides whether the architecture works: a turn can
+    make several of these and the hang-up budget is under two seconds, so a
+    per-call millisecond figure is the only way to know where the budget went.
+
+    ``cost_usd`` is ``None`` for a model with no entry in the price table. An
+    unpriced call is honest; a guessed price in a cost report is not.
+    """
+
+    model: str
+    latency_ms: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    cost_usd: Decimal | None = None
+    stop_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class LLMResponse:
     """Either something to say, or something to ask the engine for, or both.
 
     Tool calls are executed in order and their results appended before the
     model is asked again, so a turn may make several engine round trips before
     it produces the sentence the consumer hears.
+
+    ``error`` carries a transport failure the client already absorbed. The
+    response is still well-formed — empty text, no tool calls — so the loop
+    degrades to a scripted turn instead of raising, and the reason is logged
+    rather than lost.
     """
 
     text: str = ""
     tool_calls: tuple[ToolCall, ...] = ()
+    usage: LLMUsage | None = None
+    error: str | None = None
 
     @property
     def wants_tools(self) -> bool:
@@ -65,6 +96,55 @@ class LLMClient(Protocol):
     def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
         """Produce the next agent action given the conversation so far."""
         ...
+
+
+@dataclass(frozen=True)
+class TextDelta:
+    """A fragment of the spoken turn, as it is generated."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class StreamCompleted:
+    """End of one streamed round: the assembled response, tool calls and all."""
+
+    response: LLMResponse
+
+
+StreamEvent = TextDelta | StreamCompleted
+
+
+@runtime_checkable
+class StreamingLLMClient(Protocol):
+    """A client that can emit a turn as it is written.
+
+    Deliberately a *separate* protocol rather than a method on ``LLMClient``.
+    ``LLMClient`` is runtime-checkable and the scripted client satisfies it;
+    adding a method here would silently drop the scripted client out of
+    conformance and take the whole offline suite with it.
+    """
+
+    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        """Yield the turn in fragments, then the assembled response."""
+        ...
+
+
+def stream_response(client: LLMClient, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+    """Stream from any client, streaming-capable or not.
+
+    A client that cannot stream emits its whole turn as a single delta. That is
+    the honest degradation — the caller's per-sentence guard still runs, it just
+    runs on everything at once — and it is what makes the sentence-guard
+    machinery testable against the scripted client with no key and no network.
+    """
+    if isinstance(client, StreamingLLMClient):
+        yield from client.stream(messages)
+        return
+    response = client.respond(messages)
+    if response.text:
+        yield TextDelta(response.text)
+    yield StreamCompleted(response)
 
 
 SYSTEM_PROMPT = """\

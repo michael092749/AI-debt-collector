@@ -234,25 +234,35 @@ def authorized_for(
     extra_durations: Iterable[tuple[int, DurationUnit]] = (),
     extra_dates: Iterable[str] = (),
 ) -> AuthorizedFigures:
-    """Build the authorized set for the current point in the call.
+    """Build the authorized set for *the current point in the call*.
 
-    Policy figures are included unconditionally: the balance, the $250 floor and
-    the $800 settlement floor are facts the engine owns, so the agent quoting one
-    is not inventing anything. Tier discipline — *when* the agent may put $800 on
-    the table — is the negotiation ladder's job (A4), not this guard's.
+    SPEC §5.2 says a figure must appear in "the engine's currently-authorized
+    offer set", and the emphasis is on *currently*. Only two things go in the
+    base set:
+
+    * **The balance.** An account fact the agent was handed with the file, not
+      a term it negotiated. It has to be sayable before any offer exists —
+      "the balance on the account is $1,000" is the opening of the call.
+    * Nothing else.
+
+    The policy *limits* — the $250 minimum payment, the $800 settlement floor,
+    the 20% discount ceiling, the 92-day maximum — are deliberately excluded.
+    They are the engine's private thresholds, and an agent that says "the most
+    I can discount is 20%" before the engine has surfaced a discounted offer is
+    negotiating against the company with a number it was never given. Once the
+    engine does surface one, it arrives through ``offers`` (the schedule) or
+    ``verdicts`` (the evaluated-condition trail, whose ``actual`` and ``limit``
+    strings are harvested), and it is authorized from that moment on.
+
+    Payment counts are on the same footing: ``_from_offer`` authorizes 1..n for
+    the offer actually on the table. Before there is an offer there is no
+    "second payment" to refer to.
+
+    Account facts beyond the balance — days delinquent, a due date — enter
+    through the ``extra_*`` arguments, where the caller states them explicitly
+    rather than the guard assuming them.
     """
-    max_plan_months = policy.max_plan_days // DurationUnit.MONTH.days
-    base = AuthorizedFigures(
-        money=_amounts([policy.original_balance, policy.settlement_floor, policy.min_payment]),
-        percents=frozenset({policy.min_payment_pct * 100, policy.max_settlement_discount * 100}),
-        counts=frozenset(Decimal(n) for n in range(1, policy.max_installments + 1)),
-        durations=frozenset(
-            {
-                Decimal(policy.max_plan_days),
-                Decimal(max_plan_months * DurationUnit.MONTH.days),
-            }
-        ),
-    )
+    base = AuthorizedFigures(money=_amounts([policy.original_balance]))
     extras = AuthorizedFigures(
         money=_amounts(extra_money),
         percents=frozenset(Decimal(p) for p in extra_percents),

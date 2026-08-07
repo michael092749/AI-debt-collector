@@ -21,7 +21,7 @@ from pathlib import Path
 
 from collector.agent import AgentTurn, CallReport, NegotiationAgent
 from collector.audit.events import dumps
-from collector.audit.store import DEFAULT_DB_PATH, AuditStore
+from collector.audit.store import AuditStore, default_db_path
 from collector.guardrails.rings import PreCallContext
 from collector.llm.base import LLMClient
 from collector.llm.mock_client import MockLLMClient
@@ -75,7 +75,7 @@ def run(argv: list[str] | None = None) -> int:
     parser.add_argument("--name", default="Dana Whitfield", help="Consumer name for the call.")
     parser.add_argument("--account", default="ACCT-4471", help="Account reference.")
     parser.add_argument("--call-id", default="call-text-1", help="Call id used in the log.")
-    parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite path.")
+    parser.add_argument("--db", type=Path, default=default_db_path(), help="SQLite path.")
     parser.add_argument("--no-store", action="store_true", help="Run without writing a log.")
     parser.add_argument("--claude", action="store_true", help="Use the real model.")
     parser.add_argument(
@@ -120,7 +120,7 @@ def _negotiate(args: argparse.Namespace, store: AuditStore | None) -> int:
     while not agent.ended:
         try:
             said = input(PROMPT).strip()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError, KeyboardInterrupt:
             print()
             break
         if not said:
@@ -180,7 +180,7 @@ def dump_agreements(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="collector-agreements", description="Dump agreement records as JSON."
     )
-    parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    parser.add_argument("--db", type=Path, default=default_db_path())
     args = parser.parse_args(argv)
 
     if not args.db.exists():
