@@ -37,7 +37,12 @@ from collector.guardrails.numeric import (
     check_numeric,
     extract_figures,
 )
-from collector.guardrails.prohibited import Severity, Violation, scan_prohibited
+from collector.guardrails.prohibited import (
+    Severity,
+    Violation,
+    is_negated,
+    scan_prohibited,
+)
 from collector.llm.base import SYSTEM_PROMPT
 from collector.policy import PolicyConfig
 
@@ -92,14 +97,46 @@ _TRIGGER_PRIORITY: tuple[EscalationTrigger, ...] = (
 )
 
 
-_TriggerRule = tuple[EscalationTrigger, re.Pattern[str]]
+@dataclass(frozen=True)
+class _TriggerRule:
+    trigger: EscalationTrigger
+    pattern: re.Pattern[str]
+    # Whether a negation cue in the same clause clears the match. True for
+    # everything except self-harm: "I'm not going to hurt myself" is still a
+    # sentence that should reach a human, and the cost of being wrong in that
+    # direction is not symmetric with the cost of being wrong in the other.
+    negatable: bool = True
+    # A cue elsewhere in the utterance that withdraws the match. Distinct from
+    # ``negatable``: negation denies the event ("I'm not giving up"), this says
+    # the event happened but has since resolved ("laid off last year, working
+    # again now"). Clause-scoping would defeat it — the resolution is precisely
+    # what the consumer puts in the *next* clause.
+    cleared_by: re.Pattern[str] | None = None
 
 
-def _trigger(trigger: EscalationTrigger, *alternatives: str) -> _TriggerRule:
-    return trigger, re.compile("|".join(alternatives), re.IGNORECASE)
+def _trigger(
+    trigger: EscalationTrigger,
+    *alternatives: str,
+    negatable: bool = True,
+    cleared_by: re.Pattern[str] | None = None,
+) -> _TriggerRule:
+    return _TriggerRule(
+        trigger, re.compile("|".join(alternatives), re.IGNORECASE), negatable, cleared_by
+    )
+
+
+# Re-employment cues. Only consulted for job loss, where "when" changes whether
+# it is hardship at all; every other hardship pattern names a present state.
+_REEMPLOYED_RE = re.compile(
+    r"\b(?:working\s+again|working\s+now|back\s+at\s+work|back\s+to\s+work|"
+    r"found\s+(?:a|another)\s+job|got\s+(?:a|another)\s+job)\b",
+    re.IGNORECASE,
+)
 
 
 _ESCALATION_PATTERNS: tuple[_TriggerRule, ...] = (
+    # Self-harm. Never negation-cleared: erring toward a human here is free,
+    # and erring away from one is not.
     _trigger(
         EscalationTrigger.DISTRESS,
         r"\bkill\s+myself\b",
@@ -109,23 +146,36 @@ _ESCALATION_PATTERNS: tuple[_TriggerRule, ...] = (
         r"\bthoughts?\s+of\s+hurting\s+myself\b",
         r"\bnot\s+worth\s+living\b",
         r"\bno\s+(?:reason|point)\s+(?:to|in)?\s*(?:live|living|go(?:ing)?\s+on)\b",
-        r"\bcan'?t\s+(?:go\s+on|take\s+(?:this|it)\s+any\s?more|do\s+this\s+any\s?more|"
-        r"handle\s+(?:this|it)\s+any\s?more)\b",
         r"\bdon'?t\s+want\s+to\s+be\s+here\s+(?:any\s?more)?\b",
         r"\bending\s+it\s+all\b",
+        negatable=False,
+    ),
+    _trigger(
+        EscalationTrigger.DISTRESS,
+        r"\bcan'?t\s+(?:go\s+on|take\s+(?:this|it)\s+any\s?more|do\s+this\s+any\s?more|"
+        r"handle\s+(?:this|it)\s+any\s?more)\b",
         r"\bpanic\s+attack\b",
         r"\bhaving\s+a\s+breakdown\b",
         # Indirect phrasings. People in distress rarely use the clinical words
-        # above, and a keyword guard that only catches the explicit forms is a
-        # guard that fires after it mattered.
-        r"\bfalling\s+apart\b",
+        # above, and a guard that only catches the explicit forms is one that
+        # fires after it mattered.
+        #
+        # Every one of these is anchored to a first-person subject, because the
+        # bare forms fired on ordinary negotiation: "falling apart" matched "my
+        # car is falling apart, so I need to keep some cash back", and "giving
+        # up" matched "I'm not giving up on this, I want to get it sorted" —
+        # which under A6 ends the call on a consumer who is co-operating.
+        # ``\s*'s`` as well as ``\s+is``: "everything's falling apart" is how
+        # people actually say it, and requiring the space silently dropped the
+        # commonest form of the phrase this pattern exists for.
+        r"\b(?:everything|it\s+all|my\s+life)(?:\s*'s|\s+is)\s+falling\s+apart\b",
+        r"\bi'?m\s+falling\s+apart\b",
         r"\bat\s+(?:my|the)\s+breaking\s+point\b",
         r"\bcan'?t\s+cope\b",
         r"\bcan'?t\s+deal\s+with\s+(?:this|it)\s+any\s?more\b",
-        r"\bi'?m\s+drowning\b",
         r"\b(?:i'?m\s+)?(?:at\s+)?rock\s+bottom\b",
-        r"\bnothing\s+left\b",
-        r"\bgiving\s+up\b",
+        r"\bi\s+(?:have|'ve\s+got)\s+nothing\s+left\b",
+        r"\bi'?m\s+giving\s+up\b",
         r"\bwhat'?s\s+the\s+point\s+any\s?more\b",
         r"\bi\s+don'?t\s+know\s+what\s+(?:else\s+)?to\s+do\s+any\s?more\b",
     ),
@@ -181,7 +231,6 @@ _ESCALATION_PATTERNS: tuple[_TriggerRule, ...] = (
         # Strong signals only. "I can't afford $500 a month" is a capacity
         # signal for the decision engine, not an escalation.
         r"\bi\s+(?:lost|just\s+lost)\s+my\s+job\b",
-        r"\bi\s+got\s+laid\s+off\b",
         r"\bi'?m\s+(?:unemployed|out\s+of\s+work|homeless|disabled)\b",
         r"\bon\s+disability\b",
         r"\bno\s+income\b",
@@ -197,24 +246,49 @@ _ESCALATION_PATTERNS: tuple[_TriggerRule, ...] = (
         r"\bmy\s+(?:husband|wife|spouse|son|daughter)\s+(?:died|passed\s+away)\b",
         r"\bi'?m\s+(?:a\s+)?(?:widow|widower)\b",
         # Indirect hardship: the consumer describing a situation rather than
-        # naming it. Still distinct from haggling — "I can't afford $500 a
-        # month" is a capacity signal and stays out of this list.
+        # naming it. The bar is a *concrete, current* deprivation, because the
+        # softer phrasings turned out to be how people negotiate. Dropped after
+        # an adversarial pass, with the utterance that broke each one:
+        #
+        #   "behind on everything"  -> "I'm behind on everything but I can
+        #                              still do something here"
+        #   "can't keep up (bills)" -> "Can't keep up with the bills — what's
+        #                              the minimum?"
+        #   "going through a divorce" -> "...so money is tight this quarter"
+        #
+        # Every one of those is a capacity signal for the decision engine, and
+        # ending the call on it is both a compliance miss and a conversion loss.
+        #
+        # Bare "laid off" was dropped here for the same reason ("I got laid off
+        # last year but I'm working again now") and re-added below as its own
+        # rule, where an explicit re-employment cue withdraws it. Recovery is
+        # only judged where the consumer says it outright — never inferred.
         r"\b(?:being\s+|getting\s+)?evicted\b",
         r"\beviction\s+notice\b",
         r"\babout\s+to\s+lose\s+(?:my|our)\s+(?:home|house|car|apartment)\b",
         r"\b(?:power|electricity|water|gas|heat)\s+(?:is\s+|was\s+|got\s+)?(?:shut|cut)\s+off\b",
-        r"\bbehind\s+on\s+(?:everything|rent|the\s+mortgage|all\s+my\s+bills)\b",
-        r"\bcan'?t\s+keep\s+up\s+with\s+(?:anything|everything|the\s+bills|my\s+bills)\b",
-        r"\bliving\s+in\s+my\s+car\b",
+        r"\bcan'?t\s+keep\s+up\s+with\s+(?:anything|everything)\b",
+        r"\bliving\s+in\s+(?:my|the)\s+car\b",
         r"\bfood\s+(?:bank|stamps)\b",
         r"\b(?:on\s+)?(?:welfare|food\s+assistance|snap\s+benefits)\b",
         r"\bmedical\s+bills\s+(?:wiped|cleaned)\s+me\s+out\b",
-        r"\bgoing\s+through\s+a\s+divorce\b",
         r"\bhours\s+(?:got\s+)?cut\s+(?:at\s+work|back)\b",
-        # "got" is required, not optional: "I laid off the sauce" is an idiom
-        # for quitting drinking, not a job loss. The bare form matched it.
-        r"\bgot\s+laid\s+off\b",
         r"\bmy\s+(?:hours|shifts)\s+(?:were|got)\s+cut\b",
+        # "I'm drowning" lives here, not under DISTRESS. On a debt call the
+        # financial reading dominates ("I'm drowning in bills"), and routing
+        # that to the self-harm closing line — "this call is not worth your
+        # wellbeing" — is its own harm.
+        r"\bi'?m\s+drowning\b",
+    ),
+    # Job loss, separated because it is the one hardship signal whose *tense*
+    # decides whether it is a signal at all. "got" is required, not optional:
+    # "I laid off the sauce" is an idiom for quitting drinking, not a job loss.
+    # A bare recency regex was the other candidate here and was rejected — it
+    # dropped the plain "I got laid off", which is how most people say it.
+    _trigger(
+        EscalationTrigger.HARDSHIP,
+        r"\bgot\s+laid\s+off\b",
+        cleared_by=_REEMPLOYED_RE,
     ),
 )
 
@@ -283,9 +357,19 @@ def detect_escalation(utterance: str) -> tuple[EscalationSignal, ...]:
     deployment should be mining transcripts for the rest.
     """
     signals: list[EscalationSignal] = []
-    for trigger, pattern in _ESCALATION_PATTERNS:
-        for match in pattern.finditer(utterance):
-            signals.append(EscalationSignal(trigger, match.group(0), match.start(), match.end()))
+    for rule in _ESCALATION_PATTERNS:
+        for match in rule.pattern.finditer(utterance):
+            # Same clause-scoped test ``scan_prohibited`` uses. Without it the
+            # detector reads "I'm not giving up" and "nobody is giving up here"
+            # as distress and ends the call under A6 — on a consumer who is
+            # telling you they want to sort it out.
+            if rule.negatable and is_negated(utterance, match.start()):
+                continue
+            if rule.cleared_by is not None and rule.cleared_by.search(utterance):
+                continue
+            signals.append(
+                EscalationSignal(rule.trigger, match.group(0), match.start(), match.end())
+            )
     return tuple(signals)
 
 
@@ -678,6 +762,21 @@ def finalize_call(state: GuardrailState, *, transcript_persisted: bool = True) -
             _post_violation(
                 RingRuleId.DISCLOSURE_NEVER_FIRED,
                 "the agent spoke without ever disclosing it is an AI",
+            )
+        )
+    if state.disclosures.ai_disclosure_requested:
+        # SPEC §5.2 requires the AI disclosure at open *and on request*, and
+        # those are different obligations. Scoring only the first meant a call
+        # where the consumer asked "am I talking to a machine?", never got an
+        # answer, and heard the scripted fallback on every turn afterwards
+        # still closed as compliant — because the disclosure had fired, once,
+        # in the greeting. An outstanding request at close is a missed
+        # disclosure whatever happened earlier.
+        violations.append(
+            _post_violation(
+                RingRuleId.DISCLOSURE_NEVER_FIRED,
+                "the consumer asked whether they were speaking to a human and the call "
+                "ended without answering",
             )
         )
     if not transcript_persisted:

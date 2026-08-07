@@ -11,7 +11,17 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage
+# SPEC §10: never commit the database or real PII. `*.db` alone is not enough —
+# in WAL mode the most recent turns live in the -wal sidecar and not in the .db
+# at all until a checkpoint, so the pattern that matches the file without the
+# data would be the only one here.
 *.db
+*.db-wal
+*.db-shm
+# Agreement records: the fullest PII artifact in the system, and `json_dir`
+# follows the database, which is now configurable.
+agreements/
+AGR-*.json
 # Per-session agent scratch: worktree checkouts and subagent memory.
 .claude/worktrees/
 .claude/agent-memory/

@@ -230,7 +230,7 @@ _CLAUSE_BREAK_RE = re.compile(
     r"|\b(?:and|but|if|when|unless|while)\b"
     # won'?t is deliberately excluded here: it is the negation cue _NEGATION_RE
     # relies on for this same branch, not a new-subject clause boundary, and
-    # including it lets .split() consume and discard it before _is_negated
+    # including it lets .split() consume and discard it before is_negated
     # ever sees it (e.g. "We won't sue you." would wrongly block).
     r"|\b(?:we|i|you|they|it)\s+(?:will|are\s+going\s+to|is\s+going\s+to)\b"
     r"|\b(?:we|i|you|they|it)'ll\b",
@@ -323,7 +323,14 @@ def _normalize_for_matching(text: str) -> str:
     return _fold_confusables(text)
 
 
-def _is_negated(text: str, start: int) -> bool:
+def is_negated(text: str, start: int) -> bool:
+    """Does a negation cue precede ``start`` *in the same clause*?
+
+    Public because the escalation detector needs the same test and had none:
+    without it, "I'm not giving up on this" reads as distress and ends the call
+    under A6. Splitting on clause breaks first is what stops a negation in one
+    clause laundering a match in the next.
+    """
     window = text[max(0, start - _NEGATION_WINDOW) : start]
     clause = _CLAUSE_BREAK_RE.split(window)[-1]
     return _NEGATION_RE.search(clause) is not None
@@ -344,7 +351,7 @@ def scan_prohibited(candidate: str) -> tuple[Violation, ...]:
     violations: list[Violation] = []
     for rule in _RULES:
         for match in rule.pattern.finditer(haystack):
-            if rule.negatable and _is_negated(haystack, match.start()):
+            if rule.negatable and is_negated(haystack, match.start()):
                 continue
             violations.append(
                 Violation(

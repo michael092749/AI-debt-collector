@@ -127,6 +127,11 @@ class AnthropicClient:
     """`LLMClient` backed by Claude. Constructed lazily so importing this
     module never requires a key — only calling it does."""
 
+    #: 4xx that mean "the request is wrong and will stay wrong". Everything
+    #: else carrying a status — 408, 409, 429 and every 5xx including 529 — is
+    #: worth the SDK's retry and then, if it still fails, a scripted line.
+    FATAL_STATUSES = frozenset({400, 401, 403, 404, 405, 413, 422})
+
     def __init__(
         self,
         *,
@@ -150,16 +155,20 @@ class AnthropicClient:
         # the SDK already backs off on the retryable statuses (408/409/429/5xx)
         # and reads ``retry-after``, and duplicating that is how the two drift.
         self._client = anthropic.Anthropic(api_key=key, timeout=timeout, max_retries=max_retries)
-        # Only the transient failures are absorbed. A 401, 404 or 400 is
-        # misconfiguration — a bad key, a model name that does not exist — and
+        # Absorb the transient failures; let misconfiguration through. A 401,
+        # 404 or 400 is a bad key or a model name that does not exist, and
         # swallowing one would leave the agent silently mute on every turn
-        # while the call reported itself compliant. Those propagate, loudly,
-        # on the first call. ``APITimeoutError`` is an ``APIConnectionError``.
-        self._retryable_errors = (
-            anthropic.APIConnectionError,
-            anthropic.RateLimitError,
-            anthropic.InternalServerError,
-        )
+        # while the call reported itself compliant.
+        #
+        # Named by *status*, not by exception class. Listing the classes was
+        # the first attempt and it was wrong: ``OverloadedError`` (529) is a
+        # sibling of ``InternalServerError`` rather than a subclass, so the
+        # single most likely transient failure in production fell straight
+        # through — reintroducing the dropped call this exists to prevent.
+        # Statuses are stable; the class hierarchy is not.
+        self._connection_error = anthropic.APIConnectionError  # includes APITimeoutError
+        self._status_error = anthropic.APIStatusError
+        self._absorbed = (self._connection_error, self._status_error)
         self._model = resolve_model(model)
         self._max_tokens = max_tokens
         self._effort = effort
@@ -171,6 +180,13 @@ class AnthropicClient:
             }
             for schema in TOOL_SCHEMAS
         ]
+
+    def _is_fatal(self, exc: BaseException) -> bool:
+        """Misconfiguration, not a blip — re-raise rather than speak through it."""
+        return (
+            isinstance(exc, self._status_error)
+            and getattr(exc, "status_code", None) in self.FATAL_STATUSES
+        )
 
     def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
         system, conversation = _to_anthropic(messages)
@@ -189,11 +205,13 @@ class AnthropicClient:
                 thinking={"type": "adaptive"},
                 output_config=cast(Any, {"effort": self._effort}),
             )
-        except self._retryable_errors as exc:
-            # Timeout, rate limit, connection drop — already retried by the SDK
-            # and still failing. Killing the turn over one would drop the call;
-            # instead the loop gets a response it can speak a scripted line
-            # from, and the reason reaches the log via ``LLMResponse.error``.
+        except self._absorbed as exc:
+            if self._is_fatal(exc):
+                raise
+            # Timeout, overload, rate limit, connection drop — already retried
+            # by the SDK and still failing. Killing the turn over one would drop
+            # the call; instead the loop gets a response it can speak a scripted
+            # line from, and the reason reaches the log via ``LLMResponse.error``.
             detail = f"{type(exc).__name__}: {exc}"
             logger.warning("model call failed after retries: %s", detail)
             return LLMResponse(
@@ -231,7 +249,9 @@ class AnthropicClient:
                     if text:
                         yield TextDelta(text)
                 final = stream.get_final_message()
-        except self._retryable_errors as exc:
+        except self._absorbed as exc:
+            if self._is_fatal(exc):
+                raise
             detail = f"{type(exc).__name__}: {exc}"
             logger.warning("streamed model call failed after retries: %s", detail)
             yield StreamCompleted(

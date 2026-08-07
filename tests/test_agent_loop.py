@@ -97,7 +97,9 @@ class TestToolWhitelist:
             ToolContext.opening(POLICY),
         )
         assert not result.ok
-        assert "non-finite" in result.payload["error"]
+        # Rejected at the tool boundary rather than by ``Money`` — which also
+        # refuses it — so the model gets a readable error it can correct.
+        assert "expected a finite amount" in result.payload["error"]
 
     def test_float_amounts_survive_the_boundary_exactly(self) -> None:
         """JSON has one number type and it decodes to float; Money rejects those."""

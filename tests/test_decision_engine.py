@@ -105,6 +105,63 @@ class TestFullPayment:
             verdict.outcome = "reject"  # type: ignore[misc]
 
 
+class TestOverCollection:
+    """SPEC §4.3: the total is `== ORIGINAL_BALANCE` unless the tier is
+    settlement. Only the lower half of that equality was ever enforced.
+
+    This is the worst shape a defect can take in this system. The model did not
+    originate the figure — the engine did — so `you_may_say` published it as
+    authorized, the numeric guard passed it correctly, and the agreement record
+    was written. No guardrail above the engine can catch an illegal number the
+    engine itself authorized.
+    """
+
+    def test_a_total_above_the_balance_is_refused(self, policy: PolicyConfig) -> None:
+        """Reproduces a consumer who misheard the balance: "a thousand a month
+        for three months" on a $1,000 debt was accepted at $3,000."""
+        from collector.decision_engine import RationaleCode, validate_offer
+
+        verdict = validate_offer(
+            ConsumerProposal(total=Money("3000.00"), payment_count=3, cadence=Cadence.MONTHLY),
+            NegotiationState.opening(policy),
+            policy,
+        )
+        assert verdict.outcome != "accept"
+        assert verdict.rationale_code == RationaleCode.ABOVE_BALANCE_OWED
+        assert verdict.counter is not None
+        assert verdict.counter.total <= policy.original_balance
+
+    @pytest.mark.parametrize("total", ["1000.01", "1500.00", "3000.00", "1000000.00"])
+    def test_no_amount_above_the_balance_is_ever_accepted(
+        self, policy: PolicyConfig, total: str
+    ) -> None:
+        """There was no ceiling at all, so $1,000,000 was accepted too."""
+        from collector.decision_engine import validate_offer
+
+        verdict = validate_offer(
+            ConsumerProposal(total=Money(total), payment_count=1, cadence=Cadence.IMMEDIATE),
+            NegotiationState.opening(policy),
+            policy,
+        )
+        assert verdict.outcome != "accept"
+
+    def test_the_condition_trail_names_the_ceiling_either_way(self, policy: PolicyConfig) -> None:
+        """A passing condition is part of the record too — that is the whole
+        point of carrying every evaluated rule (SPEC §4.1)."""
+        from collector.decision_engine import RuleId, validate_offer
+
+        verdict = validate_offer(
+            ConsumerProposal(
+                total=policy.original_balance, payment_count=1, cadence=Cadence.IMMEDIATE
+            ),
+            NegotiationState.opening(policy),
+            policy,
+        )
+        ceiling = next(c for c in verdict.conditions if c.rule_id == RuleId.NO_OVER_COLLECTION)
+        assert ceiling.passed
+        assert verdict.outcome == "accept", "paying exactly what is owed must still be accepted"
+
+
 class TestPolicyConstants:
     def test_derives_floors_from_the_brief(self, policy: PolicyConfig) -> None:
         """SPEC §2.1. A1 resolved: 25% is of the ORIGINAL BALANCE, fixed at $250."""

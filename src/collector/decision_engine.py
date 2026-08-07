@@ -32,6 +32,7 @@ class RuleId(StrEnum):
 
     TOTAL_FLOOR = "TOTAL_FLOOR"
     NO_UNAUTHORIZED_DISCOUNT = "NO_UNAUTHORIZED_DISCOUNT"
+    NO_OVER_COLLECTION = "NO_OVER_COLLECTION"
     MIN_PAYMENT = "MIN_PAYMENT"
     PAYMENT_COUNT = "PAYMENT_COUNT"
     CADENCE = "CADENCE"
@@ -50,6 +51,7 @@ class RationaleCode(StrEnum):
     CADENCE_NOT_OFFERED = "CADENCE_NOT_OFFERED"
     DISCOUNT_NOT_AUTHORIZED = "DISCOUNT_NOT_AUTHORIZED"
     PREFERRED_TIER_AVAILABLE = "PREFERRED_TIER_AVAILABLE"
+    ABOVE_BALANCE_OWED = "ABOVE_BALANCE_OWED"
 
 
 @dataclass(frozen=True)
@@ -113,7 +115,25 @@ def _evaluate(
             RuleId.NO_UNAUTHORIZED_DISCOUNT,
             tier is Tier.SETTLEMENT or proposal.total >= policy.original_balance,
             str(proposal.total),
-            f"== {policy.original_balance} unless settlement",
+            f">= {policy.original_balance} unless settlement",
+        ),
+        # The ceiling. SPEC §4.3 says the total is `== ORIGINAL_BALANCE` unless
+        # the tier is settlement, and the rule above only ever enforced the
+        # lower half of that equality — nothing anywhere capped it. A consumer
+        # who misheard the balance and offered "a thousand a month for three
+        # months" was *accepted* at $3,000 on a $1,000 debt, and $1,000,000
+        # was accepted too.
+        #
+        # This is the worst shape a defect can take here: the model did not
+        # originate the figure, the engine did. `you_may_say` published
+        # "$3,000.00" as engine-authorized, so the numeric guard passed it
+        # correctly and the agreement record was written. No guardrail above
+        # the engine can catch an illegal number the engine itself authorized.
+        Condition(
+            RuleId.NO_OVER_COLLECTION,
+            proposal.total <= policy.original_balance,
+            str(proposal.total),
+            f"<= {policy.original_balance}",
         ),
         Condition(
             RuleId.MIN_PAYMENT,
@@ -156,6 +176,7 @@ def _evaluate(
 _FAILURE_CODES: dict[RuleId, RationaleCode] = {
     RuleId.TOTAL_FLOOR: RationaleCode.BELOW_SETTLEMENT_FLOOR,
     RuleId.NO_UNAUTHORIZED_DISCOUNT: RationaleCode.DISCOUNT_NOT_AUTHORIZED,
+    RuleId.NO_OVER_COLLECTION: RationaleCode.ABOVE_BALANCE_OWED,
     RuleId.MIN_PAYMENT: RationaleCode.BELOW_MIN_PAYMENT,
     RuleId.PAYMENT_COUNT: RationaleCode.TOO_MANY_PAYMENTS,
     RuleId.CADENCE: RationaleCode.CADENCE_NOT_OFFERED,

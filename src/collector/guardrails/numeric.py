@@ -184,43 +184,39 @@ def _from_offer(offer: Offer) -> AuthorizedFigures:
 
 
 def _from_verdict(verdict: Verdict) -> AuthorizedFigures:
-    """Whatever the engine itself stated is by definition engine-authored.
+    """What the engine *offered*, which is narrower than what it printed.
 
-    Conditions carry their actual and limit as display strings ("$250.00",
-    "<= 92 days"), so the same extractor that polices the agent is reused to
-    harvest them. That keeps the authorized set derived from the decision
-    record rather than restated by hand.
+    A verdict states three kinds of figure and only one of them is a term the
+    engine put on the table. SPEC §5.2 authorizes an "offer set", so the test is
+    provenance — was this figure ever offered — not whether a condition passed:
+
+    * ``verdict.counter`` is an ``Offer``, built by the engine. This is the only
+      thing here that was offered, and it is the whole of what we authorize.
+    * ``condition.limit`` is the policy threshold the proposal was *measured
+      against*: ">= $800.00", "<= 92 days", "<= 3 for settlement". Harvesting it
+      meant a *rejection* unlocked the company's private floors — lowball $400,
+      get refused, and the agent could then say "I could settle this at $800"
+      with no settlement anywhere in the call. The agent explains a refusal from
+      the rationale code and ``you_may_say``, which is precisely why those
+      exist; it never needs the threshold to say "that's below what I can take".
+    * ``condition.actual`` is the *consumer's* proposal restated back. Harvesting
+      it let the consumer choose the agent's numbers: propose $25/week × 40, be
+      rejected under the minimum-payment floor, and "$25 a week", "40 payments"
+      and "273 days" all became sayable — a tenth of the floor and ten times the
+      payment cap, none of it in any offer.
+
+    Neither is redeemed by its condition passing, so per-condition filtering is
+    the wrong unit: a $999 proposal *passes* TOTAL_FLOOR while being exactly the
+    unauthorized discount. Nor is ``actual`` redeemed by an accepting verdict,
+    tempting as that is — an accepted proposal is a real deal, but ``tools.py``
+    already turns it into an ``Offer`` (``Offer.from_proposal``) and records it
+    in ``offers_made``, which authorizes the whole schedule rather than the one
+    smallest instalment ``MIN_PAYMENT.actual`` happens to name. Reading it back
+    off the conditions would be both redundant and less complete.
     """
-    authorized = AuthorizedFigures.empty()
-    if verdict.counter is not None:
-        authorized = authorized.with_offer(verdict.counter)
-    for condition in verdict.conditions:
-        authorized = authorized.merged_with(_harvest(f"{condition.actual} {condition.limit}"))
-    return authorized
-
-
-def _harvest(text: str) -> AuthorizedFigures:
-    money: set[Decimal] = set()
-    percents: set[Decimal] = set()
-    counts: set[Decimal] = set()
-    durations: set[Decimal] = set()
-    for figure in extract_figures(text):
-        if figure.value is None:
-            continue
-        if figure.kind is FigureKind.MONEY:
-            money.add(figure.value)
-        elif figure.kind is FigureKind.PERCENT:
-            percents.add(figure.value)
-        elif figure.kind is FigureKind.DURATION:
-            durations.add(figure.value_in_days)
-        else:
-            counts.add(figure.value)
-    return AuthorizedFigures(
-        money=frozenset(money),
-        percents=frozenset(percents),
-        counts=frozenset(counts),
-        durations=frozenset(durations),
-    )
+    if verdict.counter is None:
+        return AuthorizedFigures.empty()
+    return _from_offer(verdict.counter)
 
 
 def authorized_for(
@@ -249,10 +245,15 @@ def authorized_for(
     the 20% discount ceiling, the 92-day maximum — are deliberately excluded.
     They are the engine's private thresholds, and an agent that says "the most
     I can discount is 20%" before the engine has surfaced a discounted offer is
-    negotiating against the company with a number it was never given. Once the
-    engine does surface one, it arrives through ``offers`` (the schedule) or
-    ``verdicts`` (the evaluated-condition trail, whose ``actual`` and ``limit``
-    strings are harvested), and it is authorized from that moment on.
+    negotiating against the company with a number it was never given.
+
+    A limit becomes sayable only by appearing in an *offer* — through ``offers``,
+    or through the counter a verdict carries (``_from_verdict``, which reads
+    nothing else: a verdict's evaluated conditions restate the policy threshold
+    and the consumer's own proposal, and neither was ever offered). So the $800
+    settlement floor is unsayable until an $800 settlement is on the table, and
+    refusing a proposal surfaces nothing at all — being told a figure is illegal
+    is not the same as being offered it.
 
     Payment counts are on the same footing: ``_from_offer`` authorizes 1..n for
     the offer actually on the table. Before there is an offer there is no

@@ -472,6 +472,16 @@ class AuditStore:
                         record.at,
                     ),
                 )
+            # `synchronous = NORMAL` is right for the turn loop — an fsync
+            # several times a turn sits on the voice critical path. It is wrong
+            # for this write. The agreement is the deliverable (SPEC §6) and
+            # this is the last commit of a successful call, so under NORMAL it
+            # would sit in the page cache until the next checkpoint: an OS crash
+            # or power loss in the seconds after the consumer agreed would lose
+            # the record *and* the negotiation that produced it, leaving nothing
+            # to notice the gap with. This runs after the call, not during it,
+            # so the fsync costs nothing that matters.
+            self._conn.execute("PRAGMA wal_checkpoint(FULL)")
             return json_path
 
         return self._run(_persist)
