@@ -294,8 +294,29 @@ Every line the worker logs carries `call_id`, `room`, `account_ref`, `channel` a
 as structured fields, so one call can be pulled out of a worker handling several. The consumer's
 *name* is deliberately not among them: it buys nothing a reader of the audit store cannot get,
 and logs leave the process by routes that carry none of the consent posture the store does.
-Turn latency is measured from the framework's own metrics (`e2e_latency`, and `llm_node_ttft`,
-which on this design is the whole seven-round-trip turn rather than time-to-first-token).
+Turn latency is measured from the framework's own metrics: `e2e_latency` (consumer stopped
+speaking to agent audio playing), `llm_node_ttft`, and `tts_node_ttfb`.
+
+**The voice path streams.** `llm_node` drives `NegotiationAgent.stream_turn()`, which guards each
+sentence the moment it completes and hands it to TTS while the model is still writing the next
+one — so `llm_node_ttft` is a genuine time-to-first-token and the remaining round trips of a
+multi-tool turn overlap with audio the consumer is already hearing, instead of preceding it.
+Two consequences worth knowing before reading a log:
+
+* **The audit log records sentences, not turns.** Each `TurnRecorded` row is one chunk released
+  to TTS. Joined with single spaces they are exactly the turn's spoken text — that identity is
+  what `test_successful_turn_is_recorded_once` pins.
+* **A barge-in can over-record by one sentence.** The guard fires when a sentence is *released*
+  and the generator is a step ahead of the ear, so an interruption leaves at most one recorded
+  line the consumer did not hear. It cannot be eliminated without giving up the latency win; it
+  is bounded at one, and the non-streaming path it replaced recorded a whole turn the consumer
+  heard only part of.
+
+Prompt caching is on (`cache_control` on the system prompt — which by render order covers the
+tool schemas — and on the end of the transcript), so the second through fifth model calls of a
+turn stop re-paying for the prefix the first one sent. It is scoped to one call: the system prompt
+carries the consumer's name, so there is no cross-call sharing. `cache_read_tokens` on the
+`ModelCalled` row is the signal that it is working; zero across a call means it is not.
 
 **Tracing is off by default and it fails loudly.** `COLLECTOR_TRACING` accepts `off`/unset and
 `otlp` and nothing else: any other value raises at start-up rather than reading as "off", and
