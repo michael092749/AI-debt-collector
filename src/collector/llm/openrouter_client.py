@@ -29,12 +29,14 @@ Two details of this model shape the mapping:
 from __future__ import annotations
 
 import os
-from typing import Any, cast
+from typing import Any
 
 from collector.llm.base import LLMResponse, Message
 from collector.llm.openai_shape import (
+    MAX_RETRIES,
+    TIMEOUT_SECONDS,
+    chat_completion,
     load_env,
-    to_llm_response,
     to_openai_messages,
     tool_definitions,
 )
@@ -63,6 +65,8 @@ class OpenRouterClient:
         max_tokens: int = MAX_TOKENS,
         effort: str = EFFORT,
         api_key: str | None = None,
+        timeout: float = TIMEOUT_SECONDS,
+        max_retries: int = MAX_RETRIES,
     ) -> None:
         from openai import OpenAI
 
@@ -73,19 +77,28 @@ class OpenRouterClient:
                 "OPENROUTER_API_KEY is not set. Run the scripted client instead "
                 "(uv run collector-text) if you don't have one."
             )
-        self._client = OpenAI(base_url=BASE_URL, api_key=key)
+        # Timeout and retries on the client, not hand-rolled around the call:
+        # the SDK already backs off on the retryable statuses (408/409/429/5xx)
+        # and reads ``retry-after``, and duplicating that is how the two drift.
+        self._client = OpenAI(
+            base_url=BASE_URL, api_key=key, timeout=timeout, max_retries=max_retries
+        )
         self._model = model
         self._max_tokens = max_tokens
         self._effort = effort
         self._tools: list[Any] = tool_definitions()
 
     def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
-        conversation = to_openai_messages(messages)
-        response = self._client.chat.completions.create(
+        # Token counts and latency come back populated; ``cost_usd`` stays
+        # ``None`` deliberately. OpenRouter's rates are its own — a margin over
+        # the upstream provider's, varying by the provider it routes to — and
+        # billing this route at Anthropic's published prices would put a wrong
+        # number in a cost report. No table, no guess.
+        return chat_completion(
+            self._client,
             model=self._model,
-            max_tokens=self._max_tokens,
-            messages=cast(Any, conversation),
+            messages=to_openai_messages(messages),
             tools=self._tools,
+            max_tokens=self._max_tokens,
             extra_body={"reasoning": {"effort": self._effort}},
         )
-        return to_llm_response(response.choices[0].message)

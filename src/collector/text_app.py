@@ -9,7 +9,7 @@ worker because only the transport differs.
     uv run collector-text --verbose        # show the engine calls behind each turn
     uv run collector-text --claude         # same call, real model
     uv run collector-text --openrouter     # same call, real model via OpenRouter
-    uv run collector-text --livekit        # same call, Gemini 3 Flash via LiveKit Inference
+    uv run collector-text --livekit        # same call, Gemini 3.6 Flash via LiveKit Inference
     uv run collector-agreements            # dump agreement records as JSON
 """
 
@@ -83,7 +83,7 @@ def run(argv: list[str] | None = None) -> int:
         "--openrouter", action="store_true", help="Use the real model via OpenRouter."
     )
     parser.add_argument(
-        "--livekit", action="store_true", help="Use Gemini 3 Flash via LiveKit Inference."
+        "--livekit", action="store_true", help="Use Gemini 3.6 Flash via LiveKit Inference."
     )
     parser.add_argument("--verbose", action="store_true", help="Show engine calls and guard trips.")
     args = parser.parse_args(argv)

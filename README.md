@@ -322,7 +322,7 @@ cp .env.example .env
 |---|---|
 | `ANTHROPIC_API_KEY` | `--claude` mode, tier-2 evals with live adversarial pressure, and any real voice call |
 | `COLLECTOR_MODEL` | Overrides the Anthropic model id (default `claude-sonnet-5`) |
-| `COLLECTOR_LLM` | Which route the voice worker uses: `anthropic` (default), `openrouter`, `livekit` |
+| `COLLECTOR_LLM` | Which route the voice worker uses: `anthropic` (default — the eval-certified route), `livekit` (Gemini 3.6 Flash, uncertified), `openrouter` |
 | `OPENROUTER_API_KEY` | `--claude`'s alternate route (`--openrouter`, `COLLECTOR_LLM=openrouter`) |
 | `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | `collector-voice` (transport, STT, TTS), the LLM judges, and `--livekit` / `COLLECTOR_LLM=livekit` |
 | `COLLECTOR_DB_PATH` | Moving the audit log off the CWD-relative `data/` — set it to the encrypted volume |

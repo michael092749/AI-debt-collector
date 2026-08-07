@@ -16,10 +16,12 @@ from pathlib import Path
 import pytest
 
 from collector.decision_engine import Verdict, build_counter, validate_offer
+from collector.llm.base import ToolCall
 from collector.money import Money
 from collector.negotiation import NegotiationState
 from collector.offers import Cadence, ConsumerProposal, Offer, Tier
 from collector.policy import PolicyConfig
+from collector.tools import ToolContext, execute
 
 POLICY = PolicyConfig.default()
 
@@ -158,6 +160,63 @@ class TestInvariantsHoldEverywhere:
                 if needed <= min(policy.max_payments_for(tier), room):
                     assert max(i.amount for i in offer.installments) <= capacity, (
                         f"{label}: instalment above capacity when a legal schedule existed"
+                    )
+
+    def test_the_tool_layer_never_emits_a_counter_the_engine_was_underinformed_for(
+        self,
+    ) -> None:
+        """The seam the sweep above never crossed.
+
+        Every capacity rule here is stated against ``build_counter``, which the
+        tests hand ``capacity=`` directly. The production caller does not: the
+        tools call it with no ``capacity`` at all and rely on the
+        ``state.signaled_capacity`` fallback — and that field has exactly one
+        writer, ``validate_consumer_offer``. Skip that tool and the engine is
+        asked to counter knowing nothing, which at DOWNPAYMENT_PLUS_ONE means
+        taking the ceiling: a consumer who said "two hundred" gets asked for
+        $750 today, in figures the engine authored and therefore authorized.
+
+        So the rule is asserted where the model actually stands: over every
+        short sequence of tool calls, an offer that reaches the table is either
+        built on a capacity the state holds, or is the opening pay-in-full,
+        whose schedule no capacity could shape.
+        """
+        walkable = (
+            ToolCall(name="propose_offer"),
+            ToolCall(name="record_refusal"),
+            ToolCall(name="concede"),
+            ToolCall(
+                name="validate_consumer_offer",
+                arguments={"total": "200", "payment_count": 1, "cadence": "immediate"},
+            ),
+        )
+        for walk in itertools.product(walkable, repeat=4):
+            context = ToolContext.opening(POLICY)
+            for step, call in enumerate(walk):
+                result = execute(call, context)
+                context = result.context
+                offer = result.offer
+                if not result.ok or offer is None:
+                    continue
+                label = f"{'->'.join(c.name for c in walk[: step + 1])}"
+                _assert_offer_legal(offer, label)
+
+                capacity = context.state.signaled_capacity
+                if capacity is None:
+                    assert offer.tier is Tier.PAY_IN_FULL, (
+                        f"{label}: put {offer.tier.label} terms on the table with "
+                        "nothing on record about what the consumer can pay"
+                    )
+                    continue
+                # Same bound as the sweep above: a capacity funds a tier only if
+                # the whole total fits in the instalments that tier allows, each
+                # still clearing the floor. Where it does, the figure they named
+                # must lead the schedule rather than be quietly discarded.
+                needed = _payments_needed(offer.total, capacity)
+                room = int(offer.total.amount / POLICY.min_payment.amount)
+                if needed <= min(POLICY.max_payments_for(offer.tier), room):
+                    assert max(i.amount for i in offer.installments) <= capacity, (
+                        f"{label}: instalment above the capacity on record"
                     )
 
     def test_ladder_never_moves_backwards(self) -> None:
