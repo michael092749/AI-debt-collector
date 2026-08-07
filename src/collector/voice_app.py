@@ -462,6 +462,24 @@ class CollectorAgent(Agent):
         one while the model is still writing sentence two, and the framework's
         ``llm_node_ttft`` becomes a real time-to-first-token again.
 
+        What that does *not* buy, and it is worth being exact because
+        ``preemptive_tts`` is off here and has to stay off: synthesis does not
+        begin the instant a chunk exists. The chunks land in an unbounded
+        ``text_ch``, and the task that drains it into TTS
+        (``AgentActivity._produce_segments``) is only started before scheduling
+        when ``preemptive_tts`` is on — otherwise "right after scheduling
+        below", in the SDK's own words (verified in 1.6.8,
+        ``voice/agent_activity.py`` around the ``wait_for_scheduled`` await).
+        So first audio is gated on ``speech_handle._wait_for_scheduled()`` as
+        well as on the first sentence.
+
+        That gate is not the thing this fixes and does not undo the fix:
+        ``perform_llm_inference`` is launched roughly a hundred lines *before*
+        that await, so generation is already running while the handle waits,
+        and scheduling is about speech ordering rather than about this turn's
+        model calls. The change moves the LLM leg off the critical path; the
+        endpointing and scheduling legs are still on it.
+
         A single pump thread drives the generator and hands sentences over
         through the loop's own queue. Two properties are why it is a pump
         rather than one ``to_thread(next, ...)`` per sentence:

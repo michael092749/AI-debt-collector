@@ -301,6 +301,14 @@ speaking to agent audio playing), `llm_node_ttft`, and `tts_node_ttfb`.
 sentence the moment it completes and hands it to TTS while the model is still writing the next
 one — so `llm_node_ttft` is a genuine time-to-first-token and the remaining round trips of a
 multi-tool turn overlap with audio the consumer is already hearing, instead of preceding it.
+
+This moves the LLM leg off the critical path; it does not move the others. Because
+`preemptive_tts` is off (and must stay off — see `voice_app.py`), synthesis starts after the
+speech handle is *scheduled*, not the instant the first chunk exists. Scheduling is speech
+ordering, not this turn's model calls, and generation is already running by then — so the win is
+real, but `e2e_ms` still carries the endpointing and scheduling legs. Read `turn_ms` against
+`e2e_ms` rather than expecting the two to converge.
+
 Two consequences worth knowing before reading a log:
 
 * **The audit log records sentences, not turns.** Each `TurnRecorded` row is one chunk released
