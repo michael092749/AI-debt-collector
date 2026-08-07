@@ -274,26 +274,20 @@ def _llm_route() -> str:
 
 
 def _llm_client() -> LLMClient:
-    """Anthropic by default; ``COLLECTOR_LLM`` routes the same calls elsewhere —
-    ``openrouter`` for the backend ``text_app.py`` reaches with ``--openrouter``,
-    ``livekit`` for Gemini 3 Flash on LiveKit Inference (``--livekit``). An env
-    var rather than a CLI flag because the worker's own argv is consumed
-    entirely by ``cli.run_app``'s dev/start subcommands (and, when launched via
-    ``lk agent dev``, by the CLI wrapper itself).
+    """Anthropic by default; ``COLLECTOR_LLM=openrouter`` routes the same calls
+    to the backend ``text_app.py`` reaches with ``--openrouter``. An env var
+    rather than a CLI flag because the worker's own argv is consumed entirely by
+    ``cli.run_app``'s dev/start subcommands (and, when launched via ``lk agent
+    dev``, by the CLI wrapper itself).
 
-    Neither alternate route is certified: ``MAX_TOOL_ROUNDS`` and the
+    The alternate route is not certified: ``MAX_TOOL_ROUNDS`` and the
     regeneration-strike budget were tuned against Claude, so a route change
     needs ``tests/evals/`` and the ADVERSARIAL_TESTING pass re-run before it
     carries a real call."""
-    route = os.environ.get("COLLECTOR_LLM")
-    if route == "openrouter":
+    if os.environ.get("COLLECTOR_LLM") == "openrouter":
         from collector.llm.openrouter_client import OpenRouterClient
 
         return OpenRouterClient()
-    if route == "livekit":
-        from collector.llm.livekit_client import LiveKitInferenceClient
-
-        return LiveKitInferenceClient()
     return AnthropicClient()
 
 

@@ -3,9 +3,9 @@
 Routes the same model (`anthropic/claude-sonnet-5`) through OpenRouter's
 OpenAI-compatible `/chat/completions` endpoint rather than Anthropic's native
 Messages API. Unlike the Anthropic client, this is not a drop-in: the request
-and response shapes differ, so the mapping lives in `openai_shape.py` — shared
-with `livekit_client.py`, which speaks the same format — rather than being a
-reskin of `_to_anthropic`.
+and response shapes differ, so the mapping lives in `openai_shape.py` — kept
+separate so any future client speaking this format shares one transcript
+mapping — rather than being a reskin of `_to_anthropic`.
 
 Two details of this model shape the mapping:
 

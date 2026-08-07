@@ -9,7 +9,6 @@ worker because only the transport differs.
     uv run collector-text --verbose        # show the engine calls behind each turn
     uv run collector-text --claude         # same call, real model
     uv run collector-text --openrouter     # same call, real model via OpenRouter
-    uv run collector-text --livekit        # same call, Gemini 3 Flash via LiveKit Inference
     uv run collector-agreements            # dump agreement records as JSON
 """
 
@@ -31,22 +30,12 @@ from collector.tracing import configure_tracing, flush_traces
 PROMPT = "you> "
 
 
-def _client(use_claude: bool, use_openrouter: bool, use_livekit: bool) -> LLMClient:
+def _client(use_claude: bool, use_openrouter: bool) -> LLMClient:
     """The mock unless asked otherwise. The real clients are imported late and
     on purpose: the default path must work with no key, no network and no SDK
     installed."""
-    if sum((use_claude, use_openrouter, use_livekit)) > 1:
-        raise SystemExit("--claude, --openrouter and --livekit are mutually exclusive")
-    if use_livekit:
-        try:
-            from collector.llm.livekit_client import LiveKitInferenceClient
-        except ImportError as exc:  # pragma: no cover - depends on the environment
-            raise SystemExit(
-                "--livekit needs the openai SDK, livekit-agents, and "
-                "LIVEKIT_API_KEY/LIVEKIT_API_SECRET; run without it to use the "
-                f"scripted client ({exc})"
-            ) from exc
-        return LiveKitInferenceClient()
+    if use_claude and use_openrouter:
+        raise SystemExit("--claude and --openrouter are mutually exclusive")
     if use_openrouter:
         try:
             from collector.llm.openrouter_client import OpenRouterClient
@@ -82,9 +71,6 @@ def run(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--openrouter", action="store_true", help="Use the real model via OpenRouter."
     )
-    parser.add_argument(
-        "--livekit", action="store_true", help="Use Gemini 3 Flash via LiveKit Inference."
-    )
     parser.add_argument("--verbose", action="store_true", help="Show engine calls and guard trips.")
     args = parser.parse_args(argv)
 
@@ -103,7 +89,7 @@ def run(argv: list[str] | None = None) -> int:
 
 def _negotiate(args: argparse.Namespace, store: AuditStore | None) -> int:
     agent = NegotiationAgent(
-        llm=_client(args.claude, args.openrouter, args.livekit),
+        llm=_client(args.claude, args.openrouter),
         policy=PolicyConfig.default(),
         call_id=args.call_id,
         consumer_name=args.name,

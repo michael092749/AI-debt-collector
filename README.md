@@ -147,13 +147,12 @@ audit/store.py — SQLite + JSON, full decision trail per agreement
     substance, AI disclosure at open and on request). A trip blocks the turn and regenerates it
     with the violation named; two strikes falls back to a scripted, figure-free line.
   - **post-call**: scores the whole trace and writes the agreement.
-- **`llm/`** — one `LLMClient` protocol, four implementations: `MockLLMClient` (scripted,
+- **`llm/`** — one `LLMClient` protocol, three implementations: `MockLLMClient` (scripted,
   deterministic, no key needed — what the whole test suite runs against), `AnthropicClient`
-  (`claude-sonnet-5`, real reasoning, the certified path), and `OpenRouterClient` /
-  `LiveKitClient`, two opt-in alternate routes sharing an OpenAI-shaped request mapper
-  (`openai_shape.py`). The agent loop is written against the protocol only, so swapping
-  between them changes nothing above `llm/`. Only the Anthropic route has been through the
-  adversarial pass.
+  (`claude-sonnet-5`, real reasoning, the certified path), and `OpenRouterClient`, an opt-in
+  alternate route using an OpenAI-shaped request mapper (`openai_shape.py`). The agent loop is
+  written against the protocol only, so swapping between them changes nothing above `llm/`.
+  Only the Anthropic route has been through the adversarial pass.
 - **`text_app.py`** and **`voice_app.py`** are two transports over the identical core. Text is a
   terminal loop with no audio, no keys, no network. Voice is a LiveKit Agents worker — Deepgram
   STT and Cartesia TTS are the framework's; the turn itself is not. `voice_app.py` overrides the
@@ -331,9 +330,9 @@ cp .env.example .env
 |---|---|
 | `ANTHROPIC_API_KEY` | `--claude` mode, tier-2 evals with live adversarial pressure, and any real voice call |
 | `COLLECTOR_MODEL` | Overrides the Anthropic model id (default `claude-sonnet-5`) |
-| `COLLECTOR_LLM` | Which route the voice worker uses: `anthropic` (default), `openrouter`, `livekit` |
+| `COLLECTOR_LLM` | Which route the voice worker uses: `anthropic` (default) or `openrouter` |
 | `OPENROUTER_API_KEY` | `--claude`'s alternate route (`--openrouter`, `COLLECTOR_LLM=openrouter`) |
-| `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | `collector-voice` (transport, STT, TTS), the LLM judges, and `--livekit` / `COLLECTOR_LLM=livekit` |
+| `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | `collector-voice` (transport, STT, TTS) and the LLM judges |
 | `COLLECTOR_DB_PATH` | Moving the audit log off the CWD-relative `data/` — set it to the encrypted volume |
 | `COLLECTOR_RETENTION_DAYS` | What `collector-purge` deletes against (default 1095 — see Storage and retention) |
 | `COLLECTOR_VOICE_RECORDING` | LiveKit Cloud upload mode (default off — see Running the voice worker) |
