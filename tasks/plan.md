@@ -3,7 +3,7 @@
 Source: review commentary handed to `/build` (repeat-back confirmation, post-call
 artifact, latency/dead-air, Gemini certification).
 
-## Task 1 — Gate commitment on an engine-authored repeat-back — IN PROGRESS
+## Task 1 — Gate commitment on an engine-authored repeat-back — DONE (129c6d0)
 
 A commitment is recorded by `tools.py::_confirm_agreement` (`state.agree(offer)`,
 tools.py:644). Nothing today requires the agent to have read the terms back to
@@ -29,6 +29,37 @@ Acceptance criteria:
 4. The refusal payload hands the model the canonical line to say.
 5. Tool payloads that put an offer on the table carry `you_must_confirm`
    alongside the existing `you_may_say`.
+
+## Task 5 — Tighten the call opening — DONE
+
+Three items from a second round of commentary, all describing what the *live*
+model does rather than what the mock does. The mock already merged greeting,
+AI disclosure and identity into one breath; `SYSTEM_PROMPT` never told the live
+model to, and had no section about the opening at all. That was the hole.
+
+* Greeting, AI disclosure and the identity question go out in one breath.
+* The Mini-Miranda now rides out with the balance and the ask instead of
+  costing a round trip of its own. `_run_tool` re-points `self.authorized`
+  before the turn speaks, so the figure is authorized by the time the merged
+  sentence is guarded.
+* No more asking permission to ask. "Can we talk about getting that resolved?"
+  is a yes/no gate whose "no" changes nothing, so it buys nothing and costs a
+  round trip.
+
+`test_disclosures_fire_in_order_and_before_any_substance` had to be repaired
+rather than relaxed: it asserted the Mini-Miranda was in an *earlier turn* than
+any figure, which was only ever a proxy for the real rule. Collapsing the turns
+made a correct call fail it. It now compares offsets, which is what the guard
+itself compares.
+
+### Left open — needs a decision
+
+Dropping "you can ask for a human at any time" from the opening was **not**
+done. It would mean editing `AI_DISCLOSURE_TEXT`, which is a compliance script,
+and `agent.py:1020` prepends that same constant on the safe-fallback path —
+the path that speaks when the guard has already blocked the model twice.
+Shortening the constant silently narrows what the fallback discloses, on
+exactly the turns where the full text matters most. Asked separately.
 
 ## Task 2 — Post-call artifact — PENDING
 

@@ -216,7 +216,7 @@ class MockLLMClient:
         if last is not None and last.role == "system" and len(messages) > 1:
             return LLMResponse(text=self._after_block(last.content))
         if last is not None and last.role == "tool":
-            return self._speak_from_tool(last.content)
+            return self._speak_from_tool(last.content, messages)
         if not self._has_spoken(messages):
             return LLMResponse(text=self._opening())
         if last is not None and last.role == "consumer":
@@ -264,12 +264,11 @@ class MockLLMClient:
         if not self._identity_confirmed(messages):
             return LLMResponse(text="I'm sorry — am I speaking with the account holder?")
         if not self._disclosed(messages):
-            return LLMResponse(
-                text=(
-                    f"Thank you. {MINI_MIRANDA_TEXT} I'm calling about an overdue "
-                    "account, and I'd like to find something that works for you."
-                )
-            )
+            # Straight to the engine rather than spending this turn on the
+            # notice alone. The notice and the balance go out together in
+            # ``_speak_from_tool``: a turn that discloses and then stops has
+            # cost the consumer a round trip to hear nothing they can act on.
+            return LLMResponse(tool_calls=(ToolCall(name="propose_offer"),))
 
         if _DONE_RE.search(said):
             return LLMResponse(
@@ -332,7 +331,7 @@ class MockLLMClient:
 
     # -- reading the conversation back -------------------------------------
 
-    def _speak_from_tool(self, content: str) -> LLMResponse:
+    def _speak_from_tool(self, content: str, messages: tuple[Message, ...]) -> LLMResponse:
         payload = _load(content)
         if not payload.get("ok"):
             if "end_call" in str(payload.get("error", "")):
@@ -363,14 +362,22 @@ class MockLLMClient:
         # for a compliant model has to be able to close a call.
         confirm = payload.get("you_must_confirm")
         ask = str(confirm) if isinstance(confirm, str) else "Can I get your okay on that?"
+        # The notice rides out with the first figures rather than costing a turn
+        # of its own. It has to lead the sentence: the ordering check compares
+        # where it fired against where the money talk starts, so a notice that
+        # trails the balance is blocked even though the words were all said.
+        notice = "" if self._disclosed(messages) else f"Thank you. {MINI_MIRANDA_TEXT} "
 
         if payload.get("outcome") == "accept":
-            return LLMResponse(text=f"{self._describe(offer)} {ask}")
+            return LLMResponse(text=f"{notice}{self._describe(offer)} {ask}")
         if payload.get("moved") is False:
             # Nothing below this is available. Restating the same terms as a
             # concession is worse than saying plainly that this is the floor.
             return LLMResponse(
-                text=f"I've gone as far as I'm able to on this one. {self._describe(offer)} {ask}"
+                text=(
+                    f"{notice}I've gone as far as I'm able to on this one. "
+                    f"{self._describe(offer)} {ask}"
+                )
             )
         if offer:
             if "rationale_code" not in payload and "moved" not in payload:
@@ -380,9 +387,11 @@ class MockLLMClient:
                 # "how much do I owe"). "Here's what I can do instead" is
                 # only true after a refusal — reusing it here misrepresents
                 # the plain balance as a fallback concession.
-                return LLMResponse(text=f"{self._describe(offer, lead='You currently owe')} {ask}")
+                return LLMResponse(
+                    text=f"{notice}{self._describe(offer, lead='You currently owe')} {ask}"
+                )
             reason = self._reason(payload.get("rationale_code"))
-            return LLMResponse(text=f"{reason} {self._describe(offer)} {ask}")
+            return LLMResponse(text=f"{notice}{reason} {self._describe(offer)} {ask}")
         return LLMResponse(text="Thank you for that. Let me see what I can do.")
 
     def _describe(self, offer: object, *, lead: str = "That's") -> str:

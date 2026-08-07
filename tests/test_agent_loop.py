@@ -26,6 +26,7 @@ from collector.guardrails.disclosures import (
     confirms_identity,
     denies_identity,
     fires_ai_disclosure,
+    fires_mini_miranda,
 )
 from collector.guardrails.numeric import FigureKind, extract_figures
 from collector.guardrails.rings import EscalationTrigger, PreCallContext
@@ -345,17 +346,62 @@ class TestTurnLoop:
         assert offer.cadence in POLICY.allowed_cadences
 
     def test_disclosures_fire_in_order_and_before_any_substance(self) -> None:
+        """The Mini-Miranda precedes the first figure — in the call, and inside
+        the turn that carries both.
+
+        This was asserted as "a later turn index than the Mini-Miranda", which
+        was only ever a proxy: it held while the notice and the balance were
+        always separate turns, and read a correct call as a violation the moment
+        they were collapsed into one. The guard itself compares *offsets*
+        (``MINI_MIRANDA_OUT_OF_ORDER``), so the test now asks what the guard asks.
+        """
         agent = _run(["Yes, this is her.", "What do you want?"])
         spoken = [m.content for m in agent.messages if m.role == "agent"]
 
         assert "AI assistant" in spoken[0], "AI disclosure opens the call"
         mini_miranda_turn = next(
-            i for i, text in enumerate(spoken) if "attempt to collect a debt" in text
+            i for i, text in enumerate(spoken) if fires_mini_miranda(text) is not None
         )
-        substantive_turns = [i for i, text in enumerate(spoken) if "$" in text]
-        assert all(i > mini_miranda_turn for i in substantive_turns), (
-            "no figure may be spoken before the Mini-Miranda"
-        )
+        for i, text in enumerate(spoken):
+            if "$" not in text:
+                continue
+            assert i >= mini_miranda_turn, "a figure was spoken before the Mini-Miranda turn"
+            if i == mini_miranda_turn:
+                fired_at = fires_mini_miranda(text)
+                assert fired_at is not None and fired_at < text.index("$"), (
+                    "the Mini-Miranda must lead the figure it shares a turn with"
+                )
+
+    def test_the_notice_and_the_balance_share_a_turn(self) -> None:
+        """The notice does not cost a round trip of its own.
+
+        It used to: the turn after identity was confirmed said the notice and
+        nothing actionable, and the balance waited for the turn after that. On a
+        phone call that is a full round trip — several seconds of the consumer
+        waiting, and one more place to hang up — spent saying something they
+        cannot answer.
+        """
+        agent = _run(["Yes, this is her."])
+        spoken = [m.content for m in agent.messages if m.role == "agent"]
+
+        notice_turn = next(i for i, t in enumerate(spoken) if fires_mini_miranda(t) is not None)
+        assert "$" in spoken[notice_turn], "the notice turn must also carry the balance"
+
+    def test_the_collapsed_turn_survives_sentence_streaming(self) -> None:
+        """The voice path guards a sentence at a time and holds a chunk back
+        while a disclosure rule is still unsatisfied (``_owes_a_disclosure``).
+        A turn carrying the notice *and* the balance is exactly the shape that
+        exercises the hold, so it is asserted on ``stream_turn`` and not only on
+        the text path.
+        """
+        agent = _agent()
+        agent.open_call()
+        spoken = " ".join(agent.stream_turn("Yes, this is her."))
+
+        fired_at = fires_mini_miranda(spoken)
+        assert fired_at is not None, f"the notice never reached TTS: {spoken!r}"
+        assert "$" in spoken, f"the balance never reached TTS: {spoken!r}"
+        assert fired_at < spoken.index("$"), "the notice must lead the figure"
 
     def test_identity_gates_the_whole_conversation(self) -> None:
         agent = _run(["Who is this?", "I'm not telling you that."])
