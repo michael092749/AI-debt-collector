@@ -364,7 +364,7 @@ class MockLLMClient:
         notice = (
             ""
             if self._disclosed(messages) or not self._identity_confirmed(messages)
-            else f"Thank you. {MINI_MIRANDA_TEXT} "
+            else f"{MINI_MIRANDA_TEXT} "
         )
         if not payload.get("ok"):
             if "end_call" in str(payload.get("error", "")):
