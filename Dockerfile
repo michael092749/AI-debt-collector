@@ -1,14 +1,26 @@
 # syntax=docker/dockerfile:1
 
 # Based on LiveKit's uv template (docs.livekit.io/deploy/agents/builds), with
-# three deltas for this project: Python 3.12 (pyproject requires >=3.12), a
-# two-step uv sync because this is a src-layout hatchling package, and a CMD
-# that launches the `collector-voice` console script rather than agent.py.
-ARG PYTHON_VERSION=3.12
+# three deltas for this project: the Python version, a two-step uv sync because
+# this is a src-layout hatchling package, and a CMD that launches the
+# `collector-voice` console script rather than agent.py.
+#
+# This ARG must satisfy pyproject's `requires-python`, and the guard below is
+# why. When it does not, uv ignores the image's interpreter and downloads a
+# managed one *as root* into /root/.local/share/uv/python. The build succeeds,
+# `.venv/bin/python` symlinks in there, and the image then dies on first start
+# under the non-root user this stage creates:
+#
+#   failed to canonicalize path `/app/.venv/bin/python3`: Permission denied
+#
+# because /root is 0700. `UV_PYTHON_DOWNLOADS=never` turns that runtime
+# crashloop into a build failure on the line that causes it.
+ARG PYTHON_VERSION=3.14
 FROM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-bookworm-slim AS base
 
 ENV PYTHONUNBUFFERED=1
 ENV UV_COMPILE_BYTECODE=1
+ENV UV_PYTHON_DOWNLOADS=never
 
 # --- Build stage ---
 FROM base AS build
