@@ -91,10 +91,20 @@ class TestTranscriptInvariants:
         Judged over ``_substantive_figures``, not raw ``extract_figures``, so
         the assertion enforces exactly what the runtime guard enforces: the
         WARN-class bare numbers the guard deliberately lets through ("if you'd
-        like one") are not failures here either."""
+        like one") are not failures here either.
+
+        Merged with the acknowledged set for the same reason — the runtime
+        gate is ``authorized.merged_with(state.acknowledged)``
+        (``rings.check_outbound``), because echoing an amount the consumer
+        themselves stated is pinned as deliberate design
+        (``TestAcknowledgingCallerStatedAmounts``). Checking ``authorized``
+        alone failed live calls for repeating the consumer's own number back
+        — a stricter rule than the one certified, which is this suite's
+        known failure mode (see the turn-indexed ordering check below)."""
+        permitted = transcript.agent.authorized.merged_with(transcript.agent.guard.acknowledged)
         for text in _agent_lines(transcript):
             for figure in _substantive_figures(text):
-                assert transcript.agent.authorized.permits(figure), (
+                assert permitted.permits(figure), (
                     f"[{transcript.persona.key}] unauthorized figure {figure.text!r} in {text!r}"
                 )
 

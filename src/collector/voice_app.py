@@ -170,7 +170,18 @@ GREETING_PAUSE_SECONDS = 0.7
 # `preemptive_tts` is off by default and must stay off for the same reason
 # one step further along — it would synthesize audio for a reply derived from
 # a sentence the consumer had not finished saying.
-TURN_HANDLING: TurnHandlingOptions = {"preemptive_generation": {"enabled": False}}
+# Endpointing: the ceiling is what the consumer waits when the turn detector
+# is *unsure* — with the default streaming values (min 0.3 / max 2.5) three of
+# five measured turns sat the full 2.5s before committing. Cut to 1.5s: still
+# room for a mid-sentence pause ("Can we do four payments? ... Of ... two
+# hundred and seventy dollars?" resumed within ~1s each time), without the
+# guaranteed hang. The floor stays at the streaming default 0.3 — the log has
+# warned that final transcripts can arrive after the turn commits, and a lower
+# floor widens that race into dropped words.
+TURN_HANDLING: TurnHandlingOptions = {
+    "preemptive_generation": {"enabled": False},
+    "endpointing": {"mode": "fixed", "min_delay": 0.3, "max_delay": 1.5},
+}
 
 # Only a leading salutation, and only when something follows it. Anything else
 # is spoken whole — this splits delivery, it never rewords the line.
@@ -303,20 +314,29 @@ def _llm_route() -> str:
 
 
 def _llm_client() -> LLMClient:
-    """Anthropic by default; ``COLLECTOR_LLM=openrouter`` routes the same calls
-    to the backend ``text_app.py`` reaches with ``--openrouter``. An env var
-    rather than a CLI flag because the worker's own argv is consumed entirely by
-    ``cli.run_app``'s dev/start subcommands (and, when launched via ``lk agent
-    dev``, by the CLI wrapper itself).
+    """Anthropic by default; ``COLLECTOR_LLM`` routes the same calls elsewhere —
+    ``openrouter`` for the backend ``text_app.py`` reaches with ``--openrouter``,
+    ``livekit`` for Gemini 3 Flash on LiveKit Inference (``--livekit``). An env
+    var rather than a CLI flag because the worker's own argv is consumed
+    entirely by ``cli.run_app``'s dev/start subcommands (and, when launched via
+    ``lk agent dev``, by the CLI wrapper itself).
 
-    The alternate route is not certified: ``MAX_TOOL_ROUNDS`` and the
+    Neither alternate route is certified: ``MAX_TOOL_ROUNDS`` and the
     regeneration-strike budget were tuned against Claude, so a route change
     needs ``tests/evals/`` and the ADVERSARIAL_TESTING pass re-run before it
-    carries a real call."""
-    if os.environ.get("COLLECTOR_LLM") == "openrouter":
+    carries a real call. The Gemini route has failed that bar once already
+    (deleted in 3ce334b after a 3/3 eval failure) and is restored for
+    re-certification against the repaired numeric classifier — it must not
+    be pointed at production on the strength of this restoration alone."""
+    route = os.environ.get("COLLECTOR_LLM")
+    if route == "openrouter":
         from collector.llm.openrouter_client import OpenRouterClient
 
         return OpenRouterClient()
+    if route == "livekit":
+        from collector.llm.livekit_client import LiveKitInferenceClient
+
+        return LiveKitInferenceClient()
     return AnthropicClient()
 
 

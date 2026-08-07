@@ -766,6 +766,22 @@ def test_llm_route_names_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _llm_route() == "openrouter"
 
 
+def test_llm_client_dispatches_the_livekit_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The eval simulator certifies whatever this function returns
+    (``tests/evals/simulator.py::_agent_llm``), so a route the env selects but
+    this function ignores lets the suite certify one model while production
+    answers on another — the exact drift that let Gemini carry calls
+    uncertified the first time around."""
+    from collector.llm.livekit_client import LiveKitInferenceClient
+    from collector.voice_app import _llm_client
+
+    monkeypatch.setenv("COLLECTOR_LLM", "livekit")
+    monkeypatch.setenv("LIVEKIT_API_KEY", "lk_test_key")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "lk_test_secret")
+    assert _llm_route() == "livekit"
+    assert isinstance(_llm_client(), LiveKitInferenceClient)
+
+
 # --------------------------------------------------------------------------
 # Session-event logging
 # --------------------------------------------------------------------------
@@ -1059,6 +1075,17 @@ def test_the_session_is_built_with_the_turn_handling_options() -> None:
     against the options being defined and then quietly not wired in."""
     source = inspect.getsource(entrypoint)
     assert "AgentSession(turn_handling=TURN_HANDLING)" in source
+
+
+def test_endpointing_commits_unsure_turns_faster_than_the_sdk_default() -> None:
+    """Measured calls sat the streaming default's full 2.5s ceiling on three
+    of five turns — the ceiling only binds when the turn detector is unsure,
+    and 2.5s of dead air on a phone reads as a hang. The floor stays at the
+    streaming default: the log has warned that transcripts can arrive after
+    the turn commits, and a lower floor widens exactly that race."""
+    endpointing = TURN_HANDLING["endpointing"]
+    assert endpointing["max_delay"] <= 1.5
+    assert endpointing["min_delay"] >= 0.3
 
 
 # --------------------------------------------------------------------------
