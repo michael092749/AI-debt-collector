@@ -46,6 +46,11 @@ def _proposals() -> list[ConsumerProposal]:
 def _assert_offer_legal(offer: Offer, label: str) -> None:
     assert offer.smallest_payment >= POLICY.min_payment, f"{label}: sub-floor instalment"
     assert offer.total >= POLICY.settlement_floor, f"{label}: below settlement floor"
+    # The ceiling, not just the floor. SPEC §4.3 reads "== ORIGINAL_BALANCE
+    # unless tier is SETTLEMENT", and this sweep only ever checked the lower
+    # half — so it passed 320 cases while the engine was accepting $3,000 on a
+    # $1,000 debt. An invariant asserted in one direction is half an invariant.
+    assert offer.total <= POLICY.original_balance, f"{label}: collects more than is owed"
     assert offer.payment_count <= POLICY.max_payments_for(offer.tier), f"{label}: too many"
     assert offer.payment_count <= POLICY.max_installments, f"{label}: over global cap"
     assert offer.duration_days <= POLICY.max_plan_days, f"{label}: schedule too long"
