@@ -24,7 +24,19 @@ phrasing. That is the structural reason the streaming defects are invisible to C
   3 monthly → verdict **accept**, `confirm_agreement` ok, agreement record written for
   **$3,000 on a $1,000 debt**. Pre-existing (decision_engine unchanged in this diff).
 
-## Confirmed detection-layer bypasses
+## FIXED 2026-08-07 — `_from_verdict` condition harvesting (both bypasses below)
+`_from_verdict` now returns `_from_offer(verdict.counter)` and nothing else; `_harvest`
+deleted as dead code. Both the `limit` leak (thresholds unlocked by a rejection) and the
+`actual` leak (consumer figures laundered by a rejection) are closed by the one change.
+Rejected candidates, for the record: harvesting only *passing* conditions (a $999
+proposal passes `TOTAL_FLOOR` while being exactly the unauthorized discount, so
+per-condition granularity is the wrong unit); and harvesting `actual` on *accepting*
+verdicts (safe, but redundant *and less complete* — `tools.py::_validate_consumer_offer`
+already does `Offer.from_proposal` into `state.offers_made`, which authorizes the whole
+schedule including the $333.34 final instalment that `MIN_PAYMENT.actual` never names).
+Regression tests live in `tests/test_guardrails.py::TestNumericAuthorization`.
+
+## Confirmed detection-layer bypasses (the two above, as originally found)
 - **Consumer-figure laundering**, `numeric.py::_from_verdict` harvests
   `f"{condition.actual} {condition.limit}"`. `actual` is consumer-originated. Proposal
   $25/wk × 40 → authorized money gains `$25.00`, counts gains `40`, durations gains

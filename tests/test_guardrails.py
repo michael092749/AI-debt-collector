@@ -348,16 +348,107 @@ class TestNumericAuthorization:
         assert violation.severity is Severity.WARN
         assert not violation.blocking
 
-    def test_verdict_conditions_authorize_the_figures_they_state(
-        self, policy: PolicyConfig
-    ) -> None:
-        """The engine's own condition trail is, by definition, engine-authored."""
+    def test_a_verdict_authorizes_the_counter_it_built(self, policy: PolicyConfig) -> None:
+        """A verdict's counter is the engine speaking, so its schedule is sayable.
+
+        This is the false-positive half of the gate: refusing a proposal is the
+        moment the agent most needs to read the alternative out loud.
+        """
         proposal = ConsumerProposal(total=Money("500"), payment_count=2, cadence=Cadence.MONTHLY)
         verdict = validate_offer(proposal, NegotiationState.opening(policy), policy)
         authorized = AuthorizedFigures.empty().with_verdict(verdict)
 
-        assert Decimal(800) in authorized.money  # the settlement floor it failed
-        assert check_numeric("The lowest total I can accept is $800.00.", authorized) == ()
+        assert verdict.counter is not None
+        assert check_numeric("I can do $250.00 today and $750.00 in 30 days.", authorized) == ()
+
+    def test_a_refusal_does_not_unlock_the_policy_thresholds(self, policy: PolicyConfig) -> None:
+        """``condition.limit`` is what the proposal was measured against, never
+        an offer. A lowball that gets *rejected* must not hand the agent the
+        company's floors — the engine has put no settlement on the table, so
+        "I could settle this at $800" is a figure it was never given.
+        """
+        proposal = ConsumerProposal(total=Money("400"), payment_count=1, cadence=Cadence.IMMEDIATE)
+        verdict = validate_offer(proposal, NegotiationState.opening(policy), policy)
+        authorized = authorized_for(policy, verdicts=(verdict,))
+
+        assert verdict.outcome == "reject"
+        assert Decimal(800) not in authorized.money  # settlement floor
+        assert Decimal(250) not in authorized.money  # minimum payment
+        assert Decimal(92) not in authorized.durations  # max plan length
+        assert Decimal(3) not in authorized.counts  # max settlement instalments
+
+        for line in (
+            "I could settle this at $800.",
+            "Payments can't be under $250.",
+            "We can spread it over 92 days.",
+            "We could do 3 payments.",
+        ):
+            assert check_numeric(line, authorized) != (), line
+
+    def test_a_refused_figure_is_not_authorized_by_being_refused(
+        self, policy: PolicyConfig
+    ) -> None:
+        """``condition.actual`` is consumer-originated, so a refusal must not
+        launder it. Otherwise the consumer picks the agent's numbers: propose
+        $500, be told it is under the floor, and the agent may now voice a
+        sub-floor settlement the engine explicitly declined.
+        """
+        proposal = ConsumerProposal(total=Money("500"), payment_count=2, cadence=Cadence.MONTHLY)
+        verdict = validate_offer(proposal, NegotiationState.opening(policy), policy)
+        authorized = authorized_for(policy, verdicts=(verdict,))
+
+        assert verdict.outcome == "reject"
+        assert Decimal(500) not in authorized.money
+        (violation,) = check_numeric("I could take $500.00 to settle this.", authorized)
+        assert violation.rule_id == NumericRuleId.UNAUTHORIZED_AMOUNT
+
+    def test_a_refusal_cannot_launder_terms_the_counter_does_not_contain(
+        self, policy: PolicyConfig
+    ) -> None:
+        """The impossible-schedule persona (SPEC §7.2), which is where refused
+        consumer figures diverge furthest from anything legal: $25/week × 40 is
+        a tenth of the minimum payment and ten times the payment cap. The engine
+        counters 4 × $250, and only *those* figures may be spoken.
+        """
+        proposal = ConsumerProposal(total=Money("1000"), payment_count=40, cadence=Cadence.WEEKLY)
+        verdict = validate_offer(proposal, NegotiationState.opening(policy), policy)
+        authorized = authorized_for(policy, verdicts=(verdict,))
+
+        assert verdict.outcome == "reject"
+        for line in (
+            "$25 a week it is, then.",
+            "We can look at 40 payments if that's what works.",
+            "That would run 273 days.",
+        ):
+            assert check_numeric(line, authorized) != (), line
+
+    def test_an_accepting_verdict_adds_nothing_beyond_the_offer_it_makes(
+        self, policy: PolicyConfig
+    ) -> None:
+        """Even acceptance authorizes through the offer, not the conditions.
+
+        An accepted proposal is a real deal, but ``tools.py`` turns it into an
+        ``Offer`` and records it, and *that* is what authorizes it — the whole
+        schedule, including the $333.34 final instalment that no condition
+        names. Reading the conditions back would be redundant and less complete.
+        """
+        proposal = ConsumerProposal(total=Money("1000"), payment_count=3, cadence=Cadence.MONTHLY)
+        verdict = validate_offer(proposal, NegotiationState.opening(policy), policy)
+        assert verdict.outcome == "accept"
+        assert verdict.counter is None
+
+        from_verdict = authorized_for(policy, verdicts=(verdict,))
+        assert from_verdict == authorized_for(policy)  # the balance, nothing more
+
+        assert verdict.tier is not None
+        accepted = Offer.from_proposal(proposal, verdict.tier)
+        authorized = authorized_for(policy, offers=(accepted,))
+        assert check_numeric("That's $1,000.00 over 3 payments.", authorized) == ()
+        assert check_numeric("$333.33, $333.33, then $333.34 over 60 days.", authorized) == ()
+
+        # The thresholds it cleared stay private even in victory.
+        assert Decimal(800) not in authorized.money
+        assert Decimal(92) not in authorized.durations
 
     def test_money_comparison_is_exact_decimal(self) -> None:
         authorized = AuthorizedFigures(money=frozenset({Decimal("800.00")}))
@@ -472,22 +563,39 @@ class TestEscalationTriggers:
             # distress", and a guard that only catches the clinical phrasing is
             # a guard that fires after it mattered.
             ("Honestly, everything's falling apart right now.", EscalationTrigger.DISTRESS),
-            ("I'm drowning here.", EscalationTrigger.DISTRESS),
             ("I'm at my breaking point with all of this.", EscalationTrigger.DISTRESS),
             ("I don't know what else to do anymore.", EscalationTrigger.DISTRESS),
             ("I just can't cope with this.", EscalationTrigger.DISTRESS),
             # Hardship described rather than named.
             ("We're being evicted at the end of the month.", EscalationTrigger.HARDSHIP),
-            ("I got laid off back in March.", EscalationTrigger.HARDSHIP),
-            ("My hours were cut and I'm behind on everything.", EscalationTrigger.HARDSHIP),
+            # "just" carries recency a regex can check; bare "laid off" cannot be
+            # told apart from "laid off last year but I'm working again now".
+            ("I just got laid off.", EscalationTrigger.HARDSHIP),
             ("The power got shut off last week.", EscalationTrigger.HARDSHIP),
             ("I'm living in my car at the moment.", EscalationTrigger.HARDSHIP),
+            # "Drowning" is financial far more often than clinical, and HARDSHIP's
+            # closing line is right either way; DISTRESS's is actively wrong for
+            # the money reading. It escalates and hands off regardless.
+            ("I'm drowning here.", EscalationTrigger.HARDSHIP),
         ],
     )
     def test_indirect_phrasings_are_detected_too(
         self, utterance: str, expected: EscalationTrigger
     ) -> None:
         assert expected in {s.trigger for s in detect_escalation(utterance)}
+
+    def test_negation_clears_hardship_but_never_self_harm(self) -> None:
+        """The asymmetry the detector turns on, pinned in both directions.
+
+        Negation clearing exists so a co-operating consumer isn't hung up on —
+        under A6 an escalation *ends the call*. But a negated self-harm
+        statement still warrants a human: "I'm not going to kill myself" is not
+        a sentence people say when nothing is wrong. A refactor that applied
+        negation uniformly would pass every other test in this class.
+        """
+        assert detect_escalation("I'm not giving up on this, I want to get it sorted.") == ()
+        negated_self_harm = detect_escalation("I'm not going to kill myself, don't worry.")
+        assert EscalationTrigger.DISTRESS in {s.trigger for s in negated_self_harm}
 
     @pytest.mark.parametrize(
         "utterance",
@@ -500,6 +608,15 @@ class TestEscalationTriggers:
             "My car payment lands the same week as that.",
             "Things are tight but I want to get this sorted.",
             "I'd rather pay it off than drag it out.",
+            # Each of these escalated on the broadened patterns, ending the call
+            # on a consumer who was co-operating. Negation and tense are the
+            # whole difference between them and the true positives above.
+            "I'm not giving up on this, I want to get it sorted.",
+            "My car is falling apart, so I need to keep some cash back.",
+            "I'm behind on everything but I can still do something here.",
+            "I got laid off last year but I'm working again now.",
+            "Can't keep up with the bills - what's the minimum?",
+            "We're going through a divorce so money is tight this quarter.",
         ],
     )
     def test_haggling_is_still_not_an_escalation(self, utterance: str) -> None:

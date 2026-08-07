@@ -44,12 +44,18 @@ JsonDict = dict[str, Any]
 
 _CADENCE_ENUM = [c.value for c in Cadence]
 
-# A sanity ceiling, not a policy one. "Weekly for a year" is 52 payments and the
-# engine must be allowed to *rule* on it — countering an impossible schedule is
-# the job. What this rejects is a value no consumer uttered: a five-digit count
-# from a malformed generation. Policy lives in decision_engine.py; this layer
-# only guarantees the engine receives the types it declares.
-MAX_PROPOSED_PAYMENTS = 1000
+# A sanity ceiling, not a policy one. The engine must be allowed to *rule* on
+# an absurd proposal — countering an impossible schedule is the job, and a
+# refusal at this layer produces no verdict, no counter and no condition trail,
+# so the model gets "bad argument" where it needed "here is why, and here is
+# what I can do instead".
+#
+# 1000 was too low and contradicted that: "five dollars a week for twenty
+# years" is 1042 payments and "$20 a week over 25 years" is 1303 — exactly the
+# deliberately-absurd offers an adversarial consumer makes, and precisely the
+# ones the engine should be countering. This is set far above any utterable
+# schedule so that what it rejects is only a malformed generation.
+MAX_PROPOSED_PAYMENTS = 100_000
 
 
 class ArgumentError(ValueError):
@@ -139,7 +145,15 @@ def _parse_money(value: object) -> Money:
 def _parse_count(value: object) -> int:
     if not isinstance(value, int | float | str | Decimal):
         raise ValueError(f"expected a whole number, got {type(value).__name__}")
-    return int(Decimal(str(value)))
+    count = Decimal(str(value))
+    if not count.is_finite():
+        raise ValueError(f"expected a finite whole number, got {value!r}")
+    # Reject rather than truncate. The schema tells the model this field is an
+    # integer; silently turning 3.9 into 3 accepts a type the declaration says
+    # is not accepted, and the model never learns it sent the wrong thing.
+    if count != count.to_integral_value():
+        raise ValueError(f"expected a whole number, got {value!r}")
+    return int(count)
 
 
 def _parse_cadence(value: object) -> Cadence:

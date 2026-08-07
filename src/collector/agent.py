@@ -41,7 +41,7 @@ from collector.audit.events import (
 )
 from collector.audit.store import AuditStore
 from collector.decision_engine import Verdict
-from collector.guardrails.disclosures import confirms_identity
+from collector.guardrails.disclosures import AI_DISCLOSURE_TEXT, confirms_identity
 from collector.guardrails.numeric import AuthorizedFigures, authorized_for
 from collector.guardrails.rings import (
     MAX_REGENERATION_STRIKES,
@@ -78,11 +78,37 @@ from collector.tools import ToolContext, ToolResult, execute
 MAX_TOOL_ROUNDS = 4
 
 # A sentence ends at terminal punctuation followed by whitespace. The trailing
-# whitespace is what keeps "$250.00 a month" and "3 p.m." in one piece: a
-# decimal point has a digit after it, not a space. Good enough for speech, which
-# is what this splits — an abbreviation mid-sentence costs one early TTS flush,
-# not a compliance failure, because every fragment is guarded either way.
+# whitespace is what keeps "$250.00 a month" in one piece: a decimal point has a
+# digit after it, not a space.
+#
+# An abbreviation is *not* merely an early TTS flush. "Your first payment is due
+# Jan. 15." split at the period in "Jan." leaves two fragments that each clear
+# the numeric guard — neither matches a date pattern, and the orphaned "15" is
+# too small to read as money, so it downgrades to a warning — while the whole
+# sentence is blocked as an unauthorized date. Splitting can therefore destroy
+# the context a rule classifies on, which is a compliance failure and not a
+# latency one. So the split is suppressed after the abbreviations that precede a
+# figure. The cost runs the safe way: a real sentence ending in "Aug." merges
+# with the next one and reaches TTS a beat late, still guarded, whole.
 _SENTENCE_END = re.compile(r"[.!?][\"')\]]*(?=\s)")
+
+# Kept to what actually precedes a number or a name, because every entry is a
+# sentence boundary this will now miss. Months and weekdays are the ones the
+# date patterns care about; the titles and clock abbreviations are here because
+# they are the other forms that routinely carry a figure behind them.
+_MONTH_ABBREVIATIONS = "jan feb mar apr jun jul aug sep sept oct nov dec"
+_WEEKDAY_ABBREVIATIONS = "mon tue tues wed thu thur thurs fri sat sun"
+_OTHER_ABBREVIATIONS = "mr mrs ms dr a.m p.m"
+_ABBREVIATIONS = frozenset(
+    _MONTH_ABBREVIATIONS.split() + _WEEKDAY_ABBREVIATIONS.split() + _OTHER_ABBREVIATIONS.split()
+)
+_TRAILING_TOKEN = re.compile(r"([A-Za-z][A-Za-z.]*)$")
+
+
+def _ends_an_abbreviation(text: str) -> bool:
+    """Is the period that follows ``text`` part of an abbreviation, not an end?"""
+    match = _TRAILING_TOKEN.search(text)
+    return match is not None and match.group(1).lower() in _ABBREVIATIONS
 
 
 def _loggable(arguments: dict[str, object]) -> dict[str, object]:
@@ -122,7 +148,7 @@ def _split_sentences(buffer: str) -> tuple[list[str], str]:
     sentences: list[str] = []
     cursor = 0
     for match in _SENTENCE_END.finditer(buffer):
-        if match.start() < cursor:
+        if match.start() < cursor or _ends_an_abbreviation(buffer[: match.start()]):
             continue
         sentence = buffer[cursor : match.end()].strip()
         if sentence:
@@ -302,18 +328,23 @@ class NegotiationAgent:
         contradicting something the consumer just heard, which is worse than the
         sentence that was blocked.
 
-        The completed turn is appended to ``self.turns`` when the iterator is
-        exhausted, so a caller that abandons it early leaves no turn recorded —
-        which is correct: an abandoned stream is a dropped call, not a turn.
+        The turn is appended to ``self.turns`` however the iterator ends,
+        including when the caller stops listening. Barge-in is the ordinary
+        thing on a voice line, not a dropped call, and the sentences already
+        yielded are already in the audit log — leaving no turn behind would put
+        speech on the trail that the transcript and ``CallReport.turns`` deny.
 
-        **The greeting is not streamed, and cannot be.** ``open_call`` stays
-        synchronous because the AI-disclosure rule is scoped to the *turn*: the
-        first agent turn must disclose that the caller is an AI, and a first
+        **The greeting is not streamed.** ``open_call`` stays synchronous
+        because the AI-disclosure rule is scoped to the *turn*, and a first
         sentence that is not the disclosure cannot be judged against that rule
-        without knowing what the second sentence will say. Guarding it whole is
-        the only way to hold it. The Mini-Miranda rule does compose sentence by
-        sentence — it constrains order within a turn, and a per-sentence guard
-        enforces order by construction — so mid-call turns stream fine.
+        without knowing what the second sentence will say. That reasoning was
+        right and it was too narrow: the *on-request* half of the same rule
+        fires mid-call, which is exactly where streaming runs, and the
+        Mini-Miranda detector wants both of its halves in one string, which the
+        canonical two-sentence wording does not give a per-sentence guard. So
+        the general form of it lives in ``_owes_a_disclosure``: a chunk that a
+        disclosure rule complains about is held back rather than blocked, and
+        released once the turn has finished saying the thing it owes.
 
         A deployment chasing first-audio latency on the greeting should not
         reach for streaming here; it should pre-render it. The opening is the
@@ -331,80 +362,154 @@ class NegotiationAgent:
         spoken: list[str] = []
         blocked: list[str] = []
         results: list[ToolResult] = []
+        transcribed = 0
         # Set when a tool closed the call. One more round is still owed: the
         # consumer has to hear the arrangement read back, and a turn that ends
         # the call in silence is a dead line, not a goodbye.
         closing = False
 
-        for _ in range(MAX_TOOL_ROUNDS + 1):
-            round_ = _Round()
-            for sentence in self._stream_round(round_):
-                spoken.append(sentence)
-                yield sentence
+        try:
+            for _ in range(MAX_TOOL_ROUNDS + 1):
+                round_ = _Round()
+                for sentence in self._stream_round(round_):
+                    spoken.append(sentence)
+                    yield sentence
 
-            if round_.blocked is not None:
-                blocked.append(round_.blocked)
-            if round_.needs_fallback(spoken):
-                fallback = fallback_for(self.guard)
-                self._speak_verbatim(fallback)
+                if round_.blocked is not None:
+                    blocked.append(round_.blocked)
+                if round_.needs_fallback(spoken):
+                    fallback = self._stream_fallback()
+                    spoken.append(fallback)
+                    yield fallback
+                    break
+
+                response = round_.response
+                # Before the tools run, not after the turn ends: round two is
+                # asked with this transcript, and a round that sees the tool
+                # result but not the sentence it just spoke says that sentence
+                # again — over the top of itself, on a live line.
+                transcribed = self._transcribe(spoken, transcribed)
+                if closing or response is None or round_.failed or not response.wants_tools:
+                    break
+                for call in response.tool_calls:
+                    results.append(self._run_tool(call))
+                closing = self.ended
+
+            if not spoken:
+                # Every round asked for another tool and the rounds ran out. A
+                # turn that produces nothing to say is a dead phone line, which
+                # is the one outcome worse than the scripted line.
+                fallback = self._stream_fallback()
                 spoken.append(fallback)
                 yield fallback
-                break
-
-            response = round_.response
-            if closing or response is None or round_.failed or not response.wants_tools:
-                break
-            for call in response.tool_calls:
-                results.append(self._run_tool(call))
-            closing = self.ended
-
-        if spoken:
-            # One assistant turn in the transcript, not one per sentence: the
-            # model wrote a paragraph and the next round trip should see it that
-            # way, whatever granularity TTS consumed it at.
-            self.messages.append(Message(role="agent", content=" ".join(spoken)))
-
-        self.turns.append(
-            AgentTurn(
-                consumer=consumer_utterance,
-                spoken=" ".join(spoken) or None,
-                tool_results=tuple(results),
-                blocked=tuple(blocked),
-                ended=self.ended,
+        finally:
+            self._transcribe(spoken, transcribed)
+            self.turns.append(
+                AgentTurn(
+                    consumer=consumer_utterance,
+                    spoken=" ".join(spoken) or None,
+                    tool_results=tuple(results),
+                    blocked=tuple(blocked),
+                    ended=self.ended,
+                )
             )
-        )
+
+    def _transcribe(self, spoken: list[str], already: int) -> int:
+        """Put what has been spoken since ``already`` into the transcript.
+
+        One assistant message per round, not one per sentence: the model wrote a
+        paragraph and the next round trip should see it that way, whatever
+        granularity TTS consumed it at. The scripted fallback goes in through
+        here too — recording it separately as well left the same line in the
+        transcript twice, as two consecutive assistant messages.
+        """
+        if len(spoken) > already:
+            self.messages.append(Message(role="agent", content=" ".join(spoken[already:])))
+        return len(spoken)
 
     def _stream_round(self, round_: _Round) -> Iterator[str]:
-        """One streamed round, yielding each sentence that clears the guard.
+        """One streamed round, yielding each chunk that clears the guard.
 
-        Stops at the first blocked sentence — the abort the streaming contract
+        Stops at the first blocked chunk — the abort the streaming contract
         requires. What the round produced besides speech (the assembled
-        response, the blocked sentence) lands on ``round_``.
+        response, the blocked text) lands on ``round_``.
         """
         buffer = ""
-        for event in stream_response(self.llm, tuple(self.messages)):
-            match event:
-                case TextDelta():
-                    buffer += event.text
-                    sentences, buffer = _split_sentences(buffer)
-                    for sentence in sentences:
-                        allowed = self._guard_sentence(sentence)
-                        if allowed is None:
-                            round_.blocked = sentence
-                            return
-                        yield allowed
-                case StreamCompleted():
-                    round_.response = event.response
-                    self._record_model_call(event.response)
+        # Complete sentences withheld from TTS because a disclosure rule is
+        # still waiting on the rest of the turn. See ``_owes_a_disclosure``.
+        held = ""
+        started = time.monotonic()
+        try:
+            for event in stream_response(self.llm, tuple(self.messages)):
+                match event:
+                    case TextDelta():
+                        buffer += event.text
+                        sentences, buffer = _split_sentences(buffer)
+                        for sentence in sentences:
+                            held = f"{held} {sentence}" if held else sentence
+                            if self._owes_a_disclosure(held):
+                                continue
+                            candidate, held = held, ""
+                            allowed = self._guard_sentence(candidate)
+                            if allowed is None:
+                                round_.blocked = candidate
+                                return
+                            yield allowed
+                    case StreamCompleted():
+                        round_.response = event.response
+                        self._record_model_call(event.response)
 
-        # Whatever the model left without terminal punctuation is still a
-        # sentence; a turn ending "so let me know" must not be swallowed.
-        if buffer.strip():
-            allowed = self._guard_sentence(buffer)
-            if allowed is None:
-                round_.blocked = buffer.strip()
-            else:
-                yield allowed
+            # Whatever the model left without terminal punctuation is still a
+            # sentence; a turn ending "so let me know" must not be swallowed.
+            # Anything still held goes with it: the turn is over, so a
+            # disclosure it has not made by now it is never going to make, and
+            # the whole chunk gets judged on that.
+            tail = f"{held} {buffer.strip()}".strip() if held else buffer.strip()
+            if tail:
+                allowed = self._guard_sentence(tail)
+                if allowed is None:
+                    round_.blocked = tail
+                else:
+                    yield allowed
+        finally:
+            if round_.response is None:
+                # An abort — a blocked chunk, or a caller that stopped
+                # listening — leaves the stream mid-flight, so
+                # ``StreamCompleted`` never arrives and neither does the usage
+                # it carries. The round still spent a model call, and the
+                # blocked ones are precisely the rounds whose latency you want
+                # to be able to account for, so what is measurable goes on the
+                # record and the rest is named unknown rather than guessed.
+                self._record_model_call(
+                    LLMResponse(
+                        usage=LLMUsage(
+                            model="unknown",
+                            latency_ms=int((time.monotonic() - started) * 1000),
+                            stop_reason="aborted",
+                        )
+                    )
+                )
+
+    def _owes_a_disclosure(self, candidate: str) -> bool:
+        """Does a disclosure rule complain about ``candidate`` being unfinished?
+
+        The disclosure rules are the one family scoped to the *turn* rather than
+        the sentence: the turn must say it is an AI when asked, and the
+        Mini-Miranda must precede the collection talk. Judged one sentence at a
+        time they collapse into "the *first* sentence must", which blocks a
+        model that answers "That's a fair question. Yes, I'm an AI." and blocks
+        the canonical Mini-Miranda whenever it is spoken as the two sentences it
+        actually is — the detector needs both halves in one string.
+
+        So a disclosure complaint is read as "not finished saying it" rather
+        than "blocked": the chunk is withheld from TTS and the next sentence is
+        appended to it. Nothing has been spoken, so nothing is contradicted, and
+        the guard state does not advance while the chunk is held. Every other
+        rule still fires the moment a sentence completes, and a chunk still
+        owing when the round ends is guarded whole and blocked there, which is
+        where the fallback belongs.
+        """
+        return bool(self.guard.disclosures.check_agent_turn(candidate))
 
     def _guard_sentence(self, sentence: str) -> str | None:
         """The pre-TTS gate for one sentence. ``None`` means do not speak it.
@@ -516,6 +621,11 @@ class NegotiationAgent:
         # Out of round trips, or the call closed inside a tool. Ask once more
         # for words; a turn that produces nothing to say is a dead phone line.
         spoken, blocked = self._speak_or_fall_back(self._ask_model())
+        if spoken is None:
+            # It asked for a seventh tool instead of answering, or it returned
+            # nothing at all. Either way the line is silent, and the scripted
+            # line is the one outcome better than that.
+            spoken = self._speak_fallback()
         return spoken, tuple(results), blocked
 
     def _ask_model(self) -> LLMResponse:
@@ -624,9 +734,7 @@ class NegotiationAgent:
         reaches for after two strikes.
         """
         if response.error is not None:
-            fallback = fallback_for(self.guard)
-            self._speak_verbatim(fallback)
-            return fallback, ()
+            return self._speak_fallback(), ()
         return self._guard_and_speak(response.text)
 
     def _guard_and_speak(self, candidate: str) -> tuple[str | None, tuple[str, ...]]:
@@ -670,8 +778,7 @@ class NegotiationAgent:
                 )
 
             if check.fallback_text is not None:
-                self._speak_verbatim(check.fallback_text)
-                return check.fallback_text, tuple(blocked)
+                return self._speak_fallback(), tuple(blocked)
 
             self.messages.append(
                 Message(
@@ -687,6 +794,53 @@ class NegotiationAgent:
 
         return None, tuple(blocked)
 
+    def _fallback_line(self) -> str:
+        """The scripted line to speak when a generated one cannot be.
+
+        ``fallback_for`` alone is not enough when the consumer has just asked
+        whether they are talking to a machine. That question is the reason the
+        turn got blocked, so the line that replaces the turn is the answer they
+        actually hear, and SPEC §5.2 wants it answered on request rather than
+        deferred to a turn that will be blocked for the same reason.
+        """
+        line = fallback_for(self.guard)
+        if self.guard.disclosures.ai_disclosure_requested:
+            return f"{AI_DISCLOSURE_TEXT} {line}"
+        return line
+
+    def _speak_fallback(self) -> str:
+        """The scripted line, spoken on the text path — transcript and all."""
+        line = self._fallback_line()
+        self._observe_scripted(line)
+        self._speak_verbatim(line)
+        return line
+
+    def _stream_fallback(self) -> str:
+        """The same line on the streaming path, where the transcript entry for
+        the round this closes belongs to ``_transcribe``, not to each line."""
+        line = self._fallback_line()
+        self._observe_scripted(line)
+        self._record_audio(line)
+        return line
+
+    def _observe_scripted(self, text: str) -> None:
+        """Let the guard see a code-authored line that is going out regardless.
+
+        ``_speak_verbatim`` bypasses ``check_outbound`` entirely, and the
+        disclosure state machine lives behind it: an AI-disclosure request
+        answered by the fallback stayed *pending*, so the next turn was blocked
+        for ignoring a question that had in fact just been answered, and so was
+        the one after it. The call could then neither proceed nor close.
+
+        The check runs here for its state transition, not for permission — the
+        line is code-authored and gets spoken either way — so a block leaves the
+        state alone rather than charging a strike against a line the model did
+        not write.
+        """
+        check = check_outbound(self.guard, text, authorized=self.authorized)
+        if check.allowed:
+            self.guard = check.state
+
     def _speak_verbatim(self, text: str) -> None:
         """Speak a code-authored line. It bypasses regeneration because there
         is no model turn to regenerate — but it is still logged as spoken."""
@@ -694,6 +848,15 @@ class NegotiationAgent:
 
     def _record_spoken(self, text: str) -> None:
         self.messages.append(Message(role="agent", content=text))
+        self._record_audio(text)
+
+    def _record_audio(self, text: str) -> None:
+        """Put a line on the trail as spoken, leaving the transcript alone.
+
+        The streaming path writes one assistant message per round rather than
+        one per line, so it needs the audit half of ``_record_spoken`` on its
+        own; the transcript half is ``_transcribe``'s.
+        """
         self._record(
             TurnRecorded(
                 call_id=self.call_id,
