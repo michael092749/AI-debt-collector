@@ -527,14 +527,23 @@ class CollectorAgent(Agent):
             abandoned.set()
 
     async def drain(self, timeout: float = 5.0) -> None:
-        """Wait for an abandoned ``stream_turn`` to finish writing its record.
+        """Wait for an abandoned ``stream_turn`` to finish unwinding.
 
         A barge-in leaves the pump thread mid-``next()``. It finishes that
-        sentence, closes the generator, and the generator's ``finally`` writes
-        the turn — to ``AuditStore``, which the shutdown callback is about to
-        close. The agreement and the turn count are the graded deliverable, so
-        that write has to land first, and the audit chain has exactly one
-        writer to race with.
+        sentence, then closes the generator — and closing it is not free. Two
+        things the shutdown callback depends on happen during that unwind, on
+        the pump's thread:
+
+        * ``_stream_round``'s own ``finally`` writes the aborted ``ModelCalled``
+          row for the round it cut short. That is a store write, and
+          ``store.close()`` is a few lines away in ``_finalize_call``.
+        * ``stream_turn``'s ``finally`` appends the ``AgentTurn``, which is what
+          ``NegotiationAgent.close()`` counts into ``CallEnded.turn_count``.
+          Draining after that count is taken would leave the record claiming
+          one turn fewer than the consumer had.
+
+        So this is ordered before both, and the audit chain keeps the single
+        writer it is built on.
 
         Bounded rather than unbounded: a wedged model call must not hold the
         room open, and one lost turn row is a smaller loss than a call that
