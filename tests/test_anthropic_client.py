@@ -144,6 +144,103 @@ class _Message:
         self.content, self.stop_reason, self.usage, self.model = content, stop_reason, usage, model
 
 
+class _FakeStream:
+    """The context manager ``client.messages.stream`` returns, drained empty."""
+
+    def __init__(self, message: _Message) -> None:
+        self._message = message
+        self.text_stream: Any = iter(())
+
+    def __enter__(self) -> _FakeStream:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def get_final_message(self) -> _Message:
+        return self._message
+
+
+class _Captures:
+    """Stands in for ``client.messages``, recording the request kwargs."""
+
+    def __init__(self, message: _Message) -> None:
+        self._message = message
+        self.kwargs: dict[str, Any] = {}
+
+    def create(self, **kwargs: Any) -> Any:
+        self.kwargs = kwargs
+        return self._message
+
+    def stream(self, **kwargs: Any) -> Any:
+        self.kwargs = kwargs
+        return _FakeStream(self._message)
+
+
+def _empty_reply() -> _Message:
+    return _Message(
+        content=[_Block(type="text", text="Hello.")],
+        stop_reason="end_turn",
+        usage=_Usage(input_tokens=1, output_tokens=1),
+        model="claude-sonnet-5",
+    )
+
+
+class TestPromptCaching:
+    """The static prefix must carry a cache breakpoint on every call.
+
+    The API renders tools before system, so the single marker on the system
+    block caches the tool schemas and the system prompt together — the
+    ~2k-token prefix otherwise reprocessed uncached 2-3 times per turn.
+    """
+
+    CACHED_SYSTEM = [
+        {
+            "type": "text",
+            "text": "You are a collections representative.",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+    def test_respond_marks_the_system_block_for_caching(self) -> None:
+        client = _client()
+        captures = _Captures(_empty_reply())
+        client._client.messages = captures  # type: ignore[assignment]
+
+        client.respond(
+            (
+                Message(role="system", content="You are a collections representative."),
+                Message(role="consumer", content="hello?"),
+            )
+        )
+        assert captures.kwargs["system"] == self.CACHED_SYSTEM
+
+    def test_stream_marks_the_system_block_for_caching(self) -> None:
+        client = _client()
+        captures = _Captures(_empty_reply())
+        client._client.messages = captures  # type: ignore[assignment]
+
+        list(
+            client.stream(
+                (
+                    Message(role="system", content="You are a collections representative."),
+                    Message(role="consumer", content="hello?"),
+                )
+            )
+        )
+        assert captures.kwargs["system"] == self.CACHED_SYSTEM
+
+    def test_an_empty_system_prompt_passes_through_unmarked(self) -> None:
+        """No prefix, nothing to cache — a breakpoint on an empty block would
+        be a pointless cache write."""
+        client = _client()
+        captures = _Captures(_empty_reply())
+        client._client.messages = captures  # type: ignore[assignment]
+
+        client.respond((Message(role="consumer", content="hello?"),))
+        assert captures.kwargs["system"] == ""
+
+
 class TestResponseAssembly:
     def _replied(self, message: _Message) -> LLMResponse:
         client = _client()

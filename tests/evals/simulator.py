@@ -8,9 +8,15 @@ whether a key is available — never by the caller, so the same invariants in
 ``test_scenarios.py`` apply either way and the suite stays green with an empty
 ``.env``.
 
-The agent's own model follows the same rule: ``AnthropicClient`` when a key is
-present, ``MockLLMClient`` otherwise. Pairing a live agent with a scripted
-consumer, or the reverse, would certify a combination nobody runs.
+The agent's own model follows the same rule: whichever route ``COLLECTOR_LLM``
+selects when its credentials are present, ``MockLLMClient`` otherwise. Pairing
+a live agent with a scripted consumer, or the reverse, would certify a
+combination nobody runs — and so would pinning the agent to a model production
+has stopped using.
+
+The consumer stays on Claude regardless (``_LIVE_MODEL``). That is not an
+oversight: holding the persona fixed is what makes two agent routes comparable
+to each other.
 """
 
 from __future__ import annotations
@@ -41,16 +47,22 @@ class Transcript:
 
 
 def _agent_llm() -> tuple[LLMClient, Mode]:
-    """The real client if it can be built, the scripted stand-in otherwise.
+    """The route production runs, or the scripted stand-in otherwise.
 
-    ``AnthropicClient`` already raises when no key is configured — reusing
-    that instead of re-deriving key presence keeps there being exactly one
-    place that decides it.
+    Deliberately ``voice_app._llm_client`` rather than a client named here:
+    that function is what a real call dispatches on, so ``COLLECTOR_LLM``
+    selects the model under test exactly as it selects the model under load.
+    Naming a client here instead is how this suite came to certify Claude
+    while production answered on Gemini — an eval pinned to a model nobody
+    runs is worse than no eval, because it reports green.
+
+    Every client raises ``RuntimeError`` when its credentials are absent, so
+    that remains the single signal for falling back to the scripted stand-in.
     """
-    from collector.llm.anthropic_client import AnthropicClient
+    from collector.voice_app import _llm_client
 
     try:
-        return AnthropicClient(), "live"
+        return _llm_client(), "live"
     except RuntimeError:
         return MockLLMClient(), "scripted"
 
@@ -82,11 +94,20 @@ def run_persona(
     return Transcript(persona=persona, mode=mode, agent=agent, report=report)
 
 
+# Both drivers run ``stream_turn()``, not ``turn()`` — the same reason
+# ``_agent_llm`` dispatches through ``voice_app._llm_client``: production's
+# voice path pumps ``stream_turn()`` (``voice_app.llm_node``), and an eval
+# that exercises ``turn()``'s regenerate-on-block path would certify guard
+# behavior production no longer runs. The stream is drained to completion,
+# which is what an uninterrupted call does.
+
+
 def _drive_scripted(agent: NegotiationAgent, persona: Persona) -> None:
     for line in persona.fallback_script[: persona.max_turns]:
         if agent.ended:
             break
-        agent.turn(line)
+        for _ in agent.stream_turn(line):
+            pass
 
 
 _NOTHING_HEARD = "..."
@@ -123,8 +144,8 @@ def _drive_live(agent: NegotiationAgent, persona: Persona, opening: str | None) 
             or _NOTHING_HEARD
         )
         history.append({"role": "assistant", "content": consumer_line})
-        turn = agent.turn(consumer_line)
-        agent_line = turn.spoken if turn.spoken is not None else _NOTHING_HEARD
+        sentences = [s for s in agent.stream_turn(consumer_line) if s]
+        agent_line = " ".join(sentences) or _NOTHING_HEARD
 
 
 def _consumer_system_prompt(persona: Persona) -> str:

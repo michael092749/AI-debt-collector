@@ -524,6 +524,37 @@ def _concede(args: JsonDict, context: ToolContext) -> ToolResult:
         )
     if context.state.is_exhausted:
         return _error(name, context, "round limit reached; close the call out with end_call")
+    # A concession is the first place the engine has to guess at what the
+    # consumer can put down: stepping to DOWNPAYMENT_PLUS_ONE with no capacity
+    # on record takes the ceiling by design (decision_engine.py:401-407), so a
+    # consumer who said "two hundred" and was never relayed gets asked for
+    # $750 today. Nothing above the engine can catch that — the engine authored
+    # the figures, so it authorized them (decision_engine.py:127-131). The
+    # signal is only missing because the model skipped the tool that carries
+    # it: ``signaled_capacity`` is written nowhere but validate_consumer_offer,
+    # and once written it is never cleared, so this refuses at most once, before
+    # the first ruling of the call.
+    #
+    # ``propose_offer`` reads the same field and needs no equivalent guard: it
+    # only reaches that branch below PAY_IN_FULL, and this is the sole caller of
+    # advance_ladder(), so a moved ladder now implies a capacity on record. That
+    # is an argument, so it is also swept: test_engine_invariants.py walks every
+    # short tool sequence and asserts it of whatever reaches the table.
+    #
+    # The round is recorded even though the call is refused, for the same reason
+    # a non-concession step records one further down: a consumer who keeps
+    # refusing without ever naming a figure would otherwise never advance the
+    # round count, leaving the cap unreachable and the call unable to close.
+    if context.state.signaled_capacity is None:
+        return _error(
+            name,
+            context._with(context.state.record_round(None, None, None)),
+            "nothing on record about what they can manage, and a concession has to "
+            "be built around that. If they named an amount, a payment count or a "
+            "timeframe, put it through validate_consumer_offer first; if they have "
+            "not, ask them what they can manage before conceding",
+            may_concede=True,
+        )
     cadence = _cadence_arg(args)
 
     # Step until the terms actually improve for the consumer. Two ways a step

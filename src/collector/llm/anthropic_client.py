@@ -195,7 +195,7 @@ class AnthropicClient:
             response = self._client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
-                system=system,
+                system=cast(Any, _cached_system(system)),
                 # Cast, not coercion: the turn shapes are built above and the SDK's
                 # TypedDicts cannot be satisfied by a dict assembled at runtime.
                 messages=cast(Any, conversation),
@@ -239,7 +239,7 @@ class AnthropicClient:
             with self._client.messages.stream(
                 model=self._model,
                 max_tokens=self._max_tokens,
-                system=system,
+                system=cast(Any, _cached_system(system)),
                 messages=cast(Any, conversation),
                 tools=self._tools,
                 thinking={"type": "adaptive"},
@@ -316,6 +316,23 @@ class AnthropicClient:
             ),
             stop_reason=getattr(response, "stop_reason", None),
         )
+
+
+def _cached_system(system: str) -> str | list[JsonDict]:
+    """The system prompt as a block carrying the prompt-cache breakpoint.
+
+    The Messages API renders ``tools`` before ``system``, so this single
+    breakpoint on the (only) system block caches the tool schemas and the
+    system prompt together — the whole static prefix a call re-sends 2-3
+    times per turn. The cache is a byte-exact prefix match: any change to
+    the system prompt or the tool schemas invalidates it.
+
+    An empty prompt passes through as before — there is nothing to cache,
+    and a breakpoint on an empty block would be a pointless cache write.
+    """
+    if not system:
+        return system
+    return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
 
 
 def _elapsed_ms(started: float) -> int:

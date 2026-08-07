@@ -15,6 +15,7 @@ from decimal import Decimal
 
 import pytest
 
+from collector.agent import _CONFIDENTIAL_REFERENCE
 from collector.decision_engine import validate_offer
 from collector.guardrails import (
     AI_DISCLOSURE_TEXT,
@@ -85,6 +86,11 @@ def ready(policy: PolicyConfig) -> GuardrailState:
         disclosures=DisclosureState(fired=frozenset(DisclosureId), agent_turns=1),
         identity_confirmed=True,
     )
+
+
+# What `agent.py` screens candidates against: the system prompt plus the tool
+# schemas, which is wider than `check_outbound`'s own default.
+_AS_AGENT = {"confidential_reference": _CONFIDENTIAL_REFERENCE}
 
 
 def rule_ids(violations: tuple[object, ...]) -> set[str]:
@@ -788,6 +794,50 @@ class TestDisclosureGating:
 
         early = state.check_agent_turn(f"{MINI_MIRANDA_TEXT} Your balance is due.")
         assert early == ()
+
+    def test_the_opening_the_system_prompt_asks_for_clears_the_disclosure_rules(
+        self, policy: PolicyConfig
+    ) -> None:
+        """The ordering the prompt now spells out, walked end to end.
+
+        Both observed production calls tripped this on their first substantive
+        turn — ``MINI_MIRANDA_OUT_OF_ORDER``, then ``MINI_MIRANDA_NOT_FIRED``
+        on the retry — costing a full regeneration round trip each time. The
+        prompt, not the rule, was the defect: it never said the notice has to
+        lead the turn, and never said it is the one thing a retry must keep.
+
+        Screened against the same confidential reference ``agent.py`` passes,
+        which is wider than ``check_outbound``'s own default: a prompt that
+        taught the notice by quoting it would make every compliant turn a
+        verbatim leak instead.
+        """
+        state = GuardrailState.opening(policy)
+
+        opening = check_outbound(
+            state, f"{AI_DISCLOSURE_TEXT} Am I speaking with Jordan Reyes?", **_AS_AGENT
+        )
+        assert opening.allowed, opening.violations
+
+        state = check_inbound(opening.state, "Yes, this is Jordan.").state.with_identity_confirmed()
+
+        substantive = (
+            f"{MINI_MIRANDA_TEXT} I'm calling about a past due balance, and I'd "
+            "like to find something that works for you."
+        )
+        first = check_outbound(state, substantive, **_AS_AGENT)
+        assert first.allowed, first.violations
+        assert DisclosureId.MINI_MIRANDA in first.state.disclosures.fired
+
+        # And the two shapes production actually produced still do not pass.
+        trailing = check_outbound(
+            state,
+            f"I'm calling about a past due balance. {MINI_MIRANDA_TEXT}",
+            **_AS_AGENT,
+        )
+        assert rule_ids(trailing.violations) == {DisclosureRuleId.MINI_MIRANDA_OUT_OF_ORDER}
+
+        dropped = check_outbound(state, "I'm calling about a past due balance.", **_AS_AGENT)
+        assert rule_ids(dropped.violations) == {DisclosureRuleId.MINI_MIRANDA_NOT_FIRED}
 
     def test_identity_and_greeting_are_allowed_before_the_mini_miranda(self) -> None:
         state = DisclosureState(fired=frozenset({DisclosureId.AI_DISCLOSURE}), agent_turns=1)

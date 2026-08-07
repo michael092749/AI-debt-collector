@@ -23,8 +23,8 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Iterator
-from dataclasses import dataclass, field
+from collections.abc import Generator, Iterator
+from dataclasses import dataclass, field, replace
 
 from collector.audit.events import (
     CallEnded,
@@ -358,7 +358,7 @@ class NegotiationAgent:
         self._log_turn(turn)
         return turn
 
-    def stream_turn(self, consumer_utterance: str) -> Iterator[str]:
+    def stream_turn(self, consumer_utterance: str) -> Generator[str]:
         """One full exchange, emitted a sentence at a time — the voice path.
 
         Same rings, same engine, same whitelist as ``turn()``. What moves is
@@ -760,16 +760,38 @@ class NegotiationAgent:
         ``collector-voice start`` the framework formats records as JSON and
         merges arbitrary extras in as top-level keys, so ``elapsed_ms`` is a
         queryable number rather than a substring of one opaque string.
+
+        The token counts ride along here as well as on ``ModelCalled``, and the
+        duplication is deliberate. ``ModelCalled`` goes to the audit store,
+        which on a cloud deployment is a container-local file destroyed when
+        the replica cycles; the log drain is the only surface that survives a
+        finished job. Without these fields, per-call cost and cache
+        effectiveness are unmeasurable in production — which is what stalled
+        the prompt-caching and thinking-cost questions.
+
+        ``cost_usd`` is deliberately *not* here. It is a ``Decimal``, and the
+        framework's JSON encoder falls back to ``str()`` for types it cannot
+        serialize, so it would land as a quoted string — the opposite of the
+        reason these fields go in ``extra=`` at all. It stays a Decimal on
+        ``ModelCalled``, and a drain can recompute it from these counts.
+
+        ``None`` rather than an omitted key when the call failed and reported
+        no usage: a missing measurement must not read as zero tokens.
         """
         start = time.monotonic()
         response = self.llm.respond(tuple(self.messages))
         elapsed_ms = (time.monotonic() - start) * 1000
+        usage = response.usage
         logger.info(
             "llm_respond",
             extra={
                 "turn": self._turn_index,
                 "label": label,
                 "elapsed_ms": round(elapsed_ms),
+                "input_tokens": usage.input_tokens if usage is not None else None,
+                "output_tokens": usage.output_tokens if usage is not None else None,
+                "cache_read_tokens": usage.cache_read_tokens if usage is not None else None,
+                "cache_write_tokens": usage.cache_write_tokens if usage is not None else None,
             },
         )
         self._record_model_call(response)
@@ -1024,10 +1046,28 @@ class NegotiationAgent:
         sentence, and every errored turn missing from ``turn_count``. This
         closes both. It is the transport's to call precisely because only the
         transport knows the line actually reached TTS.
+
+        ``stream_turn()`` differs in one way: its ``finally`` appends the
+        turn even when it raises — spoken ``None``, because nothing was. When
+        that silent record of the same exchange is the last thing on the
+        list, the apology completes it rather than appending a second: one
+        exchange, one turn, whichever path the transport failed down. Silent
+        turns arise only from an aborted or failed ``stream_turn()`` — both
+        text- and stream-path completions always speak, fallback included —
+        so the guard cannot swallow a legitimate earlier turn.
         """
         self._speak_verbatim(text)
-        turn = AgentTurn(consumer=self.last_consumer_utterance, spoken=text)
-        self.turns.append(turn)
+        last = self.turns[-1] if self.turns else None
+        if (
+            last is not None
+            and last.spoken is None
+            and last.consumer == self.last_consumer_utterance
+        ):
+            turn = replace(last, spoken=text)
+            self.turns[-1] = turn
+        else:
+            turn = AgentTurn(consumer=self.last_consumer_utterance, spoken=text)
+            self.turns.append(turn)
         return turn
 
     def _record_spoken(self, text: str) -> None:

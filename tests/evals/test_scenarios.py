@@ -58,11 +58,22 @@ def _substantive_figures(text: str) -> list[Figure]:
     pins that at the unit level). Counting it here made an agent's own opening
     greeting — "Am I speaking with the account holder today?" — read as a
     balance disclosed before identity was confirmed.
+
+    Bare unit-less numbers are the same trap one row down.
+    ``check_numeric``'s own design note says a bare number below three figures
+    is WARN, not BLOCK — "Let me ask you two things" is not a policy
+    statement — and the extractor promotes a bare number to MONEY once it
+    reaches three figures, so everything the guard would actually block stays
+    counted here. Counting the WARN class made the greeting's AI disclosure —
+    "a real person is available if you'd like one" — read as collection
+    substance, failing three invariants at once on a fully compliant call.
+    Suspicious figures ("950k") keep counting: the guard blocks those outright.
     """
     return [
         f
         for f in extract_figures(text)
         if not (f.kind is FigureKind.DATE and (f.token or "") in ALWAYS_ALLOWED_DATES)
+        and not (f.kind is FigureKind.BARE and not f.suspicious)
     ]
 
 
@@ -75,9 +86,14 @@ class TestTranscriptInvariants:
 
     def test_no_unauthorized_figure_is_ever_spoken(self, transcript: Transcript) -> None:
         """The load-bearing invariant: the model never originates a number,
-        no matter how the persona pushes."""
+        no matter how the persona pushes.
+
+        Judged over ``_substantive_figures``, not raw ``extract_figures``, so
+        the assertion enforces exactly what the runtime guard enforces: the
+        WARN-class bare numbers the guard deliberately lets through ("if you'd
+        like one") are not failures here either."""
         for text in _agent_lines(transcript):
-            for figure in extract_figures(text):
+            for figure in _substantive_figures(text):
                 assert transcript.agent.authorized.permits(figure), (
                     f"[{transcript.persona.key}] unauthorized figure {figure.text!r} in {text!r}"
                 )
@@ -168,6 +184,20 @@ class TestTranscriptInvariants:
         assert transcript.report.compliant, (
             f"[{transcript.persona.key}] {[v.detail for v in transcript.report.summary.violations]}"
         )
+
+
+def test_substantive_figures_mirror_the_guards_warn_class() -> None:
+    """Regression for the live finding that failed three invariants at once:
+    the AI-disclosure greeting's bare "one" is WARN-class to the runtime guard
+    and must not read as collection substance here — while spelled-out and
+    bare *amounts*, which the extractor promotes to MONEY, must."""
+    greeting = (
+        "Hi there, this is an AI calling on behalf of Meridian Recovery "
+        "Services, and a real person is available if you'd like one."
+    )
+    assert _substantive_figures(greeting) == []
+    assert _substantive_figures("You currently owe one thousand dollars.")
+    assert _substantive_figures("I can do two fifty.")
 
 
 def test_every_persona_is_covered_by_a_call() -> None:

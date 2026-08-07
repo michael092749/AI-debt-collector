@@ -18,6 +18,7 @@ Three things this proves, all offline:
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
@@ -362,6 +363,88 @@ class TestModelInstrumentation:
         assert call.model == "claude-sonnet-5"
         assert call.latency_ms == 412
         assert (call.input_tokens, call.output_tokens) == (1200, 30)
+
+    def test_the_token_counts_reach_the_log_line_not_only_the_audit_row(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``ModelCalled`` carries the tokens to the audit store, which on a
+        cloud deployment is a container-local file destroyed when the replica
+        cycles. The log drain is the only surface that outlives a finished job,
+        so the same counts ride on ``llm_respond`` — otherwise per-call cost
+        and cache effectiveness are unmeasurable in production.
+
+        Asserted against the record's own attributes, not ``caplog.text``: the
+        formatted text is only ``LEVEL logger:file:line message`` and never
+        contains the ``extra`` dict, so a text assertion would pass on a line
+        that carried nothing.
+        """
+
+        class MeteredClient:
+            def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+                return LLMResponse(
+                    text=_GREETING,
+                    usage=LLMUsage(
+                        model="claude-sonnet-5",
+                        latency_ms=412,
+                        input_tokens=1200,
+                        output_tokens=30,
+                        cache_read_tokens=1024,
+                        cache_write_tokens=64,
+                    ),
+                )
+
+        agent = _agent(llm=MeteredClient())
+
+        with caplog.at_level(logging.INFO, logger="collector.agent"):
+            agent.open_call()
+
+        calls = [r for r in caplog.records if r.getMessage() == "llm_respond"]
+        assert calls, "every model round trip is logged"
+        for record in calls:
+            assert record.input_tokens == 1200
+            assert record.output_tokens == 30
+            assert record.cache_read_tokens == 1024
+            assert record.cache_write_tokens == 64
+            # The fields that were already there and are queried today.
+            assert isinstance(record.elapsed_ms, int)
+            assert record.label == "opening"
+            assert isinstance(record.turn, int)
+
+    def test_a_call_with_no_usage_logs_nulls_rather_than_raising(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A failed call has no ``LLMUsage``. Reading the counts off it
+        unguarded would turn a recoverable transport error into a dropped
+        call — instrumentation added to observe a system must not be able to
+        take it down.
+
+        ``None``, not an omitted key and not ``0``: a missing measurement must
+        not read as a call that consumed no tokens. Same convention as
+        ``_ms()`` in ``voice_app.py``.
+        """
+
+        class BareFailure:
+            def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+                return LLMResponse(error="APIConnectionError: reset by peer")
+
+        agent = _agent(llm=BareFailure())
+
+        with caplog.at_level(logging.INFO, logger="collector.agent"):
+            _, spoken = agent.open_call()
+
+        assert spoken == SAFE_FALLBACK_TEXT, "the call survived the missing usage record"
+        calls = [r for r in caplog.records if r.getMessage() == "llm_respond"]
+        assert calls, "an unmetered call is still a round trip that cost time"
+        for record in calls:
+            # `__dict__`, not attribute access: an *omitted* key and a key set
+            # to `None` are the two outcomes this test exists to tell apart,
+            # and `getattr` cannot — a missing attribute raises where a null
+            # one returns. Subscripting fails loudly on the omission.
+            assert record.__dict__["input_tokens"] is None
+            assert record.__dict__["output_tokens"] is None
+            assert record.__dict__["cache_read_tokens"] is None
+            assert record.__dict__["cache_write_tokens"] is None
+            assert isinstance(record.elapsed_ms, int)
 
     def test_a_failed_model_call_speaks_the_fallback_and_logs_the_reason(
         self, tmp_path: Path
