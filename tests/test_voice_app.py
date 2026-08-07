@@ -414,11 +414,20 @@ async def test_an_abandoned_turn_finishes_writing_before_the_store_closes(
     store: AuditStore,
 ) -> None:
     """``drain()`` is what keeps the audit chain single-writer across a
-    barge-in. The pump thread is mid-``next()`` when the generator is closed:
-    it finishes that sentence, closes the generator, and the generator's
-    ``finally`` writes the turn. That write has to land before the shutdown
-    callback closes the store, so ``drain()`` waits for the thread rather than
-    assuming it already finished.
+    barge-in.
+
+    The gate is *not* released before ``aclose()`` here, deliberately: that is
+    what leaves the pump genuinely parked inside ``next()`` when the generator is
+    closed, so the abandonment is cooperative — ``abandoned`` is what stops it —
+    rather than the generator simply having run to completion first. Releasing
+    the gate before closing (as the tests above do, since they are about
+    something else) makes this test pass with ``drain()`` deleted.
+
+    What has to land before ``store.close()`` is the ``AgentTurn`` that
+    ``CallEnded.turn_count`` is taken from. Asserted on the *count*: the
+    ``TurnRecorded`` rows for sentences already yielded were written by
+    ``_guard_sentence`` before ``anext()`` ever returned them, so looking for
+    one of those in the store proves nothing about the drain.
     """
     negotiation_agent, agent = _voice_agent(store, client := _GatedStreamClient())
     ctx = llm.ChatContext.empty()
@@ -427,15 +436,66 @@ async def test_an_abandoned_turn_finishes_writing_before_the_store_closes(
     stream = agent.llm_node(ctx, [], {})  # type: ignore[arg-type]
     await asyncio.wait_for(anext(stream), timeout=5)
     turns_before = len(negotiation_agent.turns)
-    client.release.set()
+
     await stream.aclose()
+    # Still parked on the gate: the turn cannot have been recorded yet, which is
+    # precisely the window in which `store.close()` would lose it.
+    assert len(negotiation_agent.turns) == turns_before
+    client.release.set()
 
     await asyncio.wait_for(agent.drain(timeout=5), timeout=10)
 
-    # After the drain, and not merely eventually: the pump has closed the
-    # generator and its `finally` has appended the turn.
     assert len(negotiation_agent.turns) == turns_before + 1
-    assert _GatedStreamClient.FIRST in _agent_lines(store, negotiation_agent.call_id)
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_every_pump_not_just_the_last(store: AuditStore) -> None:
+    """Two generations can be in flight at once, and a cancelled ``to_thread``
+    does not stop the thread under it — so the abandoned pump keeps generating,
+    keeps guarding sentences, and keeps writing to the store.
+
+    Tracked in a single slot, the older pump went untracked the moment the newer
+    one replaced it. ``drain()`` returned as soon as the newer one finished,
+    ``store.close()`` ran, and the older pump's next write hit a closed store:
+    a lost row on the single-writer compliance store, an ``AgentTurn`` appended
+    after ``CallEnded.turn_count`` was taken, and no diagnostic anywhere,
+    because the failure is relayed to a queue nobody reads.
+    """
+    negotiation_agent, agent = _voice_agent(store, first := _GatedStreamClient())
+    ctx = llm.ChatContext.empty()
+    ctx.add_message(role="user", content="Yes, that's fine.")
+
+    try:
+        # Generation one: started, parked on its gate, then abandoned.
+        stale = agent.llm_node(ctx, [], {})  # type: ignore[arg-type]
+        await asyncio.wait_for(anext(stale), timeout=5)
+        (stale_pump,) = agent._pumps
+        await stale.aclose()
+
+        # Generation two, on a negotiation agent of its own, runs to completion.
+        agent._negotiation_agent = _voice_agent(store, second := _GatedStreamClient())[0]
+        second.release.set()
+        fresh = agent.llm_node(ctx, [], {})  # type: ignore[arg-type]
+        assert [chunk async for chunk in fresh]
+
+        # The load-bearing assertion, and the one a single slot fails: the
+        # abandoned pump is *still tracked* after a second generation replaced
+        # it, and still live — parked on its gate, so this cannot race. Under
+        # one slot it was not tracked at all and `drain()` had nothing to wait
+        # on. Asserted about this pump rather than by counting, because
+        # generation two's task settles a tick after its generator drains.
+        assert stale_pump in agent._pumps
+        assert not stale_pump.done()
+
+        turns_before = len(negotiation_agent.turns)
+    finally:
+        first.release.set()
+
+    await asyncio.wait_for(agent.drain(timeout=5), timeout=10)
+
+    # Waited, not merely returned — so the store is safe to close.
+    assert stale_pump.done()
+    assert len(negotiation_agent.turns) == turns_before + 1
 
 
 # --------------------------------------------------------------------------

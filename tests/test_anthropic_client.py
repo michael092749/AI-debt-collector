@@ -24,7 +24,7 @@ import httpx
 import pytest
 
 from collector.llm.anthropic_client import AnthropicClient, _cached_transcript, _to_anthropic
-from collector.llm.base import LLMResponse, Message, StreamCompleted, system_prompt
+from collector.llm.base import LLMResponse, Message, StreamCompleted, ToolCall, system_prompt
 
 FAKE_KEY = "sk-ant-not-a-real-key"
 
@@ -263,7 +263,10 @@ class TestPromptCaching:
 
     @staticmethod
     def _breakpoints(request: dict[str, Any]) -> int:
-        blocks = list(request["system"])
+        """Every marked block in the request, ``tools`` included — the API's
+        ceiling of four counts those too, so a count that skipped them could
+        report three while the request carried five."""
+        blocks = [*request["tools"], *request["system"]]
         for message in request["messages"]:
             content = message["content"]
             if not isinstance(content, str):
@@ -276,6 +279,18 @@ class TestPromptCaching:
             Message(role="consumer", content="Yes, speaking."),
             Message(role="agent", content="Thanks for confirming."),
             Message(role="consumer", content="I can do fifty a month."),
+        )
+
+    def _mid_turn(self) -> tuple[Message, ...]:
+        """A transcript whose last entry is an engine result — the shape every
+        round after the first actually sends, and the one the compounding win
+        depends on. ``_tool_exchange`` expands it into an assistant ``tool_use``
+        followed by a user ``tool_result``, so the breakpoint lands on a
+        ``tool_result`` block rather than on plain text."""
+        call = ToolCall(name="validate_consumer_offer", arguments={}, call_id="toolu_abc")
+        return (
+            *self._conversation(),
+            Message(role="tool", content='{"ok": true}', tool_call=call),
         )
 
     def test_the_system_prompt_carries_a_breakpoint_and_so_covers_the_tools(self) -> None:
@@ -323,16 +338,40 @@ class TestPromptCaching:
         assert json.dumps(first["tools"]) == json.dumps(second["tools"])
         assert json.dumps(first["system"]) == json.dumps(second["system"])
 
+    def test_a_tool_result_carries_the_breakpoint_without_losing_its_shape(self) -> None:
+        """Round two onward is where caching earns the write premium, and round
+        two's last block is a ``tool_result``, not text. Marking it must leave
+        ``tool_use_id`` and ``type`` intact: a mangled pairing is rejected by the
+        API outright, which would turn a cost optimization into a dropped
+        turn — and the engine result the model was waiting on with it."""
+        request = self._sent(self._mid_turn())
+
+        last = request["messages"][-1]["content"][-1]
+        assert last["type"] == "tool_result"
+        assert last["tool_use_id"] == "toolu_abc"
+        assert last["content"] == '{"ok": true}'
+        assert last["cache_control"] == {"type": "ephemeral"}
+        assert self._breakpoints(request) <= 4
+
     def test_marking_the_request_does_not_reach_back_into_the_mapping(self) -> None:
         """``_to_anthropic`` is a pure mapping the loop's own tests read
         directly. The caching layer copies the entry it marks, so the mapping
-        keeps returning the shape it documents."""
-        _, conversation = _to_anthropic(self._conversation())
-        before = json.dumps(conversation)
+        keeps returning the shape it documents.
 
-        _cached_transcript(conversation)
+        Run over the mid-turn transcript, not the plain one: a plain last entry
+        has string ``content``, which is *promoted* to a block list and so cannot
+        be mutated in place even by accident. The block-list branch — the one
+        that has to copy each block rather than mark the original — is only
+        reachable when the last entry already carries blocks, which is exactly
+        the ``tool_result`` case.
+        """
+        for messages in (self._conversation(), self._mid_turn()):
+            _, conversation = _to_anthropic(messages)
+            before = json.dumps(conversation)
 
-        assert json.dumps(conversation) == before
+            _cached_transcript(conversation)
+
+            assert json.dumps(conversation) == before
 
     def test_streaming_sends_the_same_cached_prefix(self) -> None:
         """The voice path streams, so an unmarked ``stream()`` would mean the

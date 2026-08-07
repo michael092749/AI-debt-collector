@@ -360,9 +360,10 @@ class CollectorAgent(Agent):
             else None,
         )
         self._negotiation_agent = negotiation_agent
-        # The in-flight ``_stream_sentences`` pump, so ``drain()`` can wait for
-        # an abandoned turn's audit write before the store closes.
-        self._pump: asyncio.Task[None] | None = None
+        # Every in-flight ``_stream_sentences`` pump, so ``drain()`` can wait
+        # for an abandoned turn's audit write before the store closes. All of
+        # them: see the note where they are added.
+        self._pumps: set[asyncio.Task[None]] = set()
 
     async def llm_node(
         self,
@@ -534,11 +535,31 @@ class CollectorAgent(Agent):
                             break
             except BaseException as exc:  # noqa: BLE001 — relayed, not swallowed
                 hand_over(exc)
+                if abandoned.is_set():
+                    # Relaying just wrote to a queue with no consumer. Log it
+                    # here or the failure vanishes entirely: ``drive`` returns
+                    # normally either way, so the task carries no exception for
+                    # ``_retrieve_pump_exception`` to find.
+                    logger.error(
+                        "stream_turn failed after the caller stopped listening", exc_info=exc
+                    )
             else:
                 hand_over(None)
 
         pump = asyncio.create_task(asyncio.to_thread(drive))
-        self._pump = pump
+        # A set, not a single slot. Two generations can be in flight at once —
+        # the framework's preflight path builds one and abandons it — and a
+        # cancelled ``to_thread`` does not stop the thread under it, so the
+        # abandoned pump is still generating, still guarding sentences, and
+        # still writing to the store. Tracked in one slot, the older pump went
+        # untracked the moment the newer one replaced it: ``drain()`` returned
+        # as soon as the *newer* one finished, ``store.close()`` ran, and the
+        # older one's next ``TurnRecorded`` hit a closed store. That row is lost
+        # and its ``AgentTurn`` lands after ``CallEnded.turn_count`` was taken,
+        # so the graded record under-reports the call — and none of it surfaces,
+        # because the failure is relayed to a queue nobody reads.
+        self._pumps.add(pump)
+        pump.add_done_callback(self._pumps.discard)
         pump.add_done_callback(_retrieve_pump_exception)
         try:
             while True:
@@ -559,9 +580,11 @@ class CollectorAgent(Agent):
         things the shutdown callback depends on happen during that unwind, on
         the pump's thread:
 
-        * ``_stream_round``'s own ``finally`` writes the aborted ``ModelCalled``
-          row for the round it cut short. That is a store write, and
-          ``store.close()`` is a few lines away in ``_finalize_call``.
+        * The sentence it finishes is guarded, which writes its ``TurnRecorded``
+          row (``_guard_sentence`` → ``_record_audio``), and ``_stream_round``'s
+          own ``finally`` writes the aborted ``ModelCalled`` row for the round it
+          cut short. Both are store writes, and ``store.close()`` is a few lines
+          away in ``_finalize_call``.
         * ``stream_turn``'s ``finally`` appends the ``AgentTurn``, which is what
           ``NegotiationAgent.close()`` counts into ``CallEnded.turn_count``.
           Draining after that count is taken would leave the record claiming
@@ -574,15 +597,18 @@ class CollectorAgent(Agent):
         room open, and one lost turn row is a smaller loss than a call that
         never hangs up.
         """
-        pump = self._pump
-        if pump is None or pump.done():
+        pumps = {pump for pump in self._pumps if not pump.done()}
+        if not pumps:
             return
-        # ``wait``, not ``wait_for``: a timeout here must not cancel the task,
-        # because cancelling it would not stop the thread underneath and would
-        # only hide the pump's own exception.
-        _, pending = await asyncio.wait({pump}, timeout=timeout)
+        # ``wait``, not ``wait_for``: a timeout here must not cancel the tasks,
+        # because cancelling one would not stop the thread underneath it and
+        # would only hide that pump's own exception.
+        _, pending = await asyncio.wait(pumps, timeout=timeout)
         if pending:
-            logger.warning("stream_turn did not finish writing before shutdown")
+            logger.warning(
+                "stream_turn did not finish writing before shutdown",
+                extra={"pending_pumps": len(pending)},
+            )
 
 
 def _consumer_context(ctx: JobContext) -> tuple[str, str]:
