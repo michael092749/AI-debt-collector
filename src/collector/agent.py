@@ -43,14 +43,14 @@ from collector.audit.events import (
 )
 from collector.audit.store import AuditStore
 from collector.decision_engine import Verdict
-from collector.guardrails.confirmation import confirmation_line, repeats_back
+from collector.guardrails.confirmation import agreed_line, confirmation_line, repeats_back
 from collector.guardrails.disclosures import (
     AI_DISCLOSURE_WITH_HUMAN,
     confirms_identity,
     denies_identity,
-    is_substantive,
+    fires_mini_miranda,
 )
-from collector.guardrails.numeric import AuthorizedFigures, authorized_for
+from collector.guardrails.numeric import AuthorizedFigures, authorized_for, extract_figures
 from collector.guardrails.rings import (
     CONNECTIVE_TEXT,
     MAX_REGENERATION_STRIKES,
@@ -238,6 +238,19 @@ _ACTION_FOR: dict[_Outcome, GuardrailAction] = {
 }
 
 
+def _stands_on_its_own(spoken_text: str) -> bool:
+    """Did the spoken prefix say something a connective can close?
+
+    A figure means concrete terms reached the consumer's ear (and every
+    sentence in the prefix already cleared the outbound guard, so any figure
+    present is authorized by construction); a completed Mini-Miranda stands
+    by itself. A keyword match alone — "offer", "payments" — is not enough:
+    it is how an announcement of content that never arrived gets closed as
+    though the content had been said.
+    """
+    return bool(extract_figures(spoken_text)) or fires_mini_miranda(spoken_text) is not None
+
+
 @dataclass
 class _Round:
     """What one streamed round produced, beside the sentences it yielded.
@@ -279,17 +292,20 @@ class _Round:
             # on the second attempt.
             if may_rewrite and not spoken and not self.exhausted:
                 return _Outcome.REGENERATE
-            # Something substantive is already in the consumer's ear, and it
-            # stands on its own. The scripted fallback restarts the
-            # conversation, which after a laid-out offer talks over the
-            # proposal instead of recovering from anything; a connective
-            # closes the thought and leaves it.
+            # Something is already in the consumer's ear that stands on its
+            # own. The scripted fallback restarts the conversation, which
+            # after a laid-out offer talks over the proposal instead of
+            # recovering from anything; a connective closes the thought and
+            # leaves it.
             #
-            # Substantive, not merely spoken: "Does that work for you?" asks
-            # about something, and after "Thanks for confirming." there is
-            # nothing for it to refer to — it is then the same non-sequitur
-            # it was brought in to replace, only shorter.
-            if is_substantive(" ".join(spoken)):
+            # Standing on its own, not merely substantive-sounding: a live
+            # call spoke "Here's what I'm able to offer." — the keyword
+            # "offer" reads as substantive, but the sentence only points
+            # forward at terms the guard then blocked, and closing it with
+            # "Does that work for you?" asks about an offer that was never
+            # made. What a connective can close is a figure the consumer
+            # actually heard, or a disclosure that completes by itself.
+            if _stands_on_its_own(" ".join(spoken)):
                 return _Outcome.CONNECTIVE
             return _Outcome.FALLBACK
         # A failed call only falls back if the round said nothing, since a
@@ -1260,6 +1276,25 @@ class NegotiationAgent:
             return None
         return line
 
+    def _agreed_close_line(self) -> str | None:
+        """The agreement restated, when a scripted line must close the call.
+
+        Same three gates as ``_standing_offer_line`` and for the same reason:
+        this line is spoken via ``_speak_verbatim`` and has to be safe by
+        construction. The offer comes from the negotiation's own record of
+        what was agreed, so its figures are authorized — and the render is
+        still put through the guard and dropped if it does not clear.
+        """
+        if self.tools.state.outcome is not CallOutcome.AGREED:
+            return None
+        offer = self.tools.state.agreed_offer
+        if offer is None or not self.guard.identity_confirmed or self.guard.escalated:
+            return None
+        line = agreed_line(offer)
+        if not check_outbound(self.guard, line, authorized=self.authorized).allowed:
+            return None
+        return line
+
     def _fallback_line(self) -> str:
         """The scripted line to speak when a generated one cannot be.
 
@@ -1281,6 +1316,12 @@ class NegotiationAgent:
             # code speaking because the model has already been blocked, so it
             # is the wrong turn to be saying less than the whole thing.
             return f"{AI_DISCLOSURE_WITH_HUMAN} {line}"
+        # Once the consumer has accepted, "what would work for you?" is not a
+        # recovery — it reopens a negotiation that no longer exists, over the
+        # very deal the consumer just said yes to. A live call closed exactly
+        # that way. The scripted line for a closed agreement is the agreement.
+        if (closed := self._agreed_close_line()) is not None:
+            return closed
         # Exactly the second trip. Reading the consumer identical terms on
         # every trip from the second onward is the same circling this exists
         # to break, in a different line. Ranked below the disclosure: an

@@ -71,6 +71,39 @@ def _when(due_day_offset: int) -> str:
     return f"in {due_day_offset} days"
 
 
+def _schedule(offer: Offer) -> str:
+    """The arrangement, rendered for a listener rather than a ledger.
+
+    Three-plus payments on a regular cadence with one repeated amount group
+    into a single figure — "$266.67, then $266.67, then $266.66" read aloud
+    is a wall of near-identical digits, and the grouped form carries the
+    same commitment in the same authorized figures (the payment count is
+    authorized ``1..n`` by ``numeric._from_offer``, "today" is always-allowed
+    deixis). Anything irregular stays itemized: with unequal amounts the
+    offsets are the story, and blurring which amount lands when is worse
+    than repetition.
+    """
+    installments = offer.installments
+    amounts = [i.amount for i in installments]
+    grouped = (
+        len(installments) >= 3
+        and offer.cadence.interval_days > 0
+        and all(
+            i.due_day_offset == n * offer.cadence.interval_days for n, i in enumerate(installments)
+        )
+        and all(a == amounts[0] for a in amounts[:-1])
+    )
+    if grouped:
+        lead = f"{len(installments)} {offer.cadence.value} payments of {amounts[0]}, starting today"
+        if amounts[-1] != amounts[0]:
+            lead += f", with the last at {amounts[-1]}"
+        return f"{lead} — {offer.total} in total"
+    parts = [f"{i.amount} {_when(i.due_day_offset)}" for i in installments]
+    if len(parts) == 1:
+        return parts[0]
+    return f"{parts[0]}, then " + ", then ".join(parts[1:]) + f" — {offer.total} in total"
+
+
 def confirmation_line(offer: Offer) -> str:
     """The canonical repeat-back for an engine-authored offer.
 
@@ -80,13 +113,20 @@ def confirmation_line(offer: Offer) -> str:
     the guard would block is worse than no canonical string, because it trains
     the model to paraphrase its way around a control.
     """
-    parts = [f"{i.amount} {_when(i.due_day_offset)}" for i in offer.installments]
-    if len(parts) == 1:
-        schedule = parts[0]
-    else:
-        schedule = f"{parts[0]}, then " + ", then ".join(parts[1:])
-        schedule += f" — {offer.total} in total"
-    return f"Just to confirm: {schedule}. Should I set that up?"
+    return f"Just to confirm: {_schedule(offer)}. Should I set that up?"
+
+
+def agreed_line(offer: Offer) -> str:
+    """What stands in when a scripted line must speak *after* acceptance.
+
+    The scripted fallback asks "what would work for you?" — a recovery while
+    negotiating, a false record once the consumer has said yes: it reopens a
+    negotiation that no longer exists. This line closes instead, restating
+    the agreement from the same figures ``confirmation_line`` uses, so it
+    clears the guard for the same reason. It deliberately does not ask
+    anything: assent was already given, and re-asking un-agrees the deal.
+    """
+    return f"We're agreed: {_schedule(offer)}. Thank you."
 
 
 def repeats_back(text: str, offer: Offer) -> bool:

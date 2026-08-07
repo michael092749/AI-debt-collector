@@ -528,12 +528,27 @@ _CENTS_SUFFIX_RE = re.compile(r"^[\s-]*cents?\b", re.IGNORECASE)
 _PERCENT_SUFFIX_RE = re.compile(r"^\s*(?:%|per\s*cent\b)", re.IGNORECASE)
 _DURATION_SUFFIX_RE = re.compile(r"^[\s-]*(day|week|month|year)s?\b", re.IGNORECASE)
 _THOUSAND_SUFFIX_RE = re.compile(r"^k\b", re.IGNORECASE)
+# Up to two adjectives may sit between the count and the payment word:
+# a live call promised "four monthly payments" and the anchored form read
+# "four" as a bare number — which only warns — where "four payments" would
+# have blocked. The bridge is a closed adjective list, never ``[a-z]+``:
+# a preposition means the number belongs to something else ("two fifty in
+# monthly payments" is an amount, not 250 payments).
+_PAYMENT_ADJECTIVE = (
+    r"(?:monthly|weekly|bi-?weekly|quarterly|equal|even|separate|small(?:er)?|"
+    r"low(?:er)?|easy|easier|fixed|simple|affordable|manageable|convenient)"
+)
 _PAYMENT_SUFFIX_RE = re.compile(
-    r"^[\s-]*(?:payments?|installments?|checks?|cheques?)\b", re.IGNORECASE
+    rf"^[\s-]*(?:{_PAYMENT_ADJECTIVE}[\s-]+){{0,2}}(?:payments?|installments?|checks?|cheques?)\b",
+    re.IGNORECASE,
 )
 
 _ORDINAL_SUFFIX_RE = re.compile(r"(?:st|nd|rd|th)$", re.IGNORECASE)
-_CONTEXT_CHARS = 24
+# Wide enough for two bridged adjectives and the payment word ("separate
+# smaller payments" is 26 characters). Every prefix pattern is anchored at
+# the window's end and every suffix pattern at its start, so widening the
+# window cannot introduce a match at a distance.
+_CONTEXT_CHARS = 48
 
 # What may sit between the dollars half and the cents half of one amount.
 # Anything else ("$250 and we can talk about the thirty cents") is two

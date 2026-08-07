@@ -314,6 +314,35 @@ class TestFigureExtraction:
         (figure,) = extract_figures("Let me ask you two things.")
         assert figure.kind is FigureKind.BARE
 
+    @pytest.mark.parametrize(
+        ("utterance", "value"),
+        [
+            ("four monthly payments", Decimal(4)),
+            ("four equal payments", Decimal(4)),
+            ("4 monthly installments", Decimal(4)),
+            ("three separate smaller payments", Decimal(3)),
+            ("two equal monthly payments", Decimal(2)),
+        ],
+    )
+    def test_a_modifier_does_not_unclassify_a_payment_count(
+        self, utterance: str, value: Decimal
+    ) -> None:
+        """A live call spoke "I can offer four monthly payments that add up
+        to exactly the one thousand dollars owed" — a payment count no offer
+        authorized. "four payments" classifies and blocks; "four monthly
+        payments" fell through the anchored suffix to a bare number, and a
+        bare 4 only warns. One adjective was the whole difference."""
+        figures = [f for f in extract_figures(utterance) if f.kind is FigureKind.PAYMENT_COUNT]
+        assert [f.value for f in figures] == [value]
+
+    def test_a_preposition_still_separates_money_from_a_payment_count(self) -> None:
+        """ "two fifty in monthly payments" names an amount, not 250
+        payments. Only an adjective may bridge to the payment word — a
+        preposition means the number belongs to something else."""
+        (figure,) = extract_figures("I could do two fifty in monthly payments.")
+        assert figure.kind is FigureKind.MONEY
+        assert figure.value == Decimal(250)
+
     def test_account_identifiers_are_not_treated_as_money(self) -> None:
         (figure,) = extract_figures("the account ending in 4417")
         assert figure.kind is FigureKind.BARE
@@ -385,9 +414,7 @@ class TestFigureExtraction:
         assert Decimal(900) in [
             f.value for f in extract_figures(utterance) if f.kind is FigureKind.MONEY
         ]
-        assert NumericRuleId.UNAUTHORIZED_AMOUNT in rule_ids(
-            check_numeric(utterance, authorized)
-        )
+        assert NumericRuleId.UNAUTHORIZED_AMOUNT in rule_ids(check_numeric(utterance, authorized))
 
 
 class TestNumericAuthorization:
@@ -472,6 +499,24 @@ class TestNumericAuthorization:
             )
             == ()
         )
+
+    def test_a_promised_count_with_an_adjective_is_still_gated(self, policy: PolicyConfig) -> None:
+        """The live-call sentence: with only a two-payment offer on record,
+        "four payments" blocks — and "four monthly payments" must hit the
+        same wall, not slide through as an unverified bare number."""
+        two_payment_offer = Offer(
+            tier=Tier.DOWNPAYMENT_PLUS_ONE,
+            installments=(Installment(Money("250.00"), 0), Installment(Money("750.00"), 30)),
+            cadence=Cadence.MONTHLY,
+        )
+        authorized = authorized_for(policy, offers=(two_payment_offer,))
+        promise = (
+            "I can offer four monthly payments that add up to "
+            "exactly the one thousand dollars owed."
+        )
+        violations = check_numeric(promise, authorized)
+        assert NumericRuleId.UNAUTHORIZED_PAYMENT_COUNT in rule_ids(violations)
+        assert any(v.blocking for v in violations)
 
     def test_account_facts_must_be_authorized_explicitly(self, policy: PolicyConfig) -> None:
         bare = authorized_for(policy)
@@ -1486,9 +1531,7 @@ class TestAcknowledgingCallerStatedAmounts:
         result = check_outbound(heard.state, "Let's say twelve months.")
         assert NumericRuleId.UNAUTHORIZED_DURATION in rule_ids(result.violations)
 
-    def test_an_amount_above_the_balance_is_not_acknowledged(
-        self, ready: GuardrailState
-    ) -> None:
+    def test_an_amount_above_the_balance_is_not_acknowledged(self, ready: GuardrailState) -> None:
         """The echo is bounded by what is already authorized — the balance.
         Nothing the consumer says can widen the guard past the account."""
         heard = check_inbound(ready, "What if I paid you five thousand dollars?")
@@ -1539,9 +1582,7 @@ class TestAcknowledgingCallerStatedAmounts:
         assert escalated.state.escalated
         assert not escalated.state.acknowledged.money
 
-    def test_identity_revocation_clears_what_was_acknowledged(
-        self, ready: GuardrailState
-    ) -> None:
+    def test_identity_revocation_clears_what_was_acknowledged(self, ready: GuardrailState) -> None:
         """Whoever was speaking is not the account holder, so nothing they
         said is the account holder's number."""
         heard = check_inbound(ready, "Sure, I can do four hundred dollars.")

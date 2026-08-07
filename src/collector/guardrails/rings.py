@@ -619,9 +619,7 @@ def check_inbound(state: GuardrailState, utterance: str) -> InboundCheck:
     disclosures = state.disclosures.observe_consumer(utterance)
     turn_index = state.consumer_turns
     acknowledged = state.acknowledged.merged_with(
-        consumer_stated_money(
-            utterance, ceiling=max(state.authorized.money, default=None)
-        )
+        consumer_stated_money(utterance, ceiling=max(state.authorized.money, default=None))
     )
 
     escalation = state.escalation

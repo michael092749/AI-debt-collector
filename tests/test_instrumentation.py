@@ -1220,9 +1220,7 @@ class TestABlockedStreamTellsTheModelWhy:
         agent.open_call()
         list(agent.stream_turn("Yes, this is Dana."))
 
-        spoke_at = max(
-            i for i, m in enumerate(agent.messages) if "account holder" in m.content
-        )
+        spoke_at = max(i for i, m in enumerate(agent.messages) if "account holder" in m.content)
         noted_at = max(i for i, m in enumerate(agent.messages) if m.role == "system")
         assert spoke_at < noted_at, [m.role for m in agent.messages]
 
@@ -1365,9 +1363,7 @@ class TestAZeroSpokenStreamBlockRegenerates:
             )
         assert agent.turns[-1].was_regenerated == bool(actions)
 
-    def test_the_audit_log_says_regenerated_only_when_it_regenerated(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_audit_log_says_regenerated_only_when_it_regenerated(self, tmp_path: Path) -> None:
         """An audit trail that says "blocked" about a turn that was rewritten,
         or "regenerated" about one that was abandoned, is a false record of
         what the guard did."""
@@ -1396,16 +1392,12 @@ class TestAZeroSpokenStreamBlockRegenerates:
         # Nothing substantive was spoken, so the turn is handed to the
         # scripted fallback and the trail says so — the text path's own word
         # for the same situation. See TestTheTrailSaysHowAStreamedTurnClosed.
-        assert abandoned and all(
-            a is GuardrailAction.SAFE_FALLBACK for a in abandoned
-        ), abandoned
+        assert abandoned and all(a is GuardrailAction.SAFE_FALLBACK for a in abandoned), abandoned
 
 
 def _actions(store: AuditStore, agent: NegotiationAgent) -> list[GuardrailAction]:
     return [
-        event.action
-        for event in store.trace(agent.call_id)
-        if isinstance(event, GuardrailTripped)
+        event.action for event in store.trace(agent.call_id) if isinstance(event, GuardrailTripped)
     ]
 
 
@@ -1473,7 +1465,7 @@ class TestABlockAfterRealSpeechClosesTheThought:
         assert not any("garnish" in s for s in spoken), "the block still holds"
 
     def test_a_turn_that_only_said_pleasantries_gets_the_fallback(self) -> None:
-        """"Does that work for you?" asks about something. After "Thanks for
+        """ "Does that work for you?" asks about something. After "Thanks for
         confirming." it is the same non-sequitur it was brought in to
         replace, just shorter — there is no offer standing for it to refer
         to. The gate is substantive speech, not any speech at all.
@@ -1542,6 +1534,46 @@ class TestABlockAfterRealSpeechClosesTheThought:
 
         assert agent.guard.escalated
         assert agent._stream_connective() != CONNECTIVE_TEXT
+
+    def test_an_announcement_with_no_terms_does_not_get_the_connective(self) -> None:
+        """A live call spoke exactly "Here's what I'm able to offer. Does
+        that work for you?" — an announcement of an offer that never
+        arrived, closed as though terms were standing. "offer" is a
+        substantive keyword, but nothing self-standing was said: no figure
+        reached the consumer's ear, and the sentence only points forward at
+        the content the guard then blocked. That prefix has nothing for a
+        connective to close; it takes the honest restart instead.
+        """
+
+        class _AnnouncesThenTripsTheGuard:
+            """Mini-Miranda in one turn, then a contentless announcement
+            followed by a blocked sentence — the live-call shape."""
+
+            def __init__(self) -> None:
+                self.streams = 0
+
+            def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+                return LLMResponse(text=_GREETING)
+
+            def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+                self.streams += 1
+                if self.streams == 1:
+                    yield TextDelta(f"{MINI_MIRANDA_TEXT} ")
+                    yield StreamCompleted(LLMResponse(text=MINI_MIRANDA_TEXT))
+                    return
+                yield TextDelta("Here's what I'm able to offer. ")
+                yield TextDelta("Pay today or we will garnish your wages. ")
+                yield StreamCompleted(LLMResponse(text="..."))
+
+        agent = _agent(llm=_AnnouncesThenTripsTheGuard())
+        agent.open_call()
+        assert MINI_MIRANDA_TEXT in list(agent.stream_turn("Yes, this is Dana."))
+        spoken = list(agent.stream_turn("What are my options?"))
+
+        assert "Here's what I'm able to offer." in spoken
+        assert CONNECTIVE_TEXT not in spoken, "nothing stood for it to close"
+        assert spoken[-1] == SAFE_FALLBACK_TEXT
+        assert not any("garnish" in s for s in spoken), "the block still holds"
 
 
 class _AlwaysBlocked:
@@ -1629,7 +1661,7 @@ class TestRepeatedFallbacksEscalateToTheStandingOffer:
         assert check.allowed, check.violations
 
     def test_a_turn_that_speaks_resets_the_count(self) -> None:
-        """"Consecutive" is the whole point — one fallback early in a call and
+        """ "Consecutive" is the whole point — one fallback early in a call and
         another ten turns later is not an agent going in circles."""
         agent = self._agent_with_an_offer(_AlwaysBlocked())
         first = agent.turn("What are my options?")

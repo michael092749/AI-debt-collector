@@ -19,9 +19,10 @@ from __future__ import annotations
 import pytest
 
 from collector.agent import NegotiationAgent
-from collector.guardrails.confirmation import confirmation_line, repeats_back
+from collector.guardrails.confirmation import agreed_line, confirmation_line, repeats_back
+from collector.guardrails.disclosures import MINI_MIRANDA_TEXT
 from collector.guardrails.numeric import authorized_for, check_numeric
-from collector.guardrails.rings import PreCallContext
+from collector.guardrails.rings import SAFE_FALLBACK_TEXT, PreCallContext
 from collector.llm.base import ToolCall
 from collector.llm.mock_client import MockLLMClient
 from collector.money import Money
@@ -240,3 +241,94 @@ def test_offer_payloads_carry_the_line_to_say() -> None:
     offer = result.offer
     assert offer is not None
     assert result.payload["you_must_confirm"] == confirmation_line(offer)
+
+
+# --------------------------------------------------------------------------
+# 4. Reading a schedule aloud: equal runs group instead of repeating
+
+
+@pytest.fixture
+def penny_split() -> Offer:
+    """$800 as 266.67/266.67/266.66 — the even-allocate shape a live call
+    read out as three near-identical cents amounts in a row."""
+    return Offer(
+        tier=Tier.SETTLEMENT,
+        installments=(
+            Installment(Money("266.67"), 0),
+            Installment(Money("266.67"), 30),
+            Installment(Money("266.66"), 60),
+        ),
+        cadence=Cadence.MONTHLY,
+    )
+
+
+def test_equal_installments_group_instead_of_repeating(penny_split: Offer) -> None:
+    """ "Two hundred sixty-six dollars and sixty-seven cents" three times in
+    a row is a wall of digits to someone listening on a phone. The grouped
+    form says the amount once and names the odd cent out."""
+    line = confirmation_line(penny_split)
+    assert line.count("$266.67") == 1, line
+    assert "3 monthly payments of $266.67" in line
+    assert "$266.66" in line
+    assert "$800.00 in total" in line
+
+
+def test_an_all_equal_schedule_groups_to_one_amount() -> None:
+    offer = Offer(
+        tier=Tier.PAYMENT_PLAN,
+        installments=tuple(Installment(Money("250.00"), n * 30) for n in range(4)),
+        cadence=Cadence.MONTHLY,
+    )
+    line = confirmation_line(offer)
+    assert line.count("$250.00") == 1, line
+    assert "4 monthly payments of $250.00" in line
+    assert "$1,000.00 in total" in line
+
+
+def test_a_grouped_line_still_clears_guard_and_detector(penny_split: Offer) -> None:
+    assert repeats_back(confirmation_line(penny_split), penny_split)
+    authorized = authorized_for(POLICY).with_offer(penny_split)
+    assert check_numeric(confirmation_line(penny_split), authorized) == ()
+
+
+def test_a_two_payment_schedule_stays_itemized() -> None:
+    """With two unequal payments the offsets carry the story; grouping has
+    nothing to compress and would only blur which amount lands when."""
+    offer = Offer(
+        tier=Tier.DOWNPAYMENT_PLUS_ONE,
+        installments=(Installment(Money("250.00"), 0), Installment(Money("750.00"), 30)),
+        cadence=Cadence.MONTHLY,
+    )
+    line = confirmation_line(offer)
+    assert "$250.00 today" in line
+    assert "$750.00 in 30 days" in line
+
+
+# --------------------------------------------------------------------------
+# 5. After acceptance: a blocked close must not reopen the negotiation
+
+
+def test_the_agreed_line_restates_the_terms_without_reasking(penny_split: Offer) -> None:
+    line = agreed_line(penny_split)
+    assert "$266.67" in line
+    assert "$266.66" in line
+    assert not line.rstrip().endswith("?"), "the consumer already said yes"
+    authorized = authorized_for(POLICY).with_offer(penny_split)
+    assert check_numeric(line, authorized) == ()
+
+
+def test_a_blocked_close_after_agreement_does_not_reopen_the_negotiation() -> None:
+    """A live call took the consumer's "Yes.", closed the agreement, had its
+    closing sentence blocked, and spoke the scripted restart — "What would
+    work for you?" — over a deal that had just been made. The scripted line
+    for a closed agreement is the agreement, not a reopened negotiation."""
+    agent, offer = _ready()
+    agent._observe_scripted(MINI_MIRANDA_TEXT)
+    agent._record_spoken(confirmation_line(offer))
+    result = agent._run_tool(ToolCall(name="confirm_agreement", arguments={}))
+    assert result.ok
+    assert agent.tools.state.outcome is CallOutcome.AGREED
+
+    line = agent._fallback_line()
+    assert line != SAFE_FALLBACK_TEXT
+    assert line == agreed_line(offer)
