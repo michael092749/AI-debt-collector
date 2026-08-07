@@ -199,10 +199,19 @@ deployment:
 | Value | Uploaded to LiveKit Cloud |
 |---|---|
 | unset / `off` | **Default.** Nothing. |
-| `diagnostics` | Pipeline traces and agent-server logs. No audio, no transcript. |
+| `diagnostics` | Pipeline traces and agent-server logs. No audio track, no session-report transcript — but **the consumer's words are still uploaded.** See below. |
 | `full` | Everything — audio, transcript, traces, logs (the SDK's own default). |
 
 Use `full` only for a local call with no real consumer. Anything unrecognized records nothing.
+
+⚠️ **`diagnostics` is not a privacy middle ground**, despite `transcript: False` — this table
+said otherwise until it was checked against the SDK. That flag gates only the end-of-session
+chat-history report. Under `traces: True` the SDK attaches the consumer's verbatim utterance
+(`lk.user_transcript`) and the entire serialized conversation (`lk.chat_ctx`) to spans that
+ship on every turn, consulting no recording option. Choosing `diagnostics` means accepting a
+third-party verbatim copy of the call — materially the same decision already declined for
+audio. If you only want latency data, the `turn_latency` log line (`e2e_ms`, `turn_ms`,
+`tts_ttfb_ms`) already provides it with recording off.
 
 ## Storage and retention
 

@@ -230,19 +230,32 @@ def _recording_options() -> bool | RecordingOptions:
     store. ``COLLECTOR_VOICE_RECORDING``:
 
     * unset / ``off`` — **the default.** Nothing is uploaded.
-    * ``diagnostics`` — pipeline traces and agent-server logs, no audio and no
-      transcript. The granular middle ground: it
-      buys the Agent-insights timeline for latency and failures without a
-      third-party copy of the consumer's words.
+    * ``diagnostics`` — no audio track and no session-report transcript, but
+      **it does upload the consumer's words.** See the warning below.
     * ``full`` — everything, i.e. the SDK's own default. Local debugging in
       the Agent Console only.
 
-    The default does not move: this project's ``AuditStore`` is the
-    compliance record, and nothing here collects consent for a second copy of
-    a consumer's speech held by anyone else. ``diagnostics`` is narrower than
-    a full upload, but it is still a
-    product decision to make deliberately, per call deployment — not a
-    default to drift into.
+    ``diagnostics`` is not the privacy middle ground its name suggests, and
+    this docstring claimed for a while that it was. ``transcript: False`` gates
+    only the end-of-session chat-history report (``telemetry/traces.py``); it
+    does not touch the live span pipeline. Under ``traces: True`` the SDK sets
+    ``lk.user_transcript`` to the consumer's verbatim utterance on every
+    user-turn span (``voice/audio_recognition.py``) and ``lk.chat_ctx`` to the
+    entire serialized conversation on every LLM-node span
+    (``voice/generation.py``) — neither consults the recording options. Our
+    ``llm_node`` override is called *by* that wrapper, so it is not exempt.
+
+    So ``diagnostics`` buys the Agent-insights timeline at the price of a
+    third-party verbatim copy of the call: materially the same consent decision
+    already declined for audio, differing only in medium. ``logs: True`` adds a
+    second route the SDK logs transcripts on at DEBUG, which production's INFO
+    floor happens to filter and ``lk agent dev`` does not.
+
+    The default does not move: this project's ``AuditStore`` is the compliance
+    record, and nothing here collects consent for a second copy of a consumer's
+    speech held by anyone else. If the goal is only latency data, note that
+    ``turn_latency`` (``e2e_ms``/``turn_ms``/``tts_ttfb_ms``) is already logged
+    locally and works with recording off.
     """
     mode = os.environ.get("COLLECTOR_VOICE_RECORDING", "off").lower()
     if mode == "full":
