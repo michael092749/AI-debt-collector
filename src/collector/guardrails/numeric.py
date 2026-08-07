@@ -26,7 +26,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import StrEnum
 
@@ -479,6 +479,11 @@ _PAYMENT_SUFFIX_RE = re.compile(
 _ORDINAL_SUFFIX_RE = re.compile(r"(?:st|nd|rd|th)$", re.IGNORECASE)
 _CONTEXT_CHARS = 24
 
+# What may sit between the dollars half and the cents half of one amount.
+# Anything else ("$250 and we can talk about the thirty cents") is two
+# amounts that happen to be adjacent, not one amount said in two parts.
+_CENTS_JOINER_RE = re.compile(r"^[\s,]*(?:and[\s]*)?$", re.IGNORECASE)
+
 # Below this, an unattached number is chatter ("two things"); at or above it, in
 # a call about a $1,000 balance, it is an amount.
 _MONEY_INFERENCE_FLOOR = Decimal(100)
@@ -564,6 +569,62 @@ def _touches_letter_or_underscore(text: str, start: int, end: int) -> bool:
     before = text[start - 1] if start > 0 else ""
     after = text[end] if end < len(text) else ""
     return any(ch.isalpha() or ch == "_" for ch in (before, after) if ch)
+
+
+def _is_cents(figure: Figure) -> bool:
+    """Did this figure get its value from a ``cents`` suffix?
+
+    ``_classify`` widens a cents figure's span to cover the suffix word, so
+    the suffix is in ``figure.text`` — the cheapest reliable discriminator,
+    and one that cannot mistake a plain ``0.30`` for thirty cents.
+    """
+    return "cent" in figure.text.lower()
+
+
+def _compose_dollars_and_cents(text: str, figures: list[Figure]) -> list[Figure]:
+    """Fold "two hundred fifty dollars and thirty cents" into one $250.30.
+
+    Spoken aloud, a cents amount is two number words, and the two halves are
+    found by *different* parser passes ("$250" by the digit regex, "thirty
+    cents" by the word regex) — so this is a pass over the assembled list
+    rather than something the extraction loop could do inline.
+
+    Without it the guard compares 250 and 0.30 separately against an
+    authorized set holding 250.30, and blocks the agent for stating the
+    engine's own installment correctly.
+    """
+    composed: list[Figure] = []
+    figures = sorted(figures, key=lambda f: f.start)
+    index = 0
+    while index < len(figures):
+        current = figures[index]
+        following = figures[index + 1] if index + 1 < len(figures) else None
+        if (
+            following is not None
+            and current.kind is FigureKind.MONEY
+            and following.kind is FigureKind.MONEY
+            and current.value is not None
+            and following.value is not None
+            # Whole dollars only: "$250.50 and thirty cents" is not one amount.
+            and current.value == current.value.to_integral_value()
+            and not _is_cents(current)
+            and _is_cents(following)
+            and _CENTS_JOINER_RE.match(text[current.end : following.start]) is not None
+        ):
+            composed.append(
+                replace(
+                    current,
+                    text=text[current.start : following.end],
+                    end=following.end,
+                    value=current.value + following.value,
+                    suspicious=current.suspicious or following.suspicious,
+                )
+            )
+            index += 2
+            continue
+        composed.append(current)
+        index += 1
+    return composed
 
 
 def extract_figures(text: str) -> tuple[Figure, ...]:
@@ -666,7 +727,7 @@ def extract_figures(text: str) -> tuple[Figure, ...]:
                 )
             )
 
-    return tuple(sorted(figures, key=lambda f: f.start))
+    return tuple(_compose_dollars_and_cents(text, figures))
 
 
 # -- the check -------------------------------------------------------------

@@ -311,6 +311,42 @@ class TestFigureExtraction:
         (figure,) = extract_figures("the account ending in 4417")
         assert figure.kind is FigureKind.BARE
 
+    @pytest.mark.parametrize(
+        ("utterance", "expected"),
+        [
+            ("two hundred fifty dollars and thirty cents", Decimal("250.30")),
+            ("$250 and thirty cents", Decimal("250.30")),
+            ("250 dollars and 30 cents", Decimal("250.30")),
+            ("two hundred fifty dollars, thirty cents", Decimal("250.30")),
+            ("eight hundred dollars and five cents", Decimal("800.05")),
+        ],
+    )
+    def test_dollars_and_cents_compose_into_one_figure(
+        self, utterance: str, expected: Decimal
+    ) -> None:
+        """ "$250.30" spoken aloud is two number words, and the guard was
+        reading them as two figures — neither of which is the authorized
+        250.30, so an exactly-correct restatement of the engine's own
+        installment got blocked."""
+        (figure,) = [f for f in extract_figures(utterance) if f.kind is FigureKind.MONEY]
+        assert figure.value == expected
+
+    @pytest.mark.parametrize(
+        "utterance",
+        [
+            "I'll pay $250 and we can talk about the thirty cents later.",
+            "That's $250.50 and thirty cents of interest.",
+            "Thirty cents on the dollar is all I can do.",
+        ],
+    )
+    def test_unrelated_cents_are_not_folded_into_a_neighbouring_amount(
+        self, utterance: str
+    ) -> None:
+        """Composition is adjacency-gated: only whitespace, a comma or "and"
+        may sit between the two halves, and the dollars side must be whole."""
+        values = [f.value for f in extract_figures(utterance) if f.kind is FigureKind.MONEY]
+        assert Decimal("250.30") not in values
+
 
 class TestNumericAuthorization:
     def test_spelled_out_number_is_blocked_exactly_like_digits(self) -> None:
@@ -658,6 +694,21 @@ class TestNumericAuthorization:
         for utterance in ("I could probably do a grand today.", "Just a G and we're square."):
             (figure,) = [f for f in extract_figures(utterance) if f.kind is FigureKind.MONEY]
             assert figure.value == Decimal(1000)
+
+    def test_an_authorized_amount_spoken_with_cents_is_not_blocked(self) -> None:
+        """The engine authorized 250.30; the agent said it correctly, out loud,
+        the only way it can be said out loud — and the guard blocked it. A
+        false positive on the engine's *own* figure, which is the failure mode
+        that gets a guardrail switched off in production."""
+        authorized = AuthorizedFigures(money=frozenset({Decimal("250.30")}))
+        assert check_numeric("That's two hundred fifty dollars and thirty cents.", authorized) == ()
+
+    def test_composition_does_not_launder_an_unauthorized_amount(self) -> None:
+        """Composing must not become a way to say a figure nobody authorized:
+        the composed value is checked, not its halves."""
+        authorized = AuthorizedFigures(money=frozenset({Decimal(250), Decimal("0.30")}))
+        violations = check_numeric("Two hundred fifty dollars and thirty cents.", authorized)
+        assert [v.rule_id for v in violations] == [NumericRuleId.UNAUTHORIZED_AMOUNT]
 
     def test_two_word_per_cent_is_a_percent_not_a_bare_number(self, policy: PolicyConfig) -> None:
         """ "per cent" (two words) previously downgraded an unauthorized
