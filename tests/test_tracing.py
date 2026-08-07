@@ -30,7 +30,7 @@ from opentelemetry.sdk.trace.export import (
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from collector import tracing
-from collector.agent import CallReport, NegotiationAgent
+from collector.agent import CallReport, NegotiationAgent, _Round
 from collector.audit.store import AuditStore
 from collector.guardrails.disclosures import AI_DISCLOSURE_TEXT, DisclosureId
 from collector.guardrails.rings import PreCallContext
@@ -243,7 +243,7 @@ class TestEveryLayerReachesTheTrace:
                 arguments={"payment_count": 2, "cadence": "monthly", "total": "500.00"},
             )
         )
-        agent._guard_sentence("Pay today or we will garnish your wages.")
+        agent._guard_sentence("Pay today or we will garnish your wages.", _Round())
 
         assert {"llm_call", "tool_call", "decision", "guardrail_trip"} <= _names(spans)
 
@@ -393,7 +393,8 @@ class TestEveryLayerReachesTheTrace:
     ) -> None:
         agent = _agent()
         agent.open_call()
-        blocked = agent._guard_sentence("Pay today or we will garnish your wages.")
+        round_ = _Round()
+        blocked = agent._guard_sentence("Pay today or we will garnish your wages.", round_)
         # One span per blocking rule: the threat, the unauthorized figure and
         # the missing Mini-Miranda all fire on that one sentence.
         trips = _named(spans, "guardrail_trip")
@@ -406,6 +407,11 @@ class TestEveryLayerReachesTheTrace:
             assert span.attributes["collector.guardrail.action"] == "blocked"
             assert span.attributes["collector.guardrail.rule_id"]
             assert "garnish" not in str(span.attributes)
+
+        # The blocked text and the guard's account of it come back on the
+        # round, which is how the caller both aborts and tells the model why.
+        assert round_.blocked is not None
+        assert round_.note is not None and "THREAT" in round_.note
 
 
 # ==========================================================================

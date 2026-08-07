@@ -1039,6 +1039,64 @@ class TestStreamingTurn:
         assert spoken[-1] == SAFE_FALLBACK_TEXT
 
 
+def _notes(agent: NegotiationAgent) -> list[str]:
+    """The guard's notes back to the model — every system message except the
+    system prompt itself, which is always ``messages[0]``."""
+    return [m.content for m in agent.messages[1:] if m.role == "system"]
+
+
+class _ThreateningStreamer:
+    """Speaks one clean sentence, then one the prohibited-language ring blocks."""
+
+    def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+        return LLMResponse(text=_GREETING)
+
+    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        yield TextDelta("Am I speaking with the account holder? ")
+        yield TextDelta("Pay today or we will garnish your wages. ")
+        yield StreamCompleted(LLMResponse(text="..."))
+
+
+class TestABlockedStreamTellsTheModelWhy:
+    """The text path names the violation back to the model and the next
+    generation is informed by it (``_guard_and_speak``). The streaming path
+    threw that away: it aborted, spoke a scripted line, and left the message
+    history looking exactly as it did before — so the model's next turn had
+    no reason not to reach for the same blocked phrasing again.
+    """
+
+    def test_the_violation_reason_reaches_the_message_history(self) -> None:
+        agent = _agent(llm=_ThreateningStreamer())
+        agent.open_call()
+        list(agent.stream_turn("Yes, this is Dana."))
+
+        notes = _notes(agent)
+        assert notes, "the model was told nothing about why it was cut off"
+        assert "THREAT" in notes[-1]
+        assert "garnish" in notes[-1], "name the phrasing that was blocked"
+
+    def test_the_note_follows_what_was_actually_spoken(self) -> None:
+        """History order is what the next round reads. A note about a blocked
+        sentence filed *before* the sentences that were spoken reads as though
+        the spoken ones were the problem."""
+        agent = _agent(llm=_ThreateningStreamer())
+        agent.open_call()
+        list(agent.stream_turn("Yes, this is Dana."))
+
+        spoke_at = max(
+            i for i, m in enumerate(agent.messages) if "account holder" in m.content
+        )
+        noted_at = max(i for i, m in enumerate(agent.messages) if m.role == "system")
+        assert spoke_at < noted_at, [m.role for m in agent.messages]
+
+    def test_a_clean_turn_leaves_no_note(self) -> None:
+        agent = _agent()
+        agent.open_call()
+        list(agent.stream_turn("Yes, this is Dana."))
+
+        assert not _notes(agent)
+
+
 class TestTurnScopedDisclosuresOnTheStreamingPath:
     """The disclosure rules ask what the *turn* said. Applied one sentence at a
     time they quietly become "what the *first* sentence said", which is a

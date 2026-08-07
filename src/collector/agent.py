@@ -212,6 +212,8 @@ class _Round:
 
     response: LLMResponse | None = None
     blocked: str | None = None
+    # Why it was blocked, in the guard's own words, for the model to read.
+    note: str | None = None
 
     @property
     def failed(self) -> bool:
@@ -410,6 +412,12 @@ class NegotiationAgent:
         blocked: list[str] = []
         results: list[ToolResult] = []
         transcribed = 0
+        # The round whose block the model still has to be told about. Flushed
+        # at the end of the turn rather than the moment it happens, so the
+        # note trails the speech it is about: message order is what the next
+        # round reads, and a note filed ahead of the sentences that *were*
+        # spoken reads as though those were the problem.
+        pending_note: _Round | None = None
         # Set when a tool closed the call. One more round is still owed: the
         # consumer has to hear the arrangement read back, and a turn that ends
         # the call in silence is a dead line, not a goodbye.
@@ -424,6 +432,7 @@ class NegotiationAgent:
 
                 if round_.blocked is not None:
                     blocked.append(round_.blocked)
+                    pending_note = round_
                 if round_.needs_fallback(spoken):
                     fallback = self._stream_fallback()
                     spoken.append(fallback)
@@ -451,6 +460,8 @@ class NegotiationAgent:
                 yield fallback
         finally:
             self._transcribe(spoken, transcribed)
+            if pending_note is not None:
+                self._note_block(pending_note)
             self.turns.append(
                 AgentTurn(
                     consumer=consumer_utterance,
@@ -497,9 +508,8 @@ class NegotiationAgent:
                             if self._owes_a_disclosure(held):
                                 continue
                             candidate, held = held, ""
-                            allowed = self._guard_sentence(candidate)
+                            allowed = self._guard_sentence(candidate, round_)
                             if allowed is None:
-                                round_.blocked = candidate
                                 return
                             yield allowed
                     case StreamCompleted():
@@ -513,10 +523,8 @@ class NegotiationAgent:
             # the whole chunk gets judged on that.
             tail = f"{held} {buffer.strip()}".strip() if held else buffer.strip()
             if tail:
-                allowed = self._guard_sentence(tail)
-                if allowed is None:
-                    round_.blocked = tail
-                else:
+                allowed = self._guard_sentence(tail, round_)
+                if allowed is not None:
                     yield allowed
         finally:
             if round_.response is None:
@@ -536,6 +544,33 @@ class NegotiationAgent:
                         )
                     )
                 )
+
+    def _note_block(self, round_: _Round) -> None:
+        """Tell the model what the guard stopped, and why.
+
+        The text path has always done this (``_guard_and_speak``) and its next
+        generation is informed by it. The streaming path aborted silently: the
+        message history after a block looked exactly as it did before, so
+        nothing discouraged the model from reaching for the same blocked
+        phrasing on the next turn — and it did, repeatedly.
+
+        Worded for the streaming contract rather than reusing the text path's
+        line, which promises the consumer heard nothing. Mid-stream that is
+        only true of the blocked sentence itself.
+        """
+        if round_.note is None or round_.blocked is None:
+            return
+        self.messages.append(
+            Message(
+                role="system",
+                content=(
+                    "The guard stopped this before it was synthesized, so the consumer "
+                    f'did not hear it: "{round_.blocked.strip()}" — {round_.note}. '
+                    "Do not say that again in any wording, and do not restate any "
+                    "figure the engine has not returned."
+                ),
+            )
+        )
 
     def _owes_a_disclosure(self, candidate: str) -> bool:
         """Does a disclosure rule complain about ``candidate`` being unfinished?
@@ -558,8 +593,12 @@ class NegotiationAgent:
         """
         return bool(self.guard.disclosures.check_agent_turn(candidate))
 
-    def _guard_sentence(self, sentence: str) -> str | None:
+    def _guard_sentence(self, sentence: str, round_: _Round) -> str | None:
         """The pre-TTS gate for one sentence. ``None`` means do not speak it.
+
+        A block lands on ``round_`` — the text that was stopped and the guard's
+        own account of why — because the caller is what decides between
+        aborting and retrying, and both need the reason.
 
         Records the trip as ``BLOCKED`` rather than ``REGENERATED``: on the
         streaming path there is no retry, and an audit log that says
@@ -567,6 +606,7 @@ class NegotiationAgent:
         """
         candidate = sentence.strip()
         if not candidate:
+            round_.blocked = sentence
             return None
 
         check = check_outbound(self.guard, candidate, authorized=self.authorized)
@@ -582,6 +622,8 @@ class NegotiationAgent:
             )
             return candidate
 
+        round_.blocked = sentence
+        round_.note = check.regeneration_note()
         for violation in check.blocking_violations:
             self._record(
                 GuardrailTripped(
