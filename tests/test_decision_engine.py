@@ -51,6 +51,13 @@ class TestMoney:
         total = sum((Money("333.33"), Money("333.33"), Money("333.34")), Money(0))
         assert total == Money("1000.00")
 
+    @pytest.mark.parametrize("value", ["NaN", "nan", "Infinity", "-Infinity", "inf"])
+    def test_rejects_non_finite_values(self, value: str) -> None:
+        """A quiet NaN previously quantized without trapping and crashed the
+        engine two calls downstream (ADVERSARIAL_TESTING.md C8)."""
+        with pytest.raises(ValueError, match="non-finite"):
+            Money(value)
+
 
 class TestFullPayment:
     def test_accepts_full_balance_in_one_payment(
@@ -58,9 +65,7 @@ class TestFullPayment:
     ) -> None:
         from collector.decision_engine import validate_offer
 
-        proposal = ConsumerProposal(
-            total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE
-        )
+        proposal = ConsumerProposal(total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE)
         verdict = validate_offer(proposal, fresh, policy)
 
         assert verdict.outcome == "accept"
@@ -74,9 +79,7 @@ class TestFullPayment:
         research report - it is what proves the engine decided, not the model."""
         from collector.decision_engine import validate_offer
 
-        proposal = ConsumerProposal(
-            total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE
-        )
+        proposal = ConsumerProposal(total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE)
         verdict = validate_offer(proposal, fresh, policy)
 
         assert len(verdict.conditions) > 0
@@ -90,17 +93,13 @@ class TestFullPayment:
     ) -> None:
         from collector.decision_engine import validate_offer
 
-        proposal = ConsumerProposal(
-            total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE
-        )
+        proposal = ConsumerProposal(total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE)
         assert validate_offer(proposal, fresh, policy).counter is None
 
     def test_verdict_is_frozen(self, policy: PolicyConfig, fresh: NegotiationState) -> None:
         from collector.decision_engine import validate_offer
 
-        proposal = ConsumerProposal(
-            total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE
-        )
+        proposal = ConsumerProposal(total=Money("1000"), payment_count=1, cadence=Cadence.IMMEDIATE)
         verdict = validate_offer(proposal, fresh, policy)
         with pytest.raises(AttributeError):
             verdict.outcome = "reject"  # type: ignore[misc]
@@ -192,10 +191,198 @@ class TestRejectionAndCounter:
         assert isinstance(verdict.rationale_code, RationaleCode)
 
     def test_settlement_boundary(self, policy: PolicyConfig, fresh: NegotiationState) -> None:
+        """$799.99 is below the floor at every tier; $800.00 is a legal
+        settlement — legal, but only agreeable once the ladder has reached T3."""
         from collector.decision_engine import validate_offer
 
         assert validate_offer(_propose("799.99", 1), fresh, policy).outcome == "reject"
-        assert validate_offer(_propose("800.00", 1), fresh, policy).outcome == "accept"
+        settled = fresh.conceded_to(Tier.SETTLEMENT)
+        assert validate_offer(_propose("800.00", 1), settled, policy).outcome == "accept"
+
+
+# --------------------------------------------------------------------------
+# T2b - the ladder anchors the negotiation
+#
+# The tiers are a preference order, not a menu. A consumer naming a low figure
+# must not thereby collect every concession the ladder had left to give.
+# --------------------------------------------------------------------------
+
+
+def _at(tier: Tier, policy: PolicyConfig) -> NegotiationState:
+    """A call that has already conceded its way down to ``tier``."""
+    return NegotiationState.opening(policy).conceded_to(tier)
+
+
+class TestLadderAnchoring:
+    def test_a_legal_bottom_tier_proposal_is_countered_not_taken_on_turn_one(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """'$250 a month for four months' is policy-legal and the worst outcome
+        on the list. Nothing has been refused, so it is countered at the top."""
+        from collector.decision_engine import validate_offer
+
+        verdict = validate_offer(_propose("1000", 4, capacity="250"), fresh, policy)
+
+        assert verdict.outcome == "counter"
+        assert verdict.counter is not None
+        assert verdict.counter.tier is Tier.PAY_IN_FULL
+        _assert_offer_is_legal(verdict.counter, policy)
+
+    def test_the_ladder_failure_is_named_as_a_condition_and_a_rationale_code(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """A counter with six passing conditions and no failure would leave the
+        audit trail unable to say why. LADDER is that condition."""
+        from collector.decision_engine import RationaleCode, RuleId, validate_offer
+
+        verdict = validate_offer(_propose("1000", 4, capacity="250"), fresh, policy)
+
+        failed = [c for c in verdict.conditions if not c.passed]
+        assert [c.rule_id for c in failed] == [RuleId.LADDER]
+        assert verdict.rationale_code is RationaleCode.PREFERRED_TIER_AVAILABLE
+
+    def test_a_substantive_failure_outranks_the_ladder_in_the_rationale(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """'$77 a week' fails the floor. Say that, not 'we would prefer more'."""
+        from collector.decision_engine import RationaleCode, validate_offer
+
+        verdict = validate_offer(_propose("1000", 13, Cadence.WEEKLY), fresh, policy)
+        assert verdict.rationale_code is RationaleCode.BELOW_MIN_PAYMENT
+
+    def test_a_low_capacity_signal_does_not_skip_the_ladder(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """Naming '$77 at a time' used to hand back a four-payment plan — every
+        concession on the ladder, spent in one turn, for nothing."""
+        from collector.decision_engine import validate_offer
+
+        verdict = validate_offer(_propose("1000", 13, Cadence.WEEKLY, capacity="77"), fresh, policy)
+
+        assert verdict.counter is not None
+        assert verdict.counter.tier is Tier.PAY_IN_FULL
+
+    def test_each_tier_costs_exactly_one_refusal(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        from collector.decision_engine import build_counter
+
+        state = fresh
+        walked = [build_counter(state, policy).tier]
+        for _ in range(3):
+            state = state.record_refusal().advance_ladder()
+            walked.append(build_counter(state, policy).tier)
+
+        assert walked == [
+            Tier.PAY_IN_FULL,
+            Tier.DOWNPAYMENT_PLUS_ONE,
+            Tier.SETTLEMENT,
+            Tier.PAYMENT_PLAN,
+        ]
+
+    @pytest.mark.parametrize(
+        ("tier", "total", "count"),
+        [
+            (Tier.PAY_IN_FULL, "1000", 1),
+            (Tier.DOWNPAYMENT_PLUS_ONE, "1000", 2),
+            (Tier.SETTLEMENT, "850", 3),
+            (Tier.PAYMENT_PLAN, "1000", 4),
+        ],
+    )
+    def test_a_proposal_at_the_floor_is_accepted(
+        self, tier: Tier, total: str, count: int, policy: PolicyConfig
+    ) -> None:
+        """The ladder gates what we *offer*; once it has arrived at a tier, a
+        proposal there is agreeable."""
+        from collector.decision_engine import validate_offer
+
+        verdict = validate_offer(_propose(total, count), _at(tier, policy), policy)
+        assert verdict.outcome == "accept"
+        assert verdict.tier is tier
+
+    def test_a_proposal_better_than_the_floor_is_always_accepted(
+        self, policy: PolicyConfig
+    ) -> None:
+        """A4 runs one way. Someone at the bottom of the ladder who offers to
+        clear it outright is taken at their word, not countered."""
+        from collector.decision_engine import validate_offer
+
+        verdict = validate_offer(_propose("1000", 1), _at(Tier.PAYMENT_PLAN, policy), policy)
+        assert verdict.outcome == "accept"
+        assert verdict.tier is Tier.PAY_IN_FULL
+
+    def test_terms_repeated_through_a_counter_are_taken(self, policy: PolicyConfig) -> None:
+        """The ladder asks once for better. It does not hold out forever.
+
+        A consumer walked down to settlement who still cannot manage $266.67 a
+        month has nowhere left to go: the agent may not raise its own ask from
+        $800 back to $1,000 (``_concede``), so without this their own legal
+        four-payment plan — worth $200 more to us than the settlement — is
+        unreachable by any path and the account is simply lost.
+        """
+        from collector.decision_engine import validate_offer
+
+        state = _at(Tier.SETTLEMENT, policy)
+        theirs = _propose("1000", 4, capacity="250")
+
+        first = validate_offer(theirs, state, policy)
+        assert first.outcome == "counter", "the better ask comes first"
+
+        state = state.record_round(theirs, first.counter, first.rationale_code)
+        again = validate_offer(theirs, state, policy)
+        assert again.outcome == "accept"
+        assert again.tier is Tier.PAYMENT_PLAN
+
+    def test_an_illegal_proposal_does_not_unlock_its_tier(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """ "Can I pay $77 a week?" is a plan-shaped proposal, refused on the
+        payment floor. The "$250 a month" that follows is a different offer, not
+        terms held to — it gets the ladder's counter like any other first ask."""
+        from collector.decision_engine import validate_offer
+
+        weekly = _propose("1000", 13, Cadence.WEEKLY)
+        first = validate_offer(weekly, fresh, policy)
+        state = fresh.record_round(weekly, first.counter, first.rationale_code)
+
+        assert validate_offer(_propose("1000", 4), state, policy).outcome == "counter"
+
+    def test_terms_sharpened_after_a_counter_do_not_count_as_holding_to_them(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """ "Settle at $900" answered with a counter must not become "$800,
+        then" — that is the ladder talking us down $100, which is the opposite
+        of what it is for."""
+        from collector.decision_engine import validate_offer
+
+        nine = _propose("900", 2)
+        first = validate_offer(nine, fresh, policy)
+        state = fresh.record_round(nine, first.counter, first.rationale_code)
+
+        assert validate_offer(_propose("800", 2), state, policy).outcome == "counter"
+        assert validate_offer(nine, state, policy).outcome == "accept", "$900 was held to"
+
+    def test_a_repeat_does_not_excuse_an_illegal_proposal(self, policy: PolicyConfig) -> None:
+        """Holding out is not a way through the policy floors. Only the ladder
+        condition is satisfied by repetition; every other rule still binds."""
+        from collector.decision_engine import validate_offer
+
+        state = _at(Tier.SETTLEMENT, policy)
+        theirs = _propose("500", 1)
+        state = state.record_round(theirs, None, None)
+
+        assert validate_offer(theirs, state, policy).outcome == "reject"
+
+    def test_the_discount_cannot_be_had_by_asking_for_it(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """A3: the 20% is conceded to, never fallen into."""
+        from collector.decision_engine import validate_offer
+
+        verdict = validate_offer(_propose("800", 1), fresh, policy)
+        assert verdict.outcome == "counter"
+        assert verdict.counter is not None
+        assert verdict.counter.total == policy.original_balance
 
 
 # --------------------------------------------------------------------------
@@ -243,6 +430,41 @@ class TestDownpaymentPlusOne:
         assert verdict.counter.smallest_payment >= policy.min_payment
         _assert_offer_is_legal(verdict.counter, policy)
 
+    def test_a_low_first_offer_is_answered_at_the_top_of_the_ladder(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """ "$400" on turn one buys no concession at all.
+
+        This used to counter $400 down and then $600 — a figure they had just
+        said they could not manage — because capacity picked the tier. It now
+        picks only the schedule, and on turn one the tier is still T1.
+        """
+        from collector.decision_engine import validate_offer
+
+        verdict = validate_offer(_propose("400", 1), fresh, policy)
+
+        assert verdict.counter is not None
+        assert verdict.counter.tier is Tier.PAY_IN_FULL
+        assert verdict.counter.total == Money("1000.00"), (
+            "no refusal on record yet, so the discount is unearned: total stays at the balance"
+        )
+        _assert_offer_is_legal(verdict.counter, policy)
+
+    def test_a_tier_that_cannot_hold_their_capacity_is_still_offered_at_its_floor(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """No two-payment split of $1,000 clears $400 twice, so T2 asks for more
+        than they signalled. That is the tier being what it is, and it is theirs
+        to refuse — which is what earns the step to a structure that fits."""
+        from collector.decision_engine import build_counter
+
+        offer = build_counter(
+            fresh.conceded_to(Tier.DOWNPAYMENT_PLUS_ONE), policy, capacity=Money("400")
+        )
+
+        assert [i.amount for i in offer.installments] == [Money("400"), Money("600")]
+        _assert_offer_is_legal(offer, policy)
+
 
 # --------------------------------------------------------------------------
 # T4 - Tier 3: settlement, up to 20% off, max 3 payments
@@ -255,7 +477,7 @@ class TestSettlement:
     ) -> None:
         from collector.decision_engine import validate_offer
 
-        verdict = validate_offer(_propose("900", 2), fresh, policy)
+        verdict = validate_offer(_propose("900", 2), fresh.conceded_to(Tier.SETTLEMENT), policy)
         assert verdict.outcome == "accept"
         assert verdict.tier is Tier.SETTLEMENT
 
@@ -288,6 +510,26 @@ class TestSettlement:
         assert verdict.counter is not None
         assert verdict.counter.payment_count <= 3 or verdict.counter.tier is not Tier.SETTLEMENT
 
+    def test_a_capacity_read_off_a_proposal_never_raises_the_one_they_stated(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """They said $300. Then they asked to settle at $700 in one payment.
+
+        A lump sum they are asking us to *accept* is not a statement about what
+        they can produce, and reading $700 back as capacity built the counter
+        against a figure they never offered: $400/$400 to someone who had twice
+        said $300. Inference is evidence of a ceiling, never of a floor.
+        """
+        from collector.decision_engine import validate_offer
+
+        state = fresh.conceded_to(Tier.SETTLEMENT).with_capacity(Money("300"))
+        verdict = validate_offer(_propose("700", 1, Cadence.IMMEDIATE), state, policy)
+
+        assert verdict.outcome == "reject"
+        assert verdict.counter is not None
+        assert verdict.counter.installments[0].amount == Money("300.00")
+        _assert_offer_is_legal(verdict.counter, policy)
+
     def test_installments_sum_exactly_no_decimal_drift(self, policy: PolicyConfig) -> None:
         from collector.decision_engine import build_counter
         from collector.negotiation import NegotiationState as NS
@@ -309,10 +551,16 @@ class TestPaymentPlan:
         self, policy: PolicyConfig, fresh: NegotiationState
     ) -> None:
         """§2.3 rule 1. 13 weekly payments of ~$77 is below the $250 floor.
-        The engine must counter with a legal structure, not accommodate it."""
+        The engine must counter with a legal structure, not accommodate it.
+
+        Read at the bottom of the ladder, where a plan is what is on the table:
+        earlier than that the counter is whichever tier the ladder stands on,
+        which is the subject of ``TestLadderAnchoring``.
+        """
         from collector.decision_engine import validate_offer
 
-        verdict = validate_offer(_propose("1000", 13, Cadence.WEEKLY), fresh, policy)
+        state = fresh.conceded_to(Tier.PAYMENT_PLAN)
+        verdict = validate_offer(_propose("1000", 13, Cadence.WEEKLY), state, policy)
         assert verdict.outcome == "reject"
         assert verdict.counter is not None
         assert verdict.counter.payment_count == 4
@@ -335,14 +583,33 @@ class TestPaymentPlan:
     ) -> None:
         from collector.decision_engine import validate_offer
 
-        verdict = validate_offer(_propose("1000", 3, Cadence.MONTHLY), fresh, policy)
+        state = fresh.conceded_to(Tier.PAYMENT_PLAN)
+        verdict = validate_offer(_propose("1000", 3, Cadence.MONTHLY), state, policy)
         assert verdict.outcome == "accept"
         assert verdict.tier is Tier.PAYMENT_PLAN
 
-    def test_plan_carries_no_discount(self, policy: PolicyConfig, fresh: NegotiationState) -> None:
-        """A3: only settlements discount. A 3-payment plan at $900 is a
-        settlement, not a plan."""
+    def test_stated_downpayment_leads_the_plan_and_the_rest_splits_evenly(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """$400 on the table is $400 taken: the plan opens with what they
+        offered and spreads the remaining $600 over two more payments. Money
+        sooner beats a tidier $333.34/$333.33/$333.33, and it still totals the
+        balance."""
         from collector.decision_engine import validate_offer
 
-        verdict = validate_offer(_propose("900", 3), fresh, policy)
+        state = fresh.conceded_to(Tier.PAYMENT_PLAN)
+        verdict = validate_offer(_propose("400", 1), state, policy)
+
+        assert verdict.counter is not None
+        amounts = [i.amount for i in verdict.counter.installments]
+        assert amounts == [Money("400"), Money("300"), Money("300")]
+        assert verdict.counter.tier is Tier.PAYMENT_PLAN
+
+    def test_plan_carries_no_discount(self, policy: PolicyConfig, fresh: NegotiationState) -> None:
+        """A3: only settlements discount. A 3-payment plan at $900 is a
+        settlement, not a plan — however far down the ladder it is proposed."""
+        from collector.decision_engine import classify, validate_offer
+
+        assert classify(_propose("900", 3), policy) is Tier.SETTLEMENT
+        verdict = validate_offer(_propose("900", 3), fresh.conceded_to(Tier.PAYMENT_PLAN), policy)
         assert verdict.tier is Tier.SETTLEMENT

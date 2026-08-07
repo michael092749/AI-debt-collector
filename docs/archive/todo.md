@@ -1,6 +1,6 @@
 # TODO — Decision Engine (SPEC steps 1–2)
 
-Plan: `plan.md` · Spec: `../SPEC.md`
+Plan: `plan.md` · Spec: `../../SPEC.md`
 **Status: engine complete.** 48 tests green · ruff clean · `mypy --strict` clean on all 5 core modules.
 
 ## Done
@@ -64,10 +64,36 @@ Test asserts the rule, not the example.
   - [x] `escalate()` deliberately reachable from any state — safety valve, per A6
   - [x] Round cap (`max_negotiation_rounds=8`, new in `PolicyConfig`) — unbounded
         haggling is badgering however politely phrased
-- [ ] Step 4 — `guardrails/`: prohibited persuasion, numeric authorization, disclosures, escalation
-- [ ] Step 5 — `audit/`: SQLite + agreement record with decision trail
-- [ ] Step 6 — `llm/mock_client.py`, `tools.py`, `agent.py`, `text_app.py`
-- [ ] Step 7 — `llm/anthropic_client.py`
-- [ ] Step 8 — `tests/evals/`: adversarial certification
-- [ ] Step 9 — `voice_app.py`: LiveKit pipeline
-- [ ] Step 10 — README
+- [x] **Step 4 — `guardrails/`: prohibited persuasion, numeric authorization, disclosures, escalation** (124 tests)
+- [x] **Step 5 — `audit/`: SQLite + agreement record with decision trail** (36 tests)
+- [x] **Step 6/7 — `llm/mock_client.py`, `tools.py`, `agent.py`, `text_app.py`, `llm/anthropic_client.py`** (43 tests)
+- [x] **Step 8 — `tests/evals/`: adversarial certification**
+  - [x] `personas.py` — all eight SPEC §7.2 personas, each with live `instructions` and a
+        deterministic `fallback_script`
+  - [x] `simulator.py` — live Claude-as-consumer when a key is configured, scripted replay
+        otherwise, decided once by whether `AnthropicClient()` constructs
+  - [x] `test_scenarios.py` — transcript-level invariants (no prohibited phrase, no
+        unauthorized figure, no sub-floor agreement, disclosure ordering, escalation
+        where expected/forbidden, identity gating, overall compliance) parametrized
+        over all eight personas
+  - [x] Verified non-vacuous: `evasive` produces 6 agent lines with identity never
+        confirmed (real assertions, not an early `return`); every persona reaches a
+        terminal outcome offline
+  - **Caveat, not a defect**: offline (no key) the consumer is `MockLLMClient`-driven
+    end-to-end, and the mock only ever reads figures back from engine-authored offers —
+    so `test_no_unauthorized_figure_is_ever_spoken` is structurally guaranteed to pass
+    without a key, not just observed to pass. The invariant only gets genuinely
+    adversarial pressure in live mode (`ANTHROPIC_API_KEY` set). README's Tier-2
+    description already says this; noted here so it isn't mistaken for full offline
+    certification.
+- [x] **Step 9 — `voice_app.py`: LiveKit pipeline** — `llm_node` overridden to bypass the
+      framework's own LLM/function-calling and hand the transcribed utterance straight to
+      `NegotiationAgent.turn()`; Deepgram STT / Cartesia TTS are the framework's. Verified:
+      clean `mypy --strict` (22 source files) and `import collector.voice_app` succeeds.
+      Not verified: an actual LiveKit room/call (needs `LIVEKIT_*` + `DEEPGRAM_API_KEY` +
+      `CARTESIA_API_KEY`, none configured in this environment).
+- [x] **Step 10 — README** — architecture, policy table, commands, testing strategy,
+      setup, assumptions, boundaries.
+
+**337 tests passing. `ruff` clean. `mypy --strict` clean across all 22 source files.**
+All ten SPEC steps complete.

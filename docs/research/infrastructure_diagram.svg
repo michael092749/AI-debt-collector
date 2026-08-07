@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="860" font-family="Helvetica, Arial, sans-serif">
+<defs>
+<marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#444"/></marker>
+</defs>
+<rect width="1200" height="860" fill="#fafafa"/>
+<text x="600" y="36" text-anchor="middle" font-size="22" font-weight="bold" fill="#111">Production AI Voice Agent — Infrastructure Diagram</text>
+<text x="600" y="58" text-anchor="middle" font-size="13" fill="#666">Corafone collections agent · cascade voice stack · deterministic decision engine · LangGraph · Langfuse</text>
+
+<!-- Consumer side -->
+<rect x="40" y="330" width="150" height="80" rx="10" fill="#e8f0fe" stroke="#1a73e8"/>
+<text x="115" y="362" text-anchor="middle" font-size="14" font-weight="bold">Consumer</text>
+<text x="115" y="382" text-anchor="middle" font-size="11" fill="#333">phone / web call</text>
+
+<rect x="230" y="330" width="150" height="80" rx="10" fill="#e8f0fe" stroke="#1a73e8"/>
+<text x="305" y="356" text-anchor="middle" font-size="14" font-weight="bold">Telephony</text>
+<text x="305" y="374" text-anchor="middle" font-size="11" fill="#333">Twilio SIP / LiveKit</text>
+<text x="305" y="390" text-anchor="middle" font-size="11" fill="#333">WebRTC transport</text>
+
+<line x1="190" y1="370" x2="230" y2="370" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+<line x1="230" y1="386" x2="190" y2="386" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+
+<!-- Voice pipeline container -->
+<rect x="430" y="110" width="360" height="240" rx="12" fill="#fff" stroke="#1a73e8" stroke-width="2"/>
+<text x="610" y="134" text-anchor="middle" font-size="15" font-weight="bold" fill="#1a73e8">Voice Pipeline (LiveKit Agents / Pipecat)</text>
+<rect x="455" y="150" width="140" height="60" rx="8" fill="#e8f0fe" stroke="#1a73e8"/>
+<text x="525" y="176" text-anchor="middle" font-size="13" font-weight="bold">STT</text>
+<text x="525" y="194" text-anchor="middle" font-size="11">Deepgram</text>
+<rect x="625" y="150" width="140" height="60" rx="8" fill="#e8f0fe" stroke="#1a73e8"/>
+<text x="695" y="176" text-anchor="middle" font-size="13" font-weight="bold">TTS</text>
+<text x="695" y="194" text-anchor="middle" font-size="11">Cartesia / ElevenLabs</text>
+<rect x="455" y="240" width="310" height="70" rx="8" fill="#e8f0fe" stroke="#1a73e8"/>
+<text x="610" y="264" text-anchor="middle" font-size="13" font-weight="bold">Turn-taking / VAD / barge-in</text>
+<text x="610" y="284" text-anchor="middle" font-size="11">interruption handling · &lt;500ms latency budget</text>
+
+<line x1="380" y1="370" x2="480" y2="350" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+<line x1="480" y1="340" x2="430" y2="310" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+
+<!-- Agent runtime container -->
+<rect x="430" y="410" width="360" height="300" rx="12" fill="#fff" stroke="#34a853" stroke-width="2"/>
+<text x="610" y="434" text-anchor="middle" font-size="15" font-weight="bold" fill="#188038">Agent Runtime — LangGraph state machine</text>
+<text x="610" y="452" text-anchor="middle" font-size="11" fill="#333">verify → disclose → negotiate → confirm → log</text>
+<rect x="455" y="466" width="310" height="56" rx="8" fill="#e6f4ea" stroke="#34a853"/>
+<text x="610" y="490" text-anchor="middle" font-size="13" font-weight="bold">LLM (conversation only)</text>
+<text x="610" y="508" text-anchor="middle" font-size="11">understands, phrases — never decides terms</text>
+<rect x="455" y="538" width="310" height="56" rx="8" fill="#e6f4ea" stroke="#34a853"/>
+<text x="610" y="560" text-anchor="middle" font-size="13" font-weight="bold">Context manager</text>
+<text x="610" y="578" text-anchor="middle" font-size="11">account context pre-loaded · live transcript · call state</text>
+<rect x="455" y="610" width="310" height="56" rx="8" fill="#e6f4ea" stroke="#34a853"/>
+<text x="610" y="632" text-anchor="middle" font-size="13" font-weight="bold">Escalation (HITL)</text>
+<text x="610" y="650" text-anchor="middle" font-size="11">dispute / hardship / low confidence → human, full context</text>
+
+<line x1="610" y1="350" x2="610" y2="410" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+<line x1="590" y1="410" x2="590" y2="350" stroke="#444" stroke-width="2" marker-end="url(#arr)"/>
+
+<!-- Guardrails -->
+<rect x="40" y="470" width="340" height="200" rx="12" fill="#fff" stroke="#ea4335" stroke-width="2"/>
+<text x="210" y="494" text-anchor="middle" font-size="15" font-weight="bold" fill="#c5221f">Guardrail Engine (code, not prompts)</text>
+<text x="55" y="518" font-size="11.5" fill="#333">Pre-check: identity, injection/PII screen</text>
+<text x="55" y="540" font-size="11.5" fill="#333">During: prohibited phrases blocked pre-TTS,</text>
+<text x="55" y="556" font-size="11.5" fill="#333">Mini-Miranda disclosure enforced, whitelist actions</text>
+<text x="55" y="578" font-size="11.5" fill="#333">Post: 100% transcript compliance scoring,</text>
+<text x="55" y="594" font-size="11.5" fill="#333">drift detection, immutable audit log</text>
+<text x="55" y="620" font-size="11.5" font-weight="bold" fill="#c5221f">Fail conditions: threats · false urgency ·</text>
+<text x="55" y="636" font-size="11.5" font-weight="bold" fill="#c5221f">invented consequences · legal advice</text>
+
+<line x1="380" y1="560" x2="430" y2="560" stroke="#ea4335" stroke-width="2" marker-end="url(#arr)"/>
+<line x1="430" y1="580" x2="380" y2="580" stroke="#ea4335" stroke-width="2" marker-end="url(#arr)"/>
+
+<!-- Decision engine -->
+<rect x="850" y="410" width="310" height="150" rx="12" fill="#fff" stroke="#f9ab00" stroke-width="2"/>
+<text x="1005" y="434" text-anchor="middle" font-size="15" font-weight="bold" fill="#b06000">Decision Engine (deterministic tool)</text>
+<text x="865" y="458" font-size="11.5" fill="#333">validate_offer(amount, schedule) → accept / counter</text>
+<text x="865" y="480" font-size="11.5" fill="#333">Rules: full pay › downpayment+1 › settlement</text>
+<text x="865" y="498" font-size="11.5" fill="#333">(≤20% off, ≤3 payments) › plan ≤3 months</text>
+<text x="865" y="518" font-size="11.5" fill="#333">Min payment ≥ 25% · same input → same verdict</text>
+<text x="865" y="540" font-size="11.5" font-weight="bold" fill="#b06000">Zero LLM involvement</text>
+
+<line x1="790" y1="480" x2="850" y2="480" stroke="#f9ab00" stroke-width="2" marker-end="url(#arr)"/>
+<line x1="850" y1="500" x2="790" y2="500" stroke="#f9ab00" stroke-width="2" marker-end="url(#arr)"/>
+
+<!-- State stores -->
+<rect x="850" y="600" width="310" height="110" rx="12" fill="#fff" stroke="#7b1fa2" stroke-width="2"/>
+<text x="1005" y="624" text-anchor="middle" font-size="14" font-weight="bold" fill="#7b1fa2">State &amp; Records</text>
+<text x="865" y="648" font-size="11.5" fill="#333">Postgres: LangGraph checkpointer, agreement log,</text>
+<text x="865" y="666" font-size="11.5" fill="#333">decision records, audit trail</text>
+<text x="865" y="688" font-size="11.5" fill="#333">Redis: live call state (offers, counters)</text>
+
+<line x1="790" y1="650" x2="850" y2="650" stroke="#7b1fa2" stroke-width="2" marker-end="url(#arr)"/>
+
+<!-- Observability wrapper -->
+<rect x="40" y="740" width="1120" height="90" rx="12" fill="#fff" stroke="#5f6368" stroke-width="2" stroke-dasharray="6,4"/>
+<text x="70" y="766" font-size="14" font-weight="bold" fill="#333">Observability &amp; Evals (wraps everything) — Langfuse via OpenTelemetry</text>
+<text x="70" y="788" font-size="11.5" fill="#444">Traces: every LLM call, tool call, guardrail event, decision verdict · tokens/cost/latency per call</text>
+<text x="70" y="808" font-size="11.5" fill="#444">Evals: PR-time deterministic tests → nightly LLM-as-judge on adversarial simulated calls → continuous production scoring (5–10% sample)</text>
+<line x1="610" y1="710" x2="610" y2="740" stroke="#5f6368" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr)"/>
+<line x1="1005" y1="710" x2="1005" y2="740" stroke="#5f6368" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr)"/>
+<line x1="210" y1="670" x2="210" y2="740" stroke="#5f6368" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr)"/>
+</svg>

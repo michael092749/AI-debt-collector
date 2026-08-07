@@ -58,6 +58,14 @@ _MINI_MIRANDA_PURPOSE_RE = re.compile(
 _AI_DISCLOSURE_RE = re.compile(
     r"\b(?:i(?:'m|’m|\s+am)\s+(?:an?\s+)?(?:a\.i\.|ai|artificial\s+intelligence|automated|"
     r"virtual|digital|synthetic)\b"
+    # Third-person "this is ..." disclosures (live-testing found this is the
+    # model's most common opening phrasing). "ai"/"a.i."/"artificial
+    # intelligence" are specific enough on their own to need no trailing noun;
+    # the generic adjectives below do, or "this is a virtual card number" and
+    # its like would false-fire and permanently satisfy the disclosure.
+    r"|this\s+is\s+(?:an?\s+)?(?:a\.i\.|ai|artificial\s+intelligence)\b"
+    r"|this\s+is\s+(?:an?\s+)?(?:automated|virtual|digital|synthetic)\s+"
+    r"(?:assistant|agent|system|voice|call(?:er)?)\b"
     r"|\ba\.?i\.?\s+(?:assistant|agent|voice|system)\b"
     r"|automated\s+(?:assistant|agent|system|voice)\b"
     r"|virtual\s+(?:assistant|agent)\b"
@@ -65,14 +73,18 @@ _AI_DISCLOSURE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_AI_ADJ = r"(?:an?\s+)?(?:(?:real|actual|live)\s+)?"
 _AI_REQUEST_RE = re.compile(
-    r"\b(?:are\s+you\s+(?:a\s+|an\s+)?(?:real|human|person|robot|bot|ai|recording|machine|"
+    rf"\b(?:are\s+you\s+{_AI_ADJ}(?:real|human|person|robot|bot|ai|recording|machine|"
     r"computer)"
-    r"|am\s+i\s+(?:talking|speaking)\s+(?:to|with)\s+(?:a\s+)?(?:real|human|person|machine|bot|"
+    rf"|am\s+i\s+(?:talking|speaking)\s+(?:to|with)\s+{_AI_ADJ}(?:real|human|person|machine|bot|"
     r"robot|computer)"
-    r"|is\s+this\s+(?:a\s+)?(?:recording|robot|bot|ai|real\s+person|human|machine|computer)"
+    rf"|is\s+this\s+being\s+recorded"
+    rf"|is\s+this\s+{_AI_ADJ}(?:recording|robot|bot|ai|real\s+person|human|machine|computer|"
+    r"automated)"
     r"|you(?:'re|’re|\s+are)\s+(?:a\s+)?(?:robot|bot|ai|machine|recording)"
-    r"|(?:get|put)\s+me\s+(?:a|to\s+a)\s+(?:real\s+person|human))\b",
+    r"|(?:get|put)\s+me\s+(?:a|to\s+a)\s+(?:real\s+person|human)"
+    r"|(?:human|person)\s+or\s+(?:bot|ai|robot|machine))\b",
     re.IGNORECASE,
 )
 
@@ -82,7 +94,8 @@ _AI_REQUEST_RE = re.compile(
 _SUBSTANTIVE_RE = re.compile(
     r"(?:\$\s?\d"
     r"|\b(?:balance|owes?|owed?|owing|amount\s+due|past\s+due|delinquent|dollars?|payments?|"
-    r"paying|pay|paid|settle|settlement|installments?|debt|collect|arrangement)\b)",
+    r"paying|pay|paid|settle|settlement|installments?|debt|collect|arrangement|offer|offering|"
+    r"afford|charge|charges?)\b)",
     re.IGNORECASE,
 )
 
@@ -109,14 +122,43 @@ def requests_ai_disclosure(text: str) -> bool:
 # Deliberately narrow. "Who's asking?" and "What is this about?" are not
 # confirmations, and neither is silence; being conservative here costs one
 # extra question, while being generous discloses a debt to whoever picked up.
+#
+# "go ahead" and "you've got (him|her|them|me)" were dropped: both false-
+# positive on stray phrases that were never meant as an identity confirmation
+# at all — most severely, an answering-machine greeting ("...go ahead when
+# you're ready") and a third party about to hand the phone off
+# (ADVERSARIAL_TESTING.md C2).
 _IDENTITY_CONFIRMED_RE = re.compile(
     r"(?:\byes\b|\byeah\b|\byep\b|\byup\b|\bspeaking\b|\bthat'?s me\b|\bthis is (?:he|she|they|"
-    r"them|me)\b|\byou'?ve got (?:him|her|them|me)\b|\bgo ahead\b)",
+    r"them|me)\b)",
     re.IGNORECASE,
 )
+# A third party identifying themselves by relation ("this is his brother") is
+# a denial in substance even without the word "no": the speaker has just said,
+# in plain words, they are someone other than the account holder.
+#
+# Deliberately includes bare "no": within confirms_identity this only clears
+# an affirmation elsewhere in the *same* utterance ("yes, but no, that's not
+# me") — a bounded, low-risk use. It must not also drive denies_identity
+# (below), which re-checks on every later turn once identity is confirmed:
+# "no" is the single most common word in an ordinary negotiation refusal
+# ("No, too much."), and revoking identity on it would end the call's ability
+# to discuss terms at all (ADVERSARIAL_TESTING.md C1 follow-up).
 _IDENTITY_DENIED_RE = re.compile(
     r"(?:\bno\b|\bwrong number\b|\bnot (?:me|him|her|them)\b|\bnever heard of\b|"
-    r"\bdoesn'?t live here\b|\bthey'?re not here\b)",
+    r"\bdoesn'?t live here\b|\bthey'?re not here\b|"
+    r"\bthis is (?:his|her|their|my)\s+(?:brother|sister|son|daughter|wife|husband|"
+    r"roommate|mother|father|mom|dad|assistant|secretary)\b)",
+    re.IGNORECASE,
+)
+# The subset above that is an unambiguous, explicit denial regardless of
+# where in the call it appears — no bare "no", which is ordinary negotiation
+# vocabulary, not an identity claim.
+_IDENTITY_EXPLICIT_DENIAL_RE = re.compile(
+    r"(?:\bwrong number\b|\bnot (?:me|him|her|them)\b|\bnever heard of\b|"
+    r"\bdoesn'?t live here\b|\bthey'?re not here\b|"
+    r"\bthis is (?:his|her|their|my)\s+(?:brother|sister|son|daughter|wife|husband|"
+    r"roommate|mother|father|mom|dad|assistant|secretary)\b)",
     re.IGNORECASE,
 )
 
@@ -132,6 +174,21 @@ def confirms_identity(text: str) -> bool:
     if _IDENTITY_DENIED_RE.search(text):
         return False
     return _IDENTITY_CONFIRMED_RE.search(text) is not None
+
+
+def denies_identity(text: str) -> bool:
+    """Did the consumer just say, explicitly, that they are not the account
+    holder? Checked on every turn, not just before identity is confirmed: a
+    confirmation is not a one-way latch — "hold on, someone's at the door"
+    followed later by "sorry, that's not me" must revoke it, not leave the
+    balance sayable to whoever is now on the line (ADVERSARIAL_TESTING.md C1).
+
+    Uses a narrower pattern than the negation cue inside ``confirms_identity``
+    on purpose: this is checked on *every* turn once identity is confirmed,
+    including plain negotiation refusals ("No, too much.") — a bare "no"
+    revoking identity there would end the call's ability to discuss terms.
+    """
+    return _IDENTITY_EXPLICIT_DENIAL_RE.search(text) is not None
 
 
 def substantive_span(text: str) -> tuple[int, int] | None:

@@ -317,9 +317,7 @@ class AgreementRecord:
             schedule=tuple(installment_from_json(i) for i in data["schedule"]),
             conditions=tuple(condition_from_json(c) for c in data["conditions"]),
             rationale_code=RationaleCode(data["rationale_code"]),
-            exchanges=tuple(
-                cast(DecisionRecorded, event_from_json(e)) for e in data["exchanges"]
-            ),
+            exchanges=tuple(cast(DecisionRecorded, event_from_json(e)) for e in data["exchanges"]),
             guardrail_events=tuple(
                 cast(GuardrailTripped, event_from_json(g)) for g in data["guardrail_events"]
             ),

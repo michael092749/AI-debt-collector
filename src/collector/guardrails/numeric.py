@@ -24,6 +24,7 @@ Two deliberate classification rules, both about false positives and negatives:
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -45,6 +46,8 @@ class NumericRuleId(StrEnum):
     UNAUTHORIZED_PAYMENT_COUNT = "UNAUTHORIZED_PAYMENT_COUNT"
     UNAUTHORIZED_DATE = "UNAUTHORIZED_DATE"
     UNVERIFIED_NUMBER = "UNVERIFIED_NUMBER"
+    INVISIBLE_CHARACTER = "INVISIBLE_CHARACTER"
+    SUSPICIOUS_DIGIT_BOUNDARY = "SUSPICIOUS_DIGIT_BOUNDARY"
 
 
 class FigureKind(StrEnum):
@@ -78,6 +81,10 @@ class Figure:
     value: Decimal | None = None
     unit: DurationUnit | None = None
     token: str | None = None  # normalized form, for dates
+    # A digit run touching a letter or underscore ("950k", "9_5_0") with no
+    # recognized suffix is exactly the shape a boundary-evasion attempt takes
+    # — flagged rather than silently dropped (ADVERSARIAL_TESTING.md H2).
+    suspicious: bool = False
 
     @property
     def value_in_days(self) -> Decimal:
@@ -237,12 +244,8 @@ def authorized_for(
     max_plan_months = policy.max_plan_days // DurationUnit.MONTH.days
     base = AuthorizedFigures(
         money=_amounts([policy.original_balance, policy.settlement_floor, policy.min_payment]),
-        percents=frozenset(
-            {policy.min_payment_pct * 100, policy.max_settlement_discount * 100}
-        ),
-        counts=frozenset(
-            Decimal(n) for n in range(1, policy.max_installments + 1)
-        ),
+        percents=frozenset({policy.min_payment_pct * 100, policy.max_settlement_discount * 100}),
+        counts=frozenset(Decimal(n) for n in range(1, policy.max_installments + 1)),
         durations=frozenset(
             {
                 Decimal(policy.max_plan_days),
@@ -265,19 +268,86 @@ def authorized_for(
     return authorized
 
 
+# -- invisible-character defense --------------------------------------------
+#
+# Unicode format characters (category ``Cf``: zero-width space, zero-width
+# joiner, soft hyphen, byte-order mark, ...) have no legitimate reason to
+# appear in text bound for TTS. Left alone, one placed inside a figure
+# fragments it into two separately-authorized numbers that read as one
+# unauthorized amount when spoken — "4[ZWSP]800" extracts as "4" and "800"
+# individually, never as "$4,800" (ADVERSARIAL_TESTING.md C6). NFKC
+# normalization does not help here: it does not touch ``Cf`` characters.
+#
+# The same fragmentation reproduces with non-breaking space (category ``Zs``,
+# not ``Cf``) and a bare tab (category ``Cc``) standing in for the ZWSP, so
+# the net is cast over whitespace/format/control characters generally. Plain
+# ASCII space is always exempt; newline and carriage return are too — a real
+# model turn can legitimately be multi-line ("Here's what I can do:\n$250
+# today..."), and a blanket block there would burn regeneration strikes on
+# ordinary formatting rather than an evasion attempt.
+_SUSPICIOUS_CATEGORIES = frozenset({"Cf", "Cc", "Zs", "Zl", "Zp"})
+_ALWAYS_ALLOWED_WHITESPACE = frozenset({" ", "\n", "\r"})
+
+
+def _is_suspicious_char(ch: str) -> bool:
+    if ch in _ALWAYS_ALLOWED_WHITESPACE:
+        return False
+    return unicodedata.category(ch) in _SUSPICIOUS_CATEGORIES
+
+
+def _has_format_chars(text: str) -> bool:
+    return any(_is_suspicious_char(ch) for ch in text)
+
+
+def _strip_format_chars(text: str) -> str:
+    return "".join(ch for ch in text if not _is_suspicious_char(ch))
+
+
 # -- extraction ------------------------------------------------------------
 
 _UNITS: dict[str, int] = {
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
-    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
-    "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
 }
 _TENS: dict[str, int] = {
-    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
-    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
 }
-_SCALES: dict[str, int] = {"hundred": 100, "thousand": 1000}
+# "grand"/"stack"/"dozen" are scale words exactly like "thousand" is: "two
+# grand" and "two thousand" compose the same way. A model that has learned to
+# route figures through a tool still says these when improvising, same as
+# any other spelled-out number (ADVERSARIAL_TESTING.md H1).
+_SCALES: dict[str, int] = {
+    "hundred": 100,
+    "thousand": 1000,
+    "grand": 1000,
+    "stack": 1000,
+    "dozen": 12,
+}
 _NUMBER_WORDS = {**_UNITS, **_TENS, **_SCALES}
 
 _WORD_ALT = "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True))
@@ -286,7 +356,11 @@ _WORD_NUMBER_RE = re.compile(
     rf"(?:[\s-]+(?:and[\s-]+)?(?:{_WORD_ALT}))*\b",
     re.IGNORECASE,
 )
-_DIGIT_NUMBER_RE = re.compile(r"\b\d[\d,]*(?:\.\d+)?(?:st|nd|rd|th)?\b")
+# Boundaries are digit-adjacency, not \b: a plain word boundary treats a
+# letter or underscore as the same word-class as a digit, so a run touching
+# either ("950k", "settle950today", "9_5_0") previously failed to match at
+# all rather than being flagged (ADVERSARIAL_TESTING.md H2).
+_DIGIT_NUMBER_RE = re.compile(r"(?<!\d)\d[\d,]*(?:\.\d+)?(?:st|nd|rd|th)?(?!\d)")
 
 _MONTHS = (
     "january|february|march|april|may|june|july|august|september|october|november|december"
@@ -310,6 +384,73 @@ _DATE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
+
+# Idioms with no digit or cardinal-number word in them at all: a fraction
+# framed as a discount ("half of that", "a third off"), a duration noun with
+# no numeral ("a fortnight"), and a bare single-letter money slang ("a G").
+# These require no adversarial intent at all — exactly the failure mode this
+# guard exists to catch, per its own docstring (ADVERSARIAL_TESTING.md H1).
+@dataclass(frozen=True)
+class _Idiom:
+    pattern: re.Pattern[str]
+    kind: FigureKind
+    value: Decimal
+    unit: DurationUnit | None = None
+
+
+_FRACTION_TAIL = r"(?:of\s+(?:that|it|this|the\s+balance)|off)\b"
+_IDIOMS: tuple[_Idiom, ...] = (
+    _Idiom(
+        re.compile(rf"\bhalf\s+{_FRACTION_TAIL}", re.IGNORECASE),
+        FigureKind.PERCENT,
+        Decimal(50),
+    ),
+    _Idiom(
+        re.compile(rf"\ba\s+third\s+{_FRACTION_TAIL}", re.IGNORECASE),
+        FigureKind.PERCENT,
+        Decimal(100) / Decimal(3),
+    ),
+    _Idiom(
+        re.compile(rf"\ba\s+quarter\s+{_FRACTION_TAIL}", re.IGNORECASE),
+        FigureKind.PERCENT,
+        Decimal(25),
+    ),
+    _Idiom(
+        re.compile(rf"\ba\s+fifth\s+{_FRACTION_TAIL}", re.IGNORECASE),
+        FigureKind.PERCENT,
+        Decimal(20),
+    ),
+    _Idiom(
+        re.compile(r"\ba\s+fortnight\b", re.IGNORECASE),
+        FigureKind.DURATION,
+        Decimal(14),
+        DurationUnit.DAY,
+    ),
+    _Idiom(re.compile(r"\ba\s+[gG]\b"), FigureKind.MONEY, Decimal(1000)),
+)
+
+# Bare Roman numerals ("CD dollars", "IX dollars") only when at least two
+# characters and immediately followed by a recognized money/percent suffix —
+# a single-letter numeral ("I", "V", "X") collides with far too much ordinary
+# English ("I can pay...") to ever treat on its own (ADVERSARIAL_TESTING.md
+# H5).
+_ROMAN_NUMERAL_RE = re.compile(r"\bM{0,4}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})\b")
+_ROMAN_VALUES: dict[str, int] = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+
+
+def _roman_to_int(token: str) -> int:
+    total = 0
+    prev = 0
+    for ch in reversed(token.upper()):
+        value = _ROMAN_VALUES[ch]
+        if value < prev:
+            total -= value
+        else:
+            total += value
+            prev = value
+    return total
+
+
 _MONEY_PREFIX_RE = re.compile(r"\$\s*$")
 _IDENTIFIER_PREFIX_RE = re.compile(
     r"\b(?:account|reference|confirmation|case|file|ending\s+in|extension|number|#)\s*#?\s*$",
@@ -317,10 +458,9 @@ _IDENTIFIER_PREFIX_RE = re.compile(
 )
 _MONEY_SUFFIX_RE = re.compile(r"^[\s-]*(?:dollars?|bucks?|usd)\b", re.IGNORECASE)
 _CENTS_SUFFIX_RE = re.compile(r"^[\s-]*cents?\b", re.IGNORECASE)
-_PERCENT_SUFFIX_RE = re.compile(r"^\s*(?:%|percent\b)", re.IGNORECASE)
-_DURATION_SUFFIX_RE = re.compile(
-    r"^[\s-]*(day|week|month|year)s?\b", re.IGNORECASE
-)
+_PERCENT_SUFFIX_RE = re.compile(r"^\s*(?:%|per\s*cent\b)", re.IGNORECASE)
+_DURATION_SUFFIX_RE = re.compile(r"^[\s-]*(day|week|month|year)s?\b", re.IGNORECASE)
+_THOUSAND_SUFFIX_RE = re.compile(r"^k\b", re.IGNORECASE)
 _PAYMENT_SUFFIX_RE = re.compile(
     r"^[\s-]*(?:payments?|installments?|checks?|cheques?)\b", re.IGNORECASE
 )
@@ -368,8 +508,8 @@ def _words_to_number(raw: str) -> Decimal | None:
             current += _TENS[token]
         elif token == "hundred":
             current = (current or 1) * 100
-        else:  # thousand
-            total += (current or 1) * 1000
+        else:  # thousand-like scale word: thousand, grand, stack, dozen
+            total += (current or 1) * _SCALES[token]
             current = 0
     return Decimal(total + current)
 
@@ -409,8 +549,15 @@ def _classify(
     return FigureKind.BARE, None, start, end
 
 
+def _touches_letter_or_underscore(text: str, start: int, end: int) -> bool:
+    before = text[start - 1] if start > 0 else ""
+    after = text[end] if end < len(text) else ""
+    return any(ch.isalpha() or ch == "_" for ch in (before, after) if ch)
+
+
 def extract_figures(text: str) -> tuple[Figure, ...]:
     """Every monetary figure, percentage, count, duration and date in ``text``."""
+    text = _strip_format_chars(text)
     figures: list[Figure] = []
     taken: list[tuple[int, int]] = []
 
@@ -429,6 +576,47 @@ def extract_figures(text: str) -> tuple[Figure, ...]:
                 )
             )
 
+    for idiom in _IDIOMS:
+        for match in idiom.pattern.finditer(text):
+            if _overlaps(match.span(), taken):
+                continue
+            taken.append(match.span())
+            figures.append(
+                Figure(
+                    kind=idiom.kind,
+                    text=match.group(0),
+                    start=match.start(),
+                    end=match.end(),
+                    value=idiom.value,
+                    unit=idiom.unit,
+                )
+            )
+
+    for match in _ROMAN_NUMERAL_RE.finditer(text):
+        token = match.group(0)
+        if len(token) < 2 or _overlaps(match.span(), taken):
+            continue
+        after = text[match.end() : match.end() + _CONTEXT_CHARS]
+        roman_kind: FigureKind | None = None
+        suffix_match: re.Match[str] | None = None
+        if (money_suffix := _MONEY_SUFFIX_RE.match(after)) is not None:
+            roman_kind, suffix_match = FigureKind.MONEY, money_suffix
+        elif (percent_suffix := _PERCENT_SUFFIX_RE.match(after)) is not None:
+            roman_kind, suffix_match = FigureKind.PERCENT, percent_suffix
+        if roman_kind is None or suffix_match is None:
+            continue
+        end = match.end() + len(suffix_match.group(0))
+        taken.append((match.start(), end))
+        figures.append(
+            Figure(
+                kind=roman_kind,
+                text=text[match.start() : end],
+                start=match.start(),
+                end=end,
+                value=Decimal(_roman_to_int(token)),
+            )
+        )
+
     parsers: tuple[tuple[re.Pattern[str], Callable[[str], Decimal | None]], ...] = (
         (_DIGIT_NUMBER_RE, _digits_to_number),
         (_WORD_NUMBER_RE, _words_to_number),
@@ -441,8 +629,16 @@ def extract_figures(text: str) -> tuple[Figure, ...]:
             if value is None:
                 continue
             kind, unit, start, end = _classify(text, match.start(), match.end(), value)
-            if _CENTS_SUFFIX_RE.match(text[match.end() : match.end() + _CONTEXT_CHARS]):
+            after = text[match.end() : match.end() + _CONTEXT_CHARS]
+            if _CENTS_SUFFIX_RE.match(after):
                 value = value / 100
+            elif regex is _DIGIT_NUMBER_RE and (thousand := _THOUSAND_SUFFIX_RE.match(after)):
+                # "950k" — a digit run with a bare 'k' suffix, no space. Not
+                # handled by _classify's suffix table since it isn't a unit
+                # word; folded in here the same way the cents suffix is.
+                value = value * 1000
+                kind = FigureKind.MONEY
+                end = match.end() + len(thousand.group(0))
             taken.append((start, end))
             figures.append(
                 Figure(
@@ -452,6 +648,10 @@ def extract_figures(text: str) -> tuple[Figure, ...]:
                     end=end,
                     value=value,
                     unit=unit,
+                    suspicious=(
+                        regex is _DIGIT_NUMBER_RE
+                        and _touches_letter_or_underscore(text, start, end)
+                    ),
                 )
             )
 
@@ -464,7 +664,42 @@ def extract_figures(text: str) -> tuple[Figure, ...]:
 def check_numeric(candidate: str, authorized: AuthorizedFigures) -> tuple[Violation, ...]:
     """Block any figure in a candidate agent utterance the engine did not authorize."""
     violations: list[Violation] = []
+    if _has_format_chars(candidate):
+        violations.append(
+            Violation(
+                rule_id=NumericRuleId.INVISIBLE_CHARACTER,
+                severity=Severity.BLOCK,
+                span=candidate,
+                start=0,
+                end=len(candidate),
+                detail=(
+                    f"{NumericRuleId.INVISIBLE_CHARACTER}: candidate text contains a "
+                    "Unicode format character (zero-width space/joiner, soft hyphen, "
+                    "BOM, ...); there is no legitimate reason for one in spoken text"
+                ),
+            )
+        )
     for figure in extract_figures(candidate):
+        if figure.suspicious:
+            # A digit run sitting directly against a letter or underscore
+            # with no recognized unit ("950k", "9_5_0") is exactly the shape
+            # a boundary-evasion attempt takes — blocked outright rather than
+            # judged by whether its raw value happens to be authorized
+            # (ADVERSARIAL_TESTING.md H2).
+            violations.append(
+                Violation(
+                    rule_id=NumericRuleId.SUSPICIOUS_DIGIT_BOUNDARY,
+                    severity=Severity.BLOCK,
+                    span=figure.text,
+                    start=figure.start,
+                    end=figure.end,
+                    detail=(
+                        f"{NumericRuleId.SUSPICIOUS_DIGIT_BOUNDARY}: {figure.text!r} sits "
+                        "directly against a letter or underscore with no recognized unit"
+                    ),
+                )
+            )
+            continue
         if authorized.permits(figure):
             continue
         rule = _BLOCKING_RULES.get(figure.kind, NumericRuleId.UNVERIFIED_NUMBER)

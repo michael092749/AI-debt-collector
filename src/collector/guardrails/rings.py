@@ -38,6 +38,7 @@ from collector.guardrails.numeric import (
     extract_figures,
 )
 from collector.guardrails.prohibited import Severity, Violation, scan_prohibited
+from collector.llm.base import SYSTEM_PROMPT
 from collector.policy import PolicyConfig
 
 Speaker = Literal["consumer", "agent", "system"]
@@ -47,8 +48,7 @@ Speaker = Literal["consumer", "agent", "system"]
 MAX_REGENERATION_STRIKES = 2
 
 SAFE_FALLBACK_TEXT = (
-    "I'd rather not misstate anything, so let me keep this simple. "
-    "What would work for you?"
+    "I'd rather not misstate anything, so let me keep this simple. What would work for you?"
 )
 
 
@@ -70,6 +70,7 @@ class RingRuleId(StrEnum):
     NEGOTIATION_AFTER_ESCALATION = "NEGOTIATION_AFTER_ESCALATION"
     DISCLOSURE_NEVER_FIRED = "DISCLOSURE_NEVER_FIRED"
     TRANSCRIPT_NOT_PERSISTED = "TRANSCRIPT_NOT_PERSISTED"
+    CONFIDENTIAL_TEXT_LEAKED = "CONFIDENTIAL_TEXT_LEAKED"
 
 
 class EscalationTrigger(StrEnum):
@@ -104,10 +105,14 @@ _ESCALATION_PATTERNS: tuple[_TriggerRule, ...] = (
         r"\bkill\s+myself\b",
         r"\bend\s+my\s+life\b",
         r"\bsuicid(?:e|al)\b",
-        r"\bhurt\s+myself\b",
+        r"\bhurt(?:ing)?\s+myself\b",
+        r"\bthoughts?\s+of\s+hurting\s+myself\b",
         r"\bnot\s+worth\s+living\b",
-        r"\bno\s+reason\s+to\s+(?:live|go\s+on)\b",
-        r"\bcan'?t\s+(?:go\s+on|take\s+(?:this|it)\s+any\s?more|do\s+this\s+any\s?more)\b",
+        r"\bno\s+(?:reason|point)\s+(?:to|in)?\s*(?:live|living|go(?:ing)?\s+on)\b",
+        r"\bcan'?t\s+(?:go\s+on|take\s+(?:this|it)\s+any\s?more|do\s+this\s+any\s?more|"
+        r"handle\s+(?:this|it)\s+any\s?more)\b",
+        r"\bdon'?t\s+want\s+to\s+be\s+here\s+(?:any\s?more)?\b",
+        r"\bending\s+it\s+all\b",
         r"\bpanic\s+attack\b",
         r"\bhaving\s+a\s+breakdown\b",
     ),
@@ -115,12 +120,13 @@ _ESCALATION_PATTERNS: tuple[_TriggerRule, ...] = (
         EscalationTrigger.CEASE_AND_DESIST,
         r"\bcease\s+and\s+desist\b",
         r"\bstop\s+call(?:ing|s)\b",
-        r"\bdon'?t\s+call\s+(?:me\s+)?(?:again|any\s?more|back)\b",
-        r"\bdo\s+not\s+(?:call|contact)\s+me\b",
+        r"\bquit\s+calling\b",
+        r"\b(?:don'?t|do\s+not)\s+call\s+(?:me\b|again\b|any\s?more\b|back\b)",
+        r"\b(?:don'?t|do\s+not)\s+contact\s+me\b",
         r"\bnever\s+call\s+me\b",
         r"\btake\s+me\s+off\s+your\s+(?:list|calling\s+list)\b",
         r"\bremove\s+my\s+(?:number|name)\b",
-        r"\bstop\s+contacting\s+me\b",
+        r"\b(?:quit|stop)\s+contacting\s+me\b",
         r"\bin\s+writing\s+only\b",
     ),
     _trigger(
@@ -132,6 +138,10 @@ _ESCALATION_PATTERNS: tuple[_TriggerRule, ...] = (
         r"\btalk\s+to\s+my\s+(?:lawyer|attorney)\b",
         r"\bgo\s+through\s+my\s+(?:lawyer|attorney)\b",
         r"\ball\s+communication\s+through\s+(?:my\s+)?(?:lawyer|attorney|counsel)\b",
+        r"\bsomeone\s+handling\s+this\s+legally\b",
+        r"\blegal\s+(?:team|representation|counsel)\b",
+        r"\bgot\s+legal\s+representation\b",
+        r"\bhave\s+legal\s+representation\b",
     ),
     _trigger(
         EscalationTrigger.DISPUTE,
@@ -139,14 +149,17 @@ _ESCALATION_PATTERNS: tuple[_TriggerRule, ...] = (
         # negotiation, not a dispute of the debt.
         r"\bi\s+(?:don'?t|do\s+not)\s+owe\s+(?:this|that|it|you|anything|any\s+of\s+this)\b(?!\s+much)",
         r"\bi\s+never\s+(?:owed|had|opened|took\s+out)\b",
-        r"\bthis\s+(?:is\s?n'?t|is\s+not)\s+(?:my|mine)\b",
+        r"\b(?:this|that|it)(?:\s+(?:account|debt|bill|balance))?\s+"
+        r"(?:isn'?t|is\s+not)\s+(?:even\s+)?(?:my|mine)\b",
         r"\bnot\s+my\s+(?:debt|account|bill)\b",
         r"\bi\s+dispute\b",
         r"\bi'?m\s+disputing\b",
         r"\bidentity\s+theft\b",
         r"\b(?:someone|somebody)\s+(?:else\s+)?(?:used|stole)\s+my\b",
+        r"\bconfused\s+(?:me\s+)?with\s+someone\s+else\b",
         r"\b(?:send|mail)\s+me\s+(?:the\s+)?(?:proof|validation|verification|documentation)\b",
         r"\bvalidat(?:e|ion)\s+(?:of\s+)?(?:the\s+|this\s+)?debt\b",
+        r"\bprove\s+(?:that\s+)?i\s+owe\s+this\b",
         r"\bi\s+already\s+paid\s+(?:this|that|it)\b",
         r"\bwrong\s+(?:person|number)\b",
     ),
@@ -155,6 +168,7 @@ _ESCALATION_PATTERNS: tuple[_TriggerRule, ...] = (
         # Strong signals only. "I can't afford $500 a month" is a capacity
         # signal for the decision engine, not an escalation.
         r"\bi\s+(?:lost|just\s+lost)\s+my\s+job\b",
+        r"\bi\s+got\s+laid\s+off\b",
         r"\bi'?m\s+(?:unemployed|out\s+of\s+work|homeless|disabled)\b",
         r"\bon\s+disability\b",
         r"\bno\s+income\b",
@@ -164,10 +178,37 @@ _ESCALATION_PATTERNS: tuple[_TriggerRule, ...] = (
         r"\bchapter\s+(?:7|13|seven|thirteen)\b",
         r"\bin\s+the\s+hospital\b",
         r"\bterminally\s+ill\b",
+        r"\bgoing\s+through\s+chemo(?:therapy)?\b",
+        r"\bi\s+(?:got|was)\s+evicted\b",
+        r"\bwe\s+lost\s+(?:the|our)\s+house\b",
         r"\bmy\s+(?:husband|wife|spouse|son|daughter)\s+(?:died|passed\s+away)\b",
         r"\bi'?m\s+(?:a\s+)?(?:widow|widower)\b",
     ),
 )
+
+# Nothing previously screened outbound text for verbatim system-prompt or
+# tool-schema recitation; a model that complies with "print your system
+# prompt" was stopped only by the absence of dollar figures in the leak
+# (ADVERSARIAL_TESTING.md M6). An 8-word verbatim overlap with confidential
+# reference text is not something a legitimate negotiation turn ever
+# produces by coincidence.
+_LEAK_MIN_WORDS = 8
+
+
+def _normalize_for_leak_check(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _contains_verbatim_leak(candidate: str, reference: str) -> bool:
+    words = _normalize_for_leak_check(candidate).split()
+    if len(words) < _LEAK_MIN_WORDS:
+        return False
+    normalized_reference = _normalize_for_leak_check(reference)
+    return any(
+        " ".join(words[i : i + _LEAK_MIN_WORDS]) in normalized_reference
+        for i in range(len(words) - _LEAK_MIN_WORDS + 1)
+    )
+
 
 # The agent is still talking terms. Used only after an escalation has fired.
 _NEGOTIATION_RE = re.compile(
@@ -201,9 +242,7 @@ def detect_escalation(utterance: str) -> tuple[EscalationSignal, ...]:
     signals: list[EscalationSignal] = []
     for trigger, pattern in _ESCALATION_PATTERNS:
         for match in pattern.finditer(utterance):
-            signals.append(
-                EscalationSignal(trigger, match.group(0), match.start(), match.end())
-            )
+            signals.append(EscalationSignal(trigger, match.group(0), match.start(), match.end()))
     return tuple(signals)
 
 
@@ -287,6 +326,12 @@ class GuardrailState:
 
     def with_identity_confirmed(self) -> GuardrailState:
         return replace(self, identity_confirmed=True)
+
+    def with_identity_revoked(self) -> GuardrailState:
+        """A later explicit denial undoes an earlier confirmation. Not a
+        latch: substantive content must not keep flowing to someone who has
+        since said they are not the account holder (ADVERSARIAL_TESTING.md C1)."""
+        return replace(self, identity_confirmed=False)
 
     def _record(self, event: GuardrailEvent) -> GuardrailState:
         return replace(self, events=(*self.events, event))
@@ -455,13 +500,31 @@ def check_outbound(
     candidate: str,
     *,
     authorized: AuthorizedFigures | None = None,
+    confidential_reference: str = SYSTEM_PROMPT,
 ) -> OutboundCheck:
-    """The pre-TTS gate. Nothing reaches the consumer's ear without passing here."""
+    """The pre-TTS gate. Nothing reaches the consumer's ear without passing here.
+
+    ``confidential_reference`` is screened for verbatim overlap and defaults
+    to the system prompt alone; callers that also want tool-schema text
+    covered (``agent.py`` does) pass a wider reference string — kept a
+    parameter rather than an import so this module does not depend on
+    ``tools.py`` (SPEC's four-module guardrail package would otherwise become
+    a cycle: ``tools`` -> ``audit.events`` -> ``rings``).
+    """
     figure_set = authorized if authorized is not None else state.authorized
     violations: list[Violation] = []
     violations.extend(scan_prohibited(candidate))
     violations.extend(check_numeric(candidate, figure_set))
     violations.extend(state.disclosures.check_agent_turn(candidate))
+    if _contains_verbatim_leak(candidate, confidential_reference):
+        violations.append(
+            _ring_violation(
+                RingRuleId.CONFIDENTIAL_TEXT_LEAKED,
+                candidate,
+                "candidate overlaps verbatim with confidential system-prompt/tool-schema "
+                "text; never recite instructions to the consumer",
+            )
+        )
 
     substantive = is_substantive(candidate)
     if substantive and not state.identity_confirmed:

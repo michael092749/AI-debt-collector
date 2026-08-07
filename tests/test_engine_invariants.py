@@ -31,6 +31,27 @@ CADENCES = list(Cadence)
 CAPACITIES = [None, "25", "77", "100", "250", "300", "400", "750", "900", "1000"]
 
 
+# Nothing in the engine may know the brief's $1,000 or its 25%: both are read
+# off the policy, so the rules are swept against balances and floors that are
+# nothing like them. The odd cents are deliberate - 437.19 divides badly, and a
+# 34% floor caps a plan at two payments rather than four.
+BALANCES = ["437.19", "1000", "2500", "17500.55"]
+FLOOR_PCTS = [Decimal("0.10"), Decimal("0.25"), Decimal("0.34")]
+CAPACITY_FRACTIONS = [
+    Decimal(f) for f in ("0.05", "0.26", "0.34", "0.4", "0.5", "0.75", "1", "1.5")
+]
+
+
+def _payments_needed(total: Money, capacity: Money) -> int:
+    """Fewest payments of at most ``capacity`` that cover ``total``.
+
+    Stated here independently of the engine: a test that imports the engine's
+    own arithmetic proves only that it agrees with itself.
+    """
+    whole, remainder = divmod(total.amount, capacity.amount)
+    return int(whole) + (1 if remainder else 0)
+
+
 def _proposals() -> list[ConsumerProposal]:
     return [
         ConsumerProposal(
@@ -43,18 +64,22 @@ def _proposals() -> list[ConsumerProposal]:
     ]
 
 
-def _assert_offer_legal(offer: Offer, label: str) -> None:
-    assert offer.smallest_payment >= POLICY.min_payment, f"{label}: sub-floor instalment"
-    assert offer.total >= POLICY.settlement_floor, f"{label}: below settlement floor"
-    assert offer.payment_count <= POLICY.max_payments_for(offer.tier), f"{label}: too many"
-    assert offer.payment_count <= POLICY.max_installments, f"{label}: over global cap"
-    assert offer.duration_days <= POLICY.max_plan_days, f"{label}: schedule too long"
-    assert offer.cadence in POLICY.allowed_cadences, f"{label}: cadence not offered"
+def _assert_legal_under(offer: Offer, policy: PolicyConfig, label: str) -> None:
+    assert offer.smallest_payment >= policy.min_payment, f"{label}: sub-floor instalment"
+    assert offer.total >= policy.settlement_floor, f"{label}: below settlement floor"
+    assert offer.payment_count <= policy.max_payments_for(offer.tier), f"{label}: too many"
+    assert offer.payment_count <= policy.max_installments, f"{label}: over global cap"
+    assert offer.duration_days <= policy.max_plan_days, f"{label}: schedule too long"
+    assert offer.cadence in policy.allowed_cadences, f"{label}: cadence not offered"
     assert sum((i.amount for i in offer.installments), Money.zero()) == offer.total, (
         f"{label}: instalments do not sum to total"
     )
     if offer.tier is not Tier.SETTLEMENT:
-        assert offer.total == POLICY.original_balance, f"{label}: unauthorised discount"
+        assert offer.total == policy.original_balance, f"{label}: unauthorised discount"
+
+
+def _assert_offer_legal(offer: Offer, label: str) -> None:
+    _assert_legal_under(offer, POLICY, label)
 
 
 class TestInvariantsHoldEverywhere:
@@ -85,10 +110,48 @@ class TestInvariantsHoldEverywhere:
     def test_build_counter_is_total_over_every_tier_and_capacity(self) -> None:
         state = NegotiationState.opening(POLICY)
         for tier, cap in itertools.product(Tier, CAPACITIES):
-            offer = build_counter(
-                state, POLICY, tier=tier, capacity=Money(cap) if cap else None
-            )
+            offer = build_counter(state, POLICY, tier=tier, capacity=Money(cap) if cap else None)
             _assert_offer_legal(offer, f"tier={tier.name} cap={cap}")
+
+    def test_no_counter_ever_asks_for_more_per_payment_than_the_consumer_signalled(
+        self,
+    ) -> None:
+        """The rule behind the $400 -> $400/$600 bug, over arbitrary policies.
+
+        Scoped to the tier on the table. A tier caps its instalment count, so a
+        capacity funds it only if the whole total fits in that many payments;
+        where it does, the engine must find such a schedule and never counter
+        with an instalment above the figure they just named. Where it does not,
+        the tier is simply out of their reach and refusing it is what earns the
+        step down — the engine does not take that step for them, which is what
+        it used to do.
+
+        It holds at any balance and any floor percentage, because nothing in the
+        engine knows the brief's $1,000: every bound is read off the policy.
+        """
+        for balance, pct in itertools.product(BALANCES, FLOOR_PCTS):
+            policy = POLICY.replace(original_balance=Money(balance), min_payment_pct=pct)
+            for tier, fraction in itertools.product(Tier, CAPACITY_FRACTIONS):
+                state = NegotiationState.opening(policy).conceded_to(tier)
+                capacity = policy.original_balance * fraction
+                label = f"balance={balance} pct={pct} tier={tier.name} cap={capacity}"
+                offer = build_counter(state, policy, capacity=capacity)
+
+                _assert_legal_under(offer, policy, label)
+                assert offer.tier is tier, f"{label}: counter left the tier on the table"
+                if tier is not Tier.SETTLEMENT:
+                    assert offer.total == policy.original_balance, (
+                        f"{label}: discounted without a concession on the ladder"
+                    )
+                # A schedule at this capacity exists only if it fits between two
+                # bounds: enough instalments to cover the total at ``capacity``,
+                # and few enough that each still clears the minimum payment.
+                needed = _payments_needed(offer.total, capacity)
+                room = int(offer.total.amount / policy.min_payment.amount)
+                if needed <= min(policy.max_payments_for(tier), room):
+                    assert max(i.amount for i in offer.installments) <= capacity, (
+                        f"{label}: instalment above capacity when a legal schedule existed"
+                    )
 
     def test_ladder_never_moves_backwards(self) -> None:
         """A4: once conceded to a tier, the engine never counters above it."""
@@ -139,9 +202,27 @@ class TestNoFloats:
 CORE_MODULES = ["money", "offers", "policy", "negotiation", "decision_engine"]
 
 FORBIDDEN_IMPORTS = {
-    "llm", "agent", "audit", "guardrails", "voice_app", "text_app", "tools",
-    "sqlite3", "random", "time", "datetime", "os", "sys", "socket", "pathlib",
-    "requests", "httpx", "anthropic", "openai", "livekit", "logging",
+    "llm",
+    "agent",
+    "audit",
+    "guardrails",
+    "voice_app",
+    "text_app",
+    "tools",
+    "sqlite3",
+    "random",
+    "time",
+    "datetime",
+    "os",
+    "sys",
+    "socket",
+    "pathlib",
+    "requests",
+    "httpx",
+    "anthropic",
+    "openai",
+    "livekit",
+    "logging",
 }
 
 
@@ -174,7 +255,11 @@ class TestEnginePurity:
     def test_engine_exposes_the_documented_entry_point(self) -> None:
         assert callable(validate_offer)
         assert Verdict.__dataclass_fields__.keys() >= {
-            "outcome", "tier", "conditions", "counter", "rationale_code"
+            "outcome",
+            "tier",
+            "conditions",
+            "counter",
+            "rationale_code",
         }
 
 

@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1250" height="720" font-family="Helvetica, Arial, sans-serif">
+<defs>
+<marker id="a2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#444"/></marker>
+<marker id="a3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#1a73e8"/></marker>
+<marker id="a4" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#188038"/></marker>
+</defs>
+<rect width="1250" height="720" fill="#fafafa"/>
+<text x="625" y="36" text-anchor="middle" font-size="22" font-weight="bold" fill="#111">Data Flow — One Conversational Turn + Negotiation Loop</text>
+<text x="625" y="58" text-anchor="middle" font-size="13" fill="#666">blue = audio path · green = decision path · dashed = async logging/evals</text>
+
+<!-- main turn pipeline -->
+<g font-size="13">
+<rect x="40" y="120" width="130" height="70" rx="9" fill="#e8f0fe" stroke="#1a73e8"/>
+<text x="105" y="150" text-anchor="middle" font-weight="bold">1. Consumer</text>
+<text x="105" y="170" text-anchor="middle" font-size="11">speaks (audio)</text>
+
+<rect x="210" y="120" width="130" height="70" rx="9" fill="#e8f0fe" stroke="#1a73e8"/>
+<text x="275" y="150" text-anchor="middle" font-weight="bold">2. STT</text>
+<text x="275" y="170" text-anchor="middle" font-size="11">streamed text + VAD</text>
+
+<rect x="380" y="120" width="150" height="70" rx="9" fill="#fce8e6" stroke="#ea4335"/>
+<text x="455" y="146" text-anchor="middle" font-weight="bold" fill="#c5221f">3. Pre-guardrail</text>
+<text x="455" y="164" text-anchor="middle" font-size="10.5">identity · injection/PII</text>
+<text x="455" y="180" text-anchor="middle" font-size="10.5">dispute/hardship detect</text>
+
+<rect x="570" y="120" width="150" height="70" rx="9" fill="#e6f4ea" stroke="#34a853"/>
+<text x="645" y="146" text-anchor="middle" font-weight="bold" fill="#188038">4. LangGraph agent</text>
+<text x="645" y="164" text-anchor="middle" font-size="10.5">state machine + transcript</text>
+<text x="645" y="180" text-anchor="middle" font-size="10.5">+ account context</text>
+
+<rect x="760" y="120" width="150" height="70" rx="9" fill="#fce8e6" stroke="#ea4335"/>
+<text x="835" y="146" text-anchor="middle" font-weight="bold" fill="#c5221f">5. Post-guardrail</text>
+<text x="835" y="164" text-anchor="middle" font-size="10.5">prohibited phrases blocked</text>
+<text x="835" y="180" text-anchor="middle" font-size="10.5">disclosure enforced (pre-TTS)</text>
+
+<rect x="950" y="120" width="120" height="70" rx="9" fill="#e8f0fe" stroke="#1a73e8"/>
+<text x="1010" y="150" text-anchor="middle" font-weight="bold">6. TTS</text>
+<text x="1010" y="170" text-anchor="middle" font-size="11">streamed audio</text>
+
+<rect x="1100" y="120" width="120" height="70" rx="9" fill="#e8f0fe" stroke="#1a73e8"/>
+<text x="1160" y="150" text-anchor="middle" font-weight="bold">7. Consumer</text>
+<text x="1160" y="170" text-anchor="middle" font-size="11">hears reply</text>
+</g>
+
+<line x1="170" y1="155" x2="210" y2="155" stroke="#1a73e8" stroke-width="2" marker-end="url(#a3)"/>
+<line x1="340" y1="155" x2="380" y2="155" stroke="#444" stroke-width="2" marker-end="url(#a2)"/>
+<line x1="530" y1="155" x2="570" y2="155" stroke="#444" stroke-width="2" marker-end="url(#a2)"/>
+<line x1="720" y1="155" x2="760" y2="155" stroke="#444" stroke-width="2" marker-end="url(#a2)"/>
+<line x1="910" y1="155" x2="950" y2="155" stroke="#1a73e8" stroke-width="2" marker-end="url(#a3)"/>
+<line x1="1070" y1="155" x2="1100" y2="155" stroke="#1a73e8" stroke-width="2" marker-end="url(#a3)"/>
+
+<!-- negotiation loop -->
+<rect x="380" y="300" width="530" height="220" rx="12" fill="#fff" stroke="#f9ab00" stroke-width="2"/>
+<text x="645" y="326" text-anchor="middle" font-size="15" font-weight="bold" fill="#b06000">Negotiation loop (mid-call, decision logic outside the agent)</text>
+
+<rect x="400" y="345" width="230" height="60" rx="8" fill="#fef7e0" stroke="#f9ab00"/>
+<text x="515" y="368" text-anchor="middle" font-size="12.5" font-weight="bold">Consumer proposes amount</text>
+<text x="515" y="386" text-anchor="middle" font-size="10.5">"I can pay $100 now"</text>
+
+<rect x="660" y="345" width="230" height="60" rx="8" fill="#fef7e0" stroke="#f9ab00"/>
+<text x="775" y="362" text-anchor="middle" font-size="12.5" font-weight="bold">Tool call → Decision Engine</text>
+<text x="775" y="380" text-anchor="middle" font-size="10.5">validate_offer(100, $1000 debt)</text>
+<text x="775" y="396" text-anchor="middle" font-size="10.5">→ REJECT: below 25% min ($250)</text>
+
+<rect x="400" y="440" width="490" height="60" rx="8" fill="#e6f4ea" stroke="#34a853"/>
+<text x="645" y="462" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#188038">Verdict + counter returned to agent → agent phrases it</text>
+<text x="645" y="482" text-anchor="middle" font-size="10.5">"$250 down + one payment of $750" — model words it, engine computed it</text>
+
+<line x1="645" y1="190" x2="515" y2="300" stroke="#444" stroke-width="2" marker-end="url(#a2)"/>
+<line x1="630" y1="375" x2="660" y2="375" stroke="#444" stroke-width="2" marker-end="url(#a2)"/>
+<line x1="775" y1="405" x2="645" y2="440" stroke="#444" stroke-width="2" marker-end="url(#a2)"/>
+<path d="M 500 440 Q 500 415 515 405" stroke="#444" stroke-width="2" fill="none" marker-end="url(#a2)"/>
+
+<!-- outcomes -->
+<rect x="950" y="300" width="270" height="220" rx="12" fill="#fff" stroke="#34a853" stroke-width="2"/>
+<text x="1085" y="326" text-anchor="middle" font-size="14" font-weight="bold" fill="#188038">Call outcomes (priority order)</text>
+<text x="965" y="352" font-size="11.5" fill="#333">1. Full payment ($1,000)</text>
+<text x="965" y="374" font-size="11.5" fill="#333">2. Downpayment + 1 payment</text>
+<text x="965" y="396" font-size="11.5" fill="#333">3. Settlement ≤20% off, ≤3 payments</text>
+<text x="965" y="418" font-size="11.5" fill="#333">4. Plan, no discount, ≤3 months</text>
+<text x="965" y="440" font-size="11.5" fill="#333">   (weekly / biweekly / monthly)</text>
+<text x="965" y="468" font-size="11.5" font-weight="bold" fill="#c5221f">Hard constraint: min payment ≥ 25%</text>
+<text x="965" y="494" font-size="11.5" fill="#333">Agreement logged → Postgres</text>
+<line x1="890" y1="470" x2="950" y2="410" stroke="#188038" stroke-width="2" marker-end="url(#a4)"/>
+
+<!-- escalation path -->
+<rect x="40" y="300" width="300" height="110" rx="12" fill="#fff" stroke="#ea4335" stroke-width="2"/>
+<text x="190" y="326" text-anchor="middle" font-size="14" font-weight="bold" fill="#c5221f">Escalation path</text>
+<text x="55" y="350" font-size="11.5" fill="#333">Dispute / hardship / distress / "human please"</text>
+<text x="55" y="370" font-size="11.5" fill="#333">→ interrupt() → checkpoint saved → human</text>
+<text x="55" y="390" font-size="11.5" fill="#333">takes over with full context + call summary</text>
+<line x1="380" y1="170" x2="300" y2="300" stroke="#ea4335" stroke-width="2" marker-end="url(#a2)"/>
+
+<!-- async logging -->
+<rect x="40" y="560" width="1180" height="120" rx="12" fill="#fff" stroke="#5f6368" stroke-width="2" stroke-dasharray="6,4"/>
+<text x="70" y="588" font-size="14" font-weight="bold" fill="#333">Async: logging, observability &amp; evals (never in the latency path)</text>
+<text x="70" y="612" font-size="11.5" fill="#444">Every step above emits OpenTelemetry spans → Langfuse: transcript, tool args/verdicts, guardrail events, tokens, cost, latency per turn</text>
+<text x="70" y="634" font-size="11.5" fill="#444">Post-call: 100% transcript compliance scoring + drift detection · continuous evals on 5–10% sample · failures feed back into golden dataset + regression suite</text>
+<text x="70" y="656" font-size="11.5" fill="#444">Final agreement → Postgres agreement log (amount, schedule, decision-engine record, consent, timestamp, full audit trail)</text>
+<line x1="645" y1="520" x2="645" y2="560" stroke="#5f6368" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#a2)"/>
+<line x1="1085" y1="520" x2="1085" y2="560" stroke="#5f6368" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#a2)"/>
+<line x1="190" y1="410" x2="190" y2="560" stroke="#5f6368" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#a2)"/>
+</svg>

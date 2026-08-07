@@ -31,6 +31,7 @@ from collector.guardrails.disclosures import (
     MINI_MIRANDA_TEXT,
     confirms_identity,
     fires_mini_miranda,
+    requests_ai_disclosure,
 )
 from collector.guardrails.numeric import Figure, FigureKind, extract_figures
 from collector.llm.base import LLMResponse, Message, ToolCall
@@ -40,6 +41,21 @@ from collector.llm.base import LLMResponse, Message, ToolCall
 _AGREE_RE = re.compile(
     r"\b(yes|yeah|yep|ok(ay)?|sure|fine|deal|agreed?|that works|i can do that|"
     r"let'?s do (that|it)|sounds good|i'?ll take it|sign me up)\b",
+    re.IGNORECASE,
+)
+# _AGREE_RE matches its bare tokens ("sure", "fine", "deal", "agreed") on word
+# boundary alone, so "I am not sure" reads as consent — which previously
+# closed the call AGREED off pure uncertainty. Mirrors
+# guardrails.disclosures.confirms_identity: a negation elsewhere in the
+# utterance wins over the bare affirmation it's attached to. Bare "no" is
+# deliberately not a blanket negator here — it's ordinary negotiation
+# vocabulary ("no, that's fine, go ahead") and would suppress more genuine
+# agreement than it would catch false positives — "no deal" is the one bare-
+# "no" idiom worth catching explicitly.
+_NEGATED_AGREE_RE = re.compile(
+    r"\b(?:not|never|don'?t|doesn'?t|didn'?t|haven'?t)\b[^.!?,]{0,20}?"
+    r"\b(?:sure|fine|ok(?:ay)?|deal|agreed?)\b"
+    r"|\bno\s+deal\b",
     re.IGNORECASE,
 )
 _REFUSE_RE = re.compile(
@@ -53,6 +69,19 @@ _DONE_RE = re.compile(
     r"we'?re done|end the call)\b",
     re.IGNORECASE,
 )
+# A plain factual question, not a proposal — parse_proposal correctly returns
+# None for it (no figures, no span, no explicit count), and it must not be
+# treated as generic filler either: it deserves a direct answer, not "here's
+# what I can do instead" or a re-prompt that ignores what was actually asked.
+_BALANCE_INQUIRY_RE = re.compile(
+    r"\bhow much (?:do|does|would) i (?:owe|need to pay)\b"
+    r"|\bwhat (?:do|does) i owe\b"
+    r"|\bwhat'?s (?:my|the) balance\b"
+    r"|\bwhat is (?:my|the) balance\b"
+    r"|\bhow much is owed\b"
+    r"|\bwhat'?s the amount\b",
+    re.IGNORECASE,
+)
 _PER_PAYMENT_RE = re.compile(
     r"(\b(a|per|every|each)\s+(week|month|paycheck|fortnight)\b|"
     r"\b(weekly|monthly|biweekly|bi-weekly|fortnightly)\b|/\s*(wk|mo))",
@@ -62,8 +91,10 @@ _CADENCE_WORDS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(bi-?weekly|fortnight|every (other|two) weeks?|paycheck)\b", re.I), "biweekly"),
     (re.compile(r"\b(week(ly)?|a week|per week|/\s*wk)\b", re.I), "weekly"),
     (re.compile(r"\b(month(ly)?|a month|per month|/\s*mo)\b", re.I), "monthly"),
-    (re.compile(r"\b(now|today|right away|up ?front|lump sum|one (payment|shot|go))\b", re.I),
-     "immediate"),
+    (
+        re.compile(r"\b(now|today|right away|up ?front|lump sum|one (payment|shot|go))\b", re.I),
+        "immediate",
+    ),
 )
 _COUNT_RE = re.compile(
     r"\b(?:in|over|across|split (?:it )?(?:in)?to|make it)\s+"
@@ -72,8 +103,17 @@ _COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 _WORD_COUNTS = {
-    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
 }
 # "for a year" carries no numeral, so the guardrail's figure extractor does not
 # see it — correctly, since it exists to catch figures in *agent* speech. Here
@@ -136,9 +176,7 @@ def parse_proposal(text: str) -> ParsedProposal | None:
             cadence=cadence,
             signaled_capacity=amount,
         )
-    return ParsedProposal(
-        total=amount, payment_count=1, cadence=cadence, signaled_capacity=amount
-    )
+    return ParsedProposal(total=amount, payment_count=1, cadence=cadence, signaled_capacity=amount)
 
 
 def _span_days(text: str, figures: tuple[Figure, ...]) -> Decimal | None:
@@ -178,7 +216,7 @@ class MockLLMClient:
         if last is not None and last.role == "system" and len(messages) > 1:
             return LLMResponse(text=self._after_block(last.content))
         if last is not None and last.role == "tool":
-            return LLMResponse(text=self._speak_from_tool(last.content))
+            return self._speak_from_tool(last.content)
         if not self._has_spoken(messages):
             return LLMResponse(text=self._opening())
         if last is not None and last.role == "consumer":
@@ -196,6 +234,29 @@ class MockLLMClient:
         )
 
     def _on_consumer(self, said: str, messages: tuple[Message, ...]) -> LLMResponse:
+        # Asking who/what they're talking to is not "substantive collection
+        # discussion" (that's the disclosure guard's own definition), so it
+        # is answered ahead of both gates below rather than behind them. Left
+        # behind the gates, an unanswered request trips
+        # AI_DISCLOSURE_REQUEST_IGNORED on every later candidate — including
+        # ones about something else entirely — and the call never recovers
+        # since nothing here ever actually fires the disclosure again.
+        if requests_ai_disclosure(said):
+            if not self._identity_confirmed(messages):
+                return LLMResponse(
+                    text=f"{AI_DISCLOSURE_TEXT} Am I speaking with the account holder?"
+                )
+            if not self._disclosed(messages):
+                return LLMResponse(
+                    text=(
+                        f"{AI_DISCLOSURE_TEXT} {MINI_MIRANDA_TEXT} I'm calling about an "
+                        "overdue account, and I'd like to find something that works for you."
+                    )
+                )
+            return LLMResponse(
+                text=f"{AI_DISCLOSURE_TEXT} Now, back to your account — what would work for you?"
+            )
+
         # Identity, then the Mini-Miranda, then anything about the account. The
         # order is load-bearing: the disclosure itself says "collect a debt",
         # which is substantive, so firing it before identity is confirmed is
@@ -211,9 +272,11 @@ class MockLLMClient:
             )
 
         if _DONE_RE.search(said):
-            return LLMResponse(tool_calls=(ToolCall(name="end_call", arguments={
-                "reason": "consumer ended the call"
-            }),))
+            return LLMResponse(
+                tool_calls=(
+                    ToolCall(name="end_call", arguments={"reason": "consumer ended the call"}),
+                )
+            )
 
         proposal = parse_proposal(said)
         if proposal is not None:
@@ -225,20 +288,35 @@ class MockLLMClient:
                 arguments["total"] = str(proposal.total)
             if proposal.signaled_capacity is not None:
                 arguments["signaled_capacity"] = str(proposal.signaled_capacity)
-            return LLMResponse(tool_calls=(
-                ToolCall(name="validate_consumer_offer", arguments=arguments),
-            ))
+            return LLMResponse(
+                tool_calls=(ToolCall(name="validate_consumer_offer", arguments=arguments),)
+            )
 
         offer_standing = self._standing_offer(messages) is not None
-        if _AGREE_RE.search(said) and offer_standing:
+        if _AGREE_RE.search(said) and offer_standing and not _NEGATED_AGREE_RE.search(said):
             return LLMResponse(tool_calls=(ToolCall(name="confirm_agreement"),))
         if _REFUSE_RE.search(said):
             if offer_standing:
-                return LLMResponse(tool_calls=(
-                    ToolCall(name="record_refusal"),
-                    ToolCall(name="concede"),
-                ))
-            return LLMResponse(tool_calls=(ToolCall(name="record_refusal"),))
+                return LLMResponse(
+                    tool_calls=(
+                        ToolCall(name="record_refusal"),
+                        ToolCall(name="concede"),
+                    )
+                )
+            # Nothing is on the table yet, so there is nothing to refuse —
+            # record_refusal alone left no offer, no change in state, and no
+            # way for a repeat of the same refusal to produce anything but
+            # the identical reply forever. Treated as any other opening
+            # reply: put a first offer up.
+            return LLMResponse(tool_calls=(ToolCall(name="propose_offer"),))
+        if _BALANCE_INQUIRY_RE.search(said):
+            standing = self._standing_offer(messages)
+            if standing is not None:
+                # A standing offer may already be a concession below the
+                # original balance — reading it back as "you currently owe"
+                # would misstate it as the debt itself.
+                return LLMResponse(text=self._describe(standing, lead="That's still"))
+            return LLMResponse(tool_calls=(ToolCall(name="propose_offer"),))
         if not offer_standing:
             return LLMResponse(tool_calls=(ToolCall(name="propose_offer"),))
         return LLMResponse(text="I hear you. What would work on your side?")
@@ -254,30 +332,57 @@ class MockLLMClient:
 
     # -- reading the conversation back -------------------------------------
 
-    def _speak_from_tool(self, content: str) -> str:
+    def _speak_from_tool(self, content: str) -> LLMResponse:
         payload = _load(content)
         if not payload.get("ok"):
-            return "Give me one moment — let me check what I can do here."
+            if "end_call" in str(payload.get("error", "")):
+                # Every tool refuses this way once the round cap is hit
+                # (tools.py's own instruction is to close out with end_call
+                # rather than keep negotiating) — without this, the call has
+                # no way to ever act on that refusal and just repeats a
+                # filler line forever.
+                return LLMResponse(
+                    tool_calls=(
+                        ToolCall(
+                            name="end_call",
+                            arguments={"reason": "negotiation round limit reached"},
+                        ),
+                    )
+                )
+            return LLMResponse(text="Give me one moment — let me check what I can do here.")
 
         if payload.get("agreed"):
             agreement = payload.get("agreement") or {}
-            return f"{self._describe(agreement)} I've got that recorded. Thank you."
+            return LLMResponse(
+                text=f"{self._describe(agreement)} I've got that recorded. Thank you."
+            )
 
         offer = payload.get("offer_on_the_table")
         if payload.get("outcome") == "accept":
-            return f"{self._describe(offer)} Can I get your okay on that?"
+            return LLMResponse(text=f"{self._describe(offer)} Can I get your okay on that?")
         if payload.get("moved") is False:
             # Nothing below this is available. Restating the same terms as a
             # concession is worse than saying plainly that this is the floor.
-            return (
-                f"I've gone as far as I'm able to on this one. {self._describe(offer)} "
-                "Is there any way that works?"
+            return LLMResponse(
+                text=(
+                    f"I've gone as far as I'm able to on this one. {self._describe(offer)} "
+                    "Is there any way that works?"
+                )
             )
         if offer:
-            return f"{self._reason(payload.get('rationale_code'))} {self._describe(offer)}"
-        return "Thank you for that. Let me see what I can do."
+            if "rationale_code" not in payload and "moved" not in payload:
+                # A fresh propose_offer: nothing has been refused yet to
+                # concede against, so this is the first figure spoken about
+                # the account (whether opening the negotiation or answering
+                # "how much do I owe"). "Here's what I can do instead" is
+                # only true after a refusal — reusing it here misrepresents
+                # the plain balance as a fallback concession.
+                return LLMResponse(text=self._describe(offer, lead="You currently owe"))
+            reason = self._reason(payload.get("rationale_code"))
+            return LLMResponse(text=f"{reason} {self._describe(offer)}")
+        return LLMResponse(text="Thank you for that. Let me see what I can do.")
 
-    def _describe(self, offer: object) -> str:
+    def _describe(self, offer: object, *, lead: str = "That's") -> str:
         """Read back an engine-authored offer using only its own figures."""
         if not isinstance(offer, dict):
             return "Here's where we are."
@@ -287,12 +392,12 @@ class MockLLMClient:
         schedule = offer.get("schedule") or []
 
         if count == 1:
-            return f"That's {total}, in one payment."
+            return f"{lead} {total}, in one payment."
         first = _dollars(schedule[0].get("amount")) if schedule else total
         if len({str(i.get("amount")) for i in schedule}) == 1:
-            return f"That's {total}, as {count} {cadence} payments of {first}."
+            return f"{lead} {total}, as {count} {cadence} payments of {first}."
         rest = ", then ".join(_dollars(i.get("amount")) for i in schedule[1:])
-        return f"That's {total}: {first} to start, then {rest}, {cadence}."
+        return f"{lead} {total}: {first} to start, then {rest}, {cadence}."
 
     def _reason(self, code: object) -> str:
         """Plain words for a rationale code. The engine decided; this only says so."""
@@ -303,6 +408,7 @@ class MockLLMClient:
             "SCHEDULE_TOO_LONG": "I can't stretch it out that far, I'm afraid.",
             "CADENCE_NOT_OFFERED": "I can't set it up on that schedule.",
             "DISCOUNT_NOT_AUTHORIZED": "I'm not able to reduce the balance on that arrangement.",
+            "PREFERRED_TIER_AVAILABLE": "I'd like to see if we can do better than that.",
         }.get(str(code), "Here's what I can do instead.")
 
     def _has_spoken(self, messages: tuple[Message, ...]) -> bool:
@@ -310,10 +416,7 @@ class MockLLMClient:
 
     def _identity_confirmed(self, messages: tuple[Message, ...]) -> bool:
         """Confirmed once they have answered the opening question affirmatively."""
-        return any(
-            m.role == "consumer" and confirms_identity(m.content)
-            for m in messages
-        )
+        return any(m.role == "consumer" and confirms_identity(m.content) for m in messages)
 
     def _disclosed(self, messages: tuple[Message, ...]) -> bool:
         """Has the Mini-Miranda already been spoken? Asked of the transcript

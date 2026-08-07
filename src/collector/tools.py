@@ -30,7 +30,7 @@ from collector.decision_engine import (
 )
 from collector.llm.base import ToolCall
 from collector.money import Money
-from collector.negotiation import NegotiationState
+from collector.negotiation import CallOutcome, NegotiationState
 from collector.offers import Cadence, ConsumerProposal, Offer, Tier
 from collector.policy import PolicyConfig
 
@@ -74,6 +74,7 @@ TOOL_SCHEMAS: tuple[ToolSchema, ...] = (
                     "type": "integer",
                     "description": "How many payments to split it into. 1 for a lump sum.",
                     "minimum": 1,
+                    "maximum": 1000,
                 },
                 "cadence": {
                     "type": "string",
@@ -240,12 +241,22 @@ def _cadence(value: object, default: Cadence = Cadence.MONTHLY) -> Cadence:
         ) from exc
 
 
+# Far above any legal payment count (the ladder tops out at 4), but low
+# enough that Money.allocate() on it is still cheap. Rejected here, before
+# ConsumerProposal.smallest_payment ever calls allocate() on the raw value —
+# a payment_count in the millions took 3+ seconds to reject otherwise
+# (ADVERSARIAL_TESTING.md M4).
+_MAX_SANE_PAYMENT_COUNT = 1000
+
+
 def _payment_count(value: object) -> int:
     if not isinstance(value, int | float | str | Decimal):
         raise ValueError(f"expected a payment count, got {type(value).__name__}")
     count = int(Decimal(str(value)))
     if count < 1:
         raise ValueError("payment_count must be at least 1")
+    if count > _MAX_SANE_PAYMENT_COUNT:
+        raise ValueError(f"payment_count must be at most {_MAX_SANE_PAYMENT_COUNT}")
     return count
 
 
@@ -254,6 +265,17 @@ def _payment_count(value: object) -> int:
 
 def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult:
     name = "validate_consumer_offer"
+    if context.state.is_exhausted:
+        # The round cap (anti-badgering) is enforced on propose_offer and
+        # concede; validate_consumer_offer must refuse the same way once
+        # exhausted, or the consumer can keep the negotiation open forever
+        # simply by continuing to name terms (ADVERSARIAL_TESTING.md M3).
+        return _error(
+            name,
+            context,
+            "this call has run its course; close it out with end_call rather than "
+            "evaluating another proposal",
+        )
     try:
         capacity_arg = args.get("signaled_capacity")
         total_arg = args.get("total")
@@ -278,10 +300,29 @@ def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult
         if verdict.outcome == "accept" and verdict.tier is not None
         else None
     )
+    # We never take more than we *asked* for. Same tier, same money, harsher
+    # schedule than the one on the table means they have agreed to our
+    # arrangement and mis-stated it, so it closes on ours: "two payments" read
+    # against the balance is an even $500/$500, and taking that over a standing
+    # $400/$600 raises the ask $100 on a turn the consumer spent agreeing.
+    #
+    # Only when the totals match. More than we asked for is not a mistake to
+    # correct — $900 against a standing $800 settlement is $100 they offered,
+    # and a $400/$600 offer answered with the whole $1,000 today is the best
+    # outcome on the list, not something to talk back down into instalments.
+    standing = context.standing_offer
+    if (
+        accepted is not None
+        and standing is not None
+        and standing.tier is accepted.tier
+        and standing.total == accepted.total
+        and _is_concession(standing, accepted)
+    ):
+        accepted = standing
     on_table = accepted or verdict.counter
     # Whatever they just proposed tells us what they think they can manage, and
     # every later counter and concession is built against that read.
-    state = context.state.with_capacity(effective_capacity(proposal))
+    state = context.state.with_capacity(effective_capacity(proposal, context.state))
     state = state.record_round(proposal, on_table, verdict.rationale_code)
     if verdict.outcome != "accept":
         # They named terms we cannot meet; that is a refusal of ours in all but
@@ -336,6 +377,13 @@ def _propose_offer(args: JsonDict, context: ToolContext) -> ToolResult:
 
 
 def _record_refusal(args: JsonDict, context: ToolContext) -> ToolResult:
+    if context.state.is_exhausted:
+        return _error(
+            "record_refusal",
+            context,
+            "this call has run its course; close it out with end_call rather than "
+            "recording another refusal",
+        )
     state = context.state.record_refusal()
     return ToolResult(
         name="record_refusal",
@@ -388,7 +436,17 @@ def _concede(args: JsonDict, context: ToolContext) -> ToolResult:
     # read back terms it is not authorized to agree to — and confirm_agreement
     # would then close on the standing offer, not the one just described.
     on_table = offer if moved else standing
-    state = stepped.record_round(None, offer, None) if moved else stepped
+    # When the step wasn't a concession, ``stepped`` still carries a spent
+    # refusal and a moved ladder floor from advance_ladder() — committing it
+    # anyway would consume the consumer's refusal for zero benefit. Keep the
+    # pristine input state instead, so the refusal is still on record for a
+    # concession that actually helps them (ADVERSARIAL_TESTING.md L1). The
+    # round itself must still be recorded either way: a non-concession is
+    # still an exchange, and once the ladder is bottomed out every further
+    # refusal would otherwise never advance the round count, leaving the
+    # round cap unreachable and the call unable to close (badgering with no
+    # backstop).
+    state = (stepped if moved else context.state).record_round(None, on_table, None)
     return ToolResult(
         name=name,
         payload={
@@ -421,6 +479,37 @@ def _is_concession(offer: Offer, standing: Offer | None) -> bool:
 
 def _confirm_agreement(args: JsonDict, context: ToolContext) -> ToolResult:
     name = "confirm_agreement"
+
+    # A dropped call replays exactly (module docstring) — including a replayed
+    # confirm_agreement after the call already closed. _step() raises on any
+    # transition attempted from a terminal state, so that must be checked
+    # here rather than fallen into; a plain second call to confirm the same
+    # agreement is not an error, it is exactly what a replay looks like.
+    if context.state.is_terminal:
+        if context.state.outcome is CallOutcome.AGREED and context.state.agreed_offer is not None:
+            agreed = context.state.agreed_offer
+            verdict = validate_offer(_as_proposal(agreed), context.state, context.policy)
+            return ToolResult(
+                name=name,
+                payload={
+                    "ok": True,
+                    "agreed": True,
+                    "agreement": _offer_payload(agreed),
+                    "conditions": [to_jsonable(c) for c in verdict.conditions],
+                    "you_may_say": _sayable(agreed),
+                },
+                context=context,
+                verdict=verdict,
+                offer=agreed,
+                agreed_offer=agreed,
+                ends_call=True,
+            )
+        return _error(
+            name,
+            context,
+            f"the call is already closed ({context.state.outcome.value}); nothing further",
+        )
+
     offer = context.standing_offer
     if offer is None:
         return _error(name, context, "there is no offer on the table to agree to")
@@ -496,8 +585,7 @@ def execute(call: ToolCall, context: ToolContext) -> ToolResult:
         return _error(
             call.name,
             context,
-            f"{call.name!r} is not an available action. Available: "
-            f"{', '.join(sorted(TOOL_NAMES))}",
+            f"{call.name!r} is not an available action. Available: {', '.join(sorted(TOOL_NAMES))}",
         )
     if context.state.is_terminal and call.name not in {"end_call", "confirm_agreement"}:
         return _error(

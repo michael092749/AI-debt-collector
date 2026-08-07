@@ -122,8 +122,9 @@ class AnthropicClient:
                         call_id=block.id,
                     )
                 )
-        return LLMResponse(text=" ".join(p.strip() for p in text_parts).strip(),
-                           tool_calls=tuple(calls))
+        return LLMResponse(
+            text=" ".join(p.strip() for p in text_parts).strip(), tool_calls=tuple(calls)
+        )
 
 
 def _to_anthropic(messages: tuple[Message, ...]) -> tuple[str, list[JsonDict]]:
@@ -159,6 +160,26 @@ def _to_anthropic(messages: tuple[Message, ...]) -> tuple[str, list[JsonDict]]:
             conversation.append({"role": "assistant", "content": message.content})
         elif message.role == "tool":
             conversation.extend(_tool_exchange(message))
+
+    if not conversation:
+        # open_call's first respond() (SPEC ring 1) has nothing but the system
+        # prompt in `messages`, which is stripped above into `system`. The
+        # Messages API rejects an empty `messages` list outright, so a
+        # synthetic turn kicks the model into producing the opening line.
+        conversation.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "<call_started>The call has just connected. Greet the "
+                            "consumer and open the conversation.</call_started>"
+                        ),
+                    }
+                ],
+            }
+        )
 
     return system, conversation
 

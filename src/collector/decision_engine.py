@@ -36,6 +36,7 @@ class RuleId(StrEnum):
     PAYMENT_COUNT = "PAYMENT_COUNT"
     CADENCE = "CADENCE"
     MAX_DURATION = "MAX_DURATION"
+    LADDER = "LADDER"
 
 
 class RationaleCode(StrEnum):
@@ -48,6 +49,7 @@ class RationaleCode(StrEnum):
     SCHEDULE_TOO_LONG = "SCHEDULE_TOO_LONG"
     CADENCE_NOT_OFFERED = "CADENCE_NOT_OFFERED"
     DISCOUNT_NOT_AUTHORIZED = "DISCOUNT_NOT_AUTHORIZED"
+    PREFERRED_TIER_AVAILABLE = "PREFERRED_TIER_AVAILABLE"
 
 
 @dataclass(frozen=True)
@@ -91,7 +93,11 @@ def classify(proposal: ConsumerProposal, policy: PolicyConfig) -> Tier:
 
 
 def _evaluate(
-    proposal: ConsumerProposal, tier: Tier, policy: PolicyConfig
+    proposal: ConsumerProposal,
+    tier: Tier,
+    policy: PolicyConfig,
+    ladder_floor: Tier,
+    repeated: bool,
 ) -> tuple[Condition, ...]:
     max_payments = policy.max_payments_for(tier)
     smallest = proposal.smallest_payment
@@ -133,6 +139,17 @@ def _evaluate(
             f"{proposal.duration_days} days",
             f"<= {policy.max_plan_days} days",
         ),
+        # Last, so a proposal that also breaks a real limit is answered on that
+        # limit rather than on our preferences. This one is not a policy floor:
+        # the terms are legal, they are simply further down the list than the
+        # negotiation has reached — so we ask once for better, and take them at
+        # their word when they hold to it.
+        Condition(
+            RuleId.LADDER,
+            tier <= ladder_floor or repeated,
+            tier.label,
+            f"no worse than {ladder_floor.label}, or terms held to through a counter",
+        ),
     )
 
 
@@ -143,6 +160,7 @@ _FAILURE_CODES: dict[RuleId, RationaleCode] = {
     RuleId.PAYMENT_COUNT: RationaleCode.TOO_MANY_PAYMENTS,
     RuleId.CADENCE: RationaleCode.CADENCE_NOT_OFFERED,
     RuleId.MAX_DURATION: RationaleCode.SCHEDULE_TOO_LONG,
+    RuleId.LADDER: RationaleCode.PREFERRED_TIER_AVAILABLE,
 }
 
 
@@ -167,9 +185,22 @@ def validate_offer(
 
     This is the tool the agent calls mid-call. The agent phrases the result; it
     never computes one.
+
+    Legal is not the same as agreeable. The tiers are a preference order, and a
+    proposal below where the ladder currently stands is countered at the ladder
+    rather than taken — otherwise the first thing a consumer says decides the
+    outcome and there was never a negotiation (A7).
+
+    Countered once, though, not forever. Someone who hears the better ask and
+    repeats their own terms has said no to it, and their arrangement is legal;
+    holding out for a tier they have twice declined loses an account we could
+    have closed. It is also the only way down to a payment plan, since raising
+    the ask from a settlement is not something the agent may do (``_concede``).
     """
     tier = classify(proposal, policy)
-    conditions = _evaluate(proposal, tier, policy)
+    conditions = _evaluate(
+        proposal, tier, policy, state.ladder_floor, _held_to(proposal, tier, state, policy)
+    )
 
     if all(c.passed for c in conditions):
         return Verdict(
@@ -185,7 +216,7 @@ def validate_offer(
     counter = build_counter(
         state,
         policy,
-        capacity=effective_capacity(proposal),
+        capacity=effective_capacity(proposal, state),
         preferred_cadence=proposal.cadence,
     )
     failed = {c.rule_id for c in conditions if not c.passed}
@@ -202,19 +233,61 @@ def validate_offer(
 
 # Violating one of these means the *amount* is unacceptable -> reject.
 # Anything else means the amount is fine but the *structure* is wrong -> counter.
-_HARD_FLOORS = frozenset(
-    {RuleId.TOTAL_FLOOR, RuleId.MIN_PAYMENT, RuleId.NO_UNAUTHORIZED_DISCOUNT}
-)
+_HARD_FLOORS = frozenset({RuleId.TOTAL_FLOOR, RuleId.MIN_PAYMENT, RuleId.NO_UNAUTHORIZED_DISCOUNT})
 
 
-def effective_capacity(proposal: ConsumerProposal) -> Money:
+def _held_to(
+    proposal: ConsumerProposal, tier: Tier, state: NegotiationState, policy: PolicyConfig
+) -> bool:
+    """Have they put these terms up before and heard the better ask?
+
+    Rounds are recorded *after* the verdict is computed (``tools.py``), so the
+    first time terms are named this is False and they get countered; a consumer
+    who holds to them across that counter finds it True on the way back.
+
+    Two clauses do the real work, and both close a door back to the leapfrog:
+
+    ``PREFERRED_TIER_AVAILABLE`` — the earlier round must have been countered
+    for the ladder and nothing else. Otherwise an *illegal* proposal unlocks its
+    tier for a later legal one: "can I pay $77 a week?" is a T4 shape, refused
+    on the payment floor, and the "$250 a month" that follows would walk into
+    the worst outcome with no counter ever made at the ladder.
+
+    ``total >= ...`` — and they must have held to the terms, not sharpened them.
+    Without it "settle at $900" answered by a counter becomes "$800, then", and
+    the ladder would have talked us *down* $100.
+    """
+    return any(
+        r.proposal is not None
+        and classify(r.proposal, policy) is tier
+        and r.rationale_code == RationaleCode.PREFERRED_TIER_AVAILABLE
+        and proposal.total >= r.proposal.total
+        for r in state.rounds
+    )
+
+
+def effective_capacity(proposal: ConsumerProposal, state: NegotiationState) -> Money:
     """What this proposal reveals the consumer thinks they can pay at a time.
 
-    An explicit signal wins; otherwise their own smallest instalment is the
-    honest read. Someone asking for 13 weekly payments of $77 has told us $77,
-    even though they never said a capacity out loud.
+    An explicit signal wins outright: it is the latest thing they actually said,
+    and it may move the figure in either direction. Otherwise their own smallest
+    instalment is the honest read — someone asking for 13 weekly payments of $77
+    has told us $77 without ever saying a capacity out loud.
+
+    But a figure we inferred may only *lower* one they stated. Inference reads a
+    ceiling, never a floor: a lump sum they are asking us to accept says nothing
+    about what they can produce, and where no sum was named at all the shape is
+    scored against the balance, so the "capacity" is arithmetic on a default.
+    Left unclamped, both talk over the number the consumer gave us — $300 said
+    three times became a counter built on $500 — and the next counter comes back
+    harder than the one they just refused.
     """
-    return proposal.signaled_capacity or proposal.smallest_payment
+    if proposal.signaled_capacity is not None:
+        return proposal.signaled_capacity
+    inferred = proposal.smallest_payment
+    if state.signaled_capacity is not None:
+        return min(inferred, state.signaled_capacity)
+    return inferred
 
 
 # -- counter construction --------------------------------------------------
@@ -225,36 +298,42 @@ def _tier_total(tier: Tier, policy: PolicyConfig) -> Money:
     return policy.settlement_floor if tier is Tier.SETTLEMENT else policy.original_balance
 
 
-def _feasible(tier: Tier, capacity: Money | None, policy: PolicyConfig) -> bool:
-    if capacity is None:
-        return True  # no signal: stay optimistic and ask for the best tier left
-    if tier is Tier.PAY_IN_FULL:
-        return capacity >= policy.original_balance
-    return capacity >= policy.min_payment
-
-
 def select_tier(state: NegotiationState, policy: PolicyConfig, capacity: Money | None) -> Tier:
-    """Highest-preference tier still both feasible and permitted.
+    """The tier the ladder currently stands on, and only that one.
 
-    Never better than ``ladder_floor`` - concessions only move one way (A4).
-    If nothing is feasible the consumer cannot meet the floor at all; we return
-    the most affordable legal structure and let the agent say so plainly rather
-    than inventing something below policy.
+    Every tier below the floor is a concession that has not been earned yet, so
+    there is nothing to choose between: the offer is the floor. ``capacity``
+    shapes the schedule *inside* the tier — how large a downpayment, how many
+    instalments — and is deliberately not allowed to choose the tier itself.
+
+    It used to. The engine skipped any tier whose whole total could not be paid
+    at the signalled capacity, which meant naming "$77 a week" on the first turn
+    collected all three concessions at once and put the worst outcome on the
+    table before anything had been refused. A tier the consumer cannot fund is
+    answered by them refusing it, which earns exactly one step down (A7).
     """
-    for tier in Tier:
-        if tier >= state.ladder_floor and _feasible(tier, capacity, policy):
-            return tier
-    return Tier.PAYMENT_PLAN
+    return state.ladder_floor
 
 
-def _allocate(total: Money, parts: int, floor: Money) -> tuple[Money, ...]:
+def _allocate(
+    total: Money, parts: int, floor: Money, capacity: Money | None = None
+) -> tuple[Money, ...]:
     """Split ``total`` into ``parts`` instalments that each clear ``floor``.
 
-    Even where possible - "three payments of $266.67" is easier to agree to
-    than a lopsided schedule. Only when an even split would dip below the floor
-    do we pin instalments at the floor and put the remainder on the last one.
+    A capacity they named out loud is taken at its word and leads the schedule:
+    someone who says "$400" gets $400 now and $300/$300 after, not three even
+    payments of $333.34. Money sooner is worth more than a tidy schedule, and
+    it is the same instinct as maximizing the downpayment one tier up.
+
+    Otherwise even - "three payments of $266.67" is easier to agree to than a
+    lopsided schedule. Only when an even split would dip below the floor do we
+    pin instalments at the floor and put the remainder on the last one.
     """
     even = total.allocate(parts)
+    if capacity is not None and parts > 1 and capacity > even[0]:
+        rest = (total - capacity).allocate(parts - 1)
+        if min(rest) >= floor:
+            return (capacity, *rest)
     if min(even) >= floor:
         return even
     remainder = total - floor * (parts - 1)
@@ -310,7 +389,7 @@ def build_counter(
         allowed = min(policy.max_payments_for(tier), headroom)
         wanted = payments if payments is not None else _payments_for(total, capacity)
         parts = max(1, min(wanted, allowed))
-        amounts = _allocate(total, parts, policy.min_payment)
+        amounts = _allocate(total, parts, policy.min_payment, capacity)
 
     cadence = _counter_cadence(preferred_cadence, len(amounts), policy)
     installments = tuple(

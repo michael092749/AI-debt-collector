@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "livekit-docs": {
+      "type": "http",
+      "url": "https://docs.livekit.io/mcp"
+    },
+    "sqlite": {
+      "command": "uvx",
+      "args": ["mcp-server-sqlite", "--db-path", "data/collector.db"]
+    }
+  }
+}

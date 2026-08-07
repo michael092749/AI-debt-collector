@@ -11,7 +11,6 @@ client. Everything runs offline against a tmp_path database; the real
 from __future__ import annotations
 
 import json
-import sqlite3
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -77,9 +76,15 @@ def lowball(policy: PolicyConfig) -> Verdict:
 
 @pytest.fixture
 def accepted(policy: PolicyConfig) -> Verdict:
-    """$800 over three monthly payments — accepted at T3."""
+    """$800 over three monthly payments — accepted at T3.
+
+    Read against a call that has already conceded its way down to settlement:
+    the same terms proposed cold are countered, not taken, because the ladder
+    has not reached them yet (A7).
+    """
     proposal = ConsumerProposal(Money("800"), 3, Cadence.MONTHLY)
-    return validate_offer(proposal, NegotiationState.opening(policy), policy)
+    state = NegotiationState.opening(policy).conceded_to(Tier.SETTLEMENT)
+    return validate_offer(proposal, state, policy)
 
 
 @pytest.fixture
@@ -104,9 +109,7 @@ def record_call(store: AuditStore, lowball: Verdict, accepted: Verdict) -> None:
             at="2026-01-01T12:00:00+00:00",
         )
     )
-    store.record(
-        TurnRecorded(CALL_ID, 0, Speaker.AGENT, "This is a call about a debt.", at="t0")
-    )
+    store.record(TurnRecorded(CALL_ID, 0, Speaker.AGENT, "This is a call about a debt.", at="t0"))
     store.record(TurnRecorded(CALL_ID, 1, Speaker.CONSUMER, "I can do two hundred.", at="t1"))
     store.record(
         DecisionRecorded(
@@ -211,7 +214,7 @@ class TestSchema:
 
     def test_money_columns_are_text_never_real(self, store: AuditStore) -> None:
         """SQLite REAL is a float. Money lives in TEXT columns or it is a bug."""
-        rows = store._conn.execute("PRAGMA table_info(agreements)").fetchall()
+        rows = store._rows("PRAGMA table_info(agreements)", ())
         types = {r["name"]: r["type"] for r in rows}
         assert types["total"] == "TEXT"
         assert "REAL" not in set(types.values())
@@ -266,9 +269,7 @@ class TestTrace:
         self, store: AuditStore, agreement: AgreementRecord
     ) -> None:
         del agreement
-        row = store._conn.execute(
-            "SELECT * FROM calls WHERE call_id = ?", (CALL_ID,)
-        ).fetchone()
+        row = store._rows("SELECT * FROM calls WHERE call_id = ?", (CALL_ID,))[0]
 
         assert row["original_balance"] == "1000.00"
         assert row["outcome"] == CallOutcome.AGREED.value
@@ -316,9 +317,7 @@ class TestAgreementRecord:
         # The rejection's full trail rides along, not just its outcome.
         assert len(rejected.conditions) == len(RuleId)
 
-    def test_carries_guardrail_events_and_escalations(
-        self, agreement: AgreementRecord
-    ) -> None:
+    def test_carries_guardrail_events_and_escalations(self, agreement: AgreementRecord) -> None:
         assert [g.rule_id for g in agreement.guardrail_events] == ["PROHIBITED_THREAT"]
         assert [e.trigger for e in agreement.escalations] == [EscalationTrigger.DISPUTE]
 
@@ -326,9 +325,7 @@ class TestAgreementRecord:
         assert agreement.confirmation.confirmed is True
         assert agreement.confirmation.turn_index == 8
 
-    def test_refuses_an_unconfirmed_arrangement(
-        self, accepted: Verdict, store: AuditStore
-    ) -> None:
+    def test_refuses_an_unconfirmed_arrangement(self, accepted: Verdict, store: AuditStore) -> None:
         with pytest.raises(ValueError, match="unconfirmed"):
             store.finalize_agreement(
                 call_id=CALL_ID,
@@ -390,7 +387,7 @@ class TestSerialization:
     ) -> None:
         del agreement
         for table in store.table_names():
-            for row in store._conn.execute(f"SELECT * FROM {table}"):
+            for row in store._rows(f"SELECT * FROM {table}", ()):
                 for key, value in dict(row).items():
                     assert not isinstance(value, float), f"{table}.{key} is a float"
                     if isinstance(value, str) and value.startswith("{"):
@@ -453,10 +450,10 @@ class TestRoundTrip:
         self, store: AuditStore, agreement: AgreementRecord
     ) -> None:
         """Production sampling (SPEC §7.3) needs to filter without parsing JSON."""
-        row = store._conn.execute(
+        row = store._rows(
             "SELECT * FROM agreements WHERE tier = ? AND total >= ?",
             (Tier.SETTLEMENT.name, "800.00"),
-        ).fetchone()
+        )[0]
 
         assert row["agreement_id"] == agreement.agreement_id
         assert row["payment_count"] == 3
@@ -548,5 +545,9 @@ def test_store_is_usable_without_a_context_manager(tmp_path: Path) -> None:
         assert store.turns(CALL_ID)[0].text == "hi"
     finally:
         store.close()
-    with pytest.raises(sqlite3.ProgrammingError):
+    # close() shuts down the store's dedicated worker thread (see
+    # test_audit_store_threading.py), so a post-close call now fails when
+    # `_run` tries to submit to that dead executor rather than when sqlite3
+    # notices the connection is closed.
+    with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
         store.turns(CALL_ID)

@@ -19,6 +19,7 @@ fifth file.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -150,6 +151,9 @@ _RULES: tuple[_Rule, ...] = (
         r"\boff\s+the\s+table\b",
         r"\bwon'?t\s+be\s+(?:available|here|around)\s+(?:again|tomorrow|later)\b",
         r"\bif\s+you\s+hang\s+up\b",
+        r"\bdon'?t\s+stick\s+around\b",
+        r"\bcan'?t\s+promise\s+(?:this|that|it)?\s*(?:option|offer|deal|rate)?\s*"
+        r"will\s+(?:still\s+)?be\s+here\b",
     ),
     _rule(
         ProhibitedRuleId.INVENTED_CONSEQUENCE,
@@ -167,6 +171,11 @@ _RULES: tuple[_Rule, ...] = (
         r"\bnever\s+be\s+able\s+to\s+(?:get|borrow|rent|buy|finance)\b",
         r"\bnotify\s+(?:the\s+)?(?:irs|police|authorities|immigration)\b",
         r"\bdeport(?:ed|ation)?\b",
+        r"\bescalate\s+for\s+you\b",
+        r"\bconsequences\s+to\s+(?:letting\s+this\s+go\s+further|this|not\s+paying)\b",
+        r"\byou\s+won'?t\s+like\s+(?:them|it|what\s+happens)\b",
+        r"\b(?:affects?|hurts?|damages?)\s+your\s+standing\s+with\s+lenders\b",
+        r"\bnext\s+step\s+isn'?t\s+one\s+you\s+want\b",
     ),
     _rule(
         ProhibitedRuleId.ABUSIVE_LANGUAGE,
@@ -203,12 +212,115 @@ _NEGATION_RE = re.compile(
     re.IGNORECASE,
 )
 
-_CLAUSE_BREAK_RE = re.compile(r"[,;:.!?]")
+# A clause boundary for negation-scoping purposes is not just punctuation.
+# Two run-on constructions launder a threat past the punctuation-only check:
+#
+#   "This isn't me being difficult, but if you can't work with me today
+#    we will garnish your wages."
+#
+# The negation cue ("isn't"/"can't") sits in a *different* clause from the
+# threat ("we will garnish") even though nothing but a comma-free coordinating
+# or subordinating conjunction separates them. And within an "if"-clause
+# itself, a new-subject assertion ("we will", "I'll", "they're going to")
+# hands the sentence off to a different actor's promise, which is exactly the
+# threat this rule exists to catch — so that handoff is a clause break too,
+# even mid-clause.
+_CLAUSE_BREAK_RE = re.compile(
+    r"[,;:.!?]"
+    r"|\b(?:and|but|if|when|unless|while)\b"
+    # won'?t is deliberately excluded here: it is the negation cue _NEGATION_RE
+    # relies on for this same branch, not a new-subject clause boundary, and
+    # including it lets .split() consume and discard it before _is_negated
+    # ever sees it (e.g. "We won't sue you." would wrongly block).
+    r"|\b(?:we|i|you|they|it)\s+(?:will|are\s+going\s+to|is\s+going\s+to)\b"
+    r"|\b(?:we|i|you|they|it)'ll\b",
+    re.IGNORECASE,
+)
 
 
 def _normalize_apostrophes(text: str) -> str:
     """Curly quotes in, straight quotes out — same length, so spans stay valid."""
     return text.replace("’", "'")
+
+
+# -- evasion normalization --------------------------------------------------
+#
+# Two ways an otherwise verbatim-matching threat slips past every rule above:
+# a Unicode format/invisible character breaking word adjacency ("sue[ZWSP]
+# you"), or a visually-identical character from another script standing in
+# for a Latin letter ("we will ѕue you", Cyrillic U+0455). Neither trips
+# anything until the candidate is normalized first (ADVERSARIAL_TESTING.md
+# H3). NFKC alone does not catch the second case: Cyrillic 's' is not a
+# compatibility decomposition of Latin 's', so it is folded by an explicit
+# lookalike table instead.
+
+_SUSPICIOUS_CATEGORIES = frozenset({"Cf", "Cc", "Zs", "Zl", "Zp"})
+
+# The classic IDN-homograph set: Cyrillic and Greek letters visually
+# indistinguishable from a Latin one at TTS/reading speed.
+_CONFUSABLES: dict[str, str] = {
+    "а": "a",
+    "А": "A",
+    "в": "b",
+    "В": "B",
+    "е": "e",
+    "Е": "E",
+    "і": "i",
+    "І": "I",
+    "к": "k",
+    "К": "K",
+    "м": "m",
+    "М": "M",
+    "н": "h",
+    "Н": "H",
+    "о": "o",
+    "О": "O",
+    "р": "p",
+    "Р": "P",
+    "с": "c",
+    "С": "C",
+    "ѕ": "s",
+    "Ѕ": "S",
+    "т": "t",
+    "Т": "T",
+    "у": "y",
+    "У": "Y",
+    "х": "x",
+    "Х": "X",
+    "α": "a",
+    "β": "b",
+    "ο": "o",
+    "ρ": "p",
+    "τ": "t",
+    "υ": "u",
+    "χ": "x",
+}
+
+
+def _strip_invisible(text: str) -> str:
+    """Neutralize evasion whitespace — replaced with a space, never deleted.
+
+    Deleting "we will[ZWSP]garnish" would join it into "we willgarnish" and
+    kill the rule's own \\b word-boundary anchors, opening a *worse* bypass
+    than the one this normalization exists to close. A space in its place
+    keeps "garnish" a real word while still breaking whatever adjacency the
+    evasion character was relying on.
+    """
+    return "".join(
+        " " if ch != " " and unicodedata.category(ch) in _SUSPICIOUS_CATEGORIES else ch
+        for ch in text
+    )
+
+
+def _fold_confusables(text: str) -> str:
+    return "".join(_CONFUSABLES.get(ch, ch) for ch in text)
+
+
+def _normalize_for_matching(text: str) -> str:
+    text = _normalize_apostrophes(text)
+    text = unicodedata.normalize("NFKC", text)
+    text = _strip_invisible(text)
+    return _fold_confusables(text)
 
 
 def _is_negated(text: str, start: int) -> bool:
@@ -224,7 +336,11 @@ def scan_prohibited(candidate: str) -> tuple[Violation, ...]:
     me?" is not a threat, and treating it as one would block the agent for the
     consumer's words.
     """
-    haystack = _normalize_apostrophes(candidate)
+    # ``haystack`` may differ in length from ``candidate`` once invisible
+    # characters are stripped, so spans below are reported against the
+    # normalized text, not resliced from the original — still an accurate,
+    # readable record of what was actually said once evasion is undone.
+    haystack = _normalize_for_matching(candidate)
     violations: list[Violation] = []
     for rule in _RULES:
         for match in rule.pattern.finditer(haystack):
@@ -234,7 +350,7 @@ def scan_prohibited(candidate: str) -> tuple[Violation, ...]:
                 Violation(
                     rule_id=rule.rule_id,
                     severity=Severity.BLOCK,
-                    span=candidate[match.start() : match.end()],
+                    span=match.group(0),
                     start=match.start(),
                     end=match.end(),
                     detail=f"{rule.rule_id}: {rule.detail}",

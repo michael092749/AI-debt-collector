@@ -154,13 +154,40 @@ class TestRoundCap:
 
 class TestEngineIntegration:
     def test_counter_tier_tracks_the_ladder(self) -> None:
-        """The engine reads ladder_floor, so conceding here changes what the
-        engine is willing to put on the table."""
-        s = _state().with_capacity(Money("300"))
+        """The engine reads ladder_floor, so conceding here — and only conceding
+        — changes what the engine is willing to put on the table."""
+        s = _state().with_capacity(Money("500"))
         first = build_counter(s, POLICY, capacity=s.signaled_capacity)
-        assert first.tier is Tier.DOWNPAYMENT_PLUS_ONE
+        assert first.tier is Tier.PAY_IN_FULL, "a capacity signal is not a concession"
 
-        s = s.record_refusal().advance_ladder().record_refusal().advance_ladder()
+        s = s.record_refusal().advance_ladder()
+        assert build_counter(s, POLICY, capacity=s.signaled_capacity).tier is (
+            Tier.DOWNPAYMENT_PLUS_ONE
+        )
+
+        s = s.record_refusal().advance_ladder()
         later = build_counter(s, POLICY, capacity=s.signaled_capacity)
         assert later.tier is Tier.SETTLEMENT
         assert later.total == Money("800.00"), "settlement unlocks the 20% discount"
+
+    def test_a_low_capacity_buys_no_discount_and_no_free_steps(self) -> None:
+        """$300 leaves T2 out of reach — two payments cannot cover $1,000 — and
+        it used to be answered by dropping straight to a four-payment plan, the
+        worst outcome on the list, with nothing refused. Capacity shapes the
+        schedule; it never walks the ladder. The 20% especially is conceded to,
+        never fallen into (A3)."""
+        s = _state().with_capacity(Money("300"))
+        offer = build_counter(s, POLICY, capacity=s.signaled_capacity)
+
+        assert offer.tier is Tier.PAY_IN_FULL
+        assert offer.total == Money("1000.00")
+
+    def test_capacity_shapes_the_schedule_once_the_ladder_reaches_a_plan(self) -> None:
+        """Where the tier can hold it, the stated capacity is honoured to the
+        cent — that is the half of the old behaviour worth keeping."""
+        s = _state().with_capacity(Money("300")).conceded_to(Tier.PAYMENT_PLAN)
+        offer = build_counter(s, POLICY, capacity=s.signaled_capacity)
+
+        assert offer.tier is Tier.PAYMENT_PLAN
+        assert offer.total == Money("1000.00")
+        assert all(i.amount <= Money("300") for i in offer.installments)

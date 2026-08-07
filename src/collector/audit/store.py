@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import TracebackType
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from collector.audit.events import (
     AgreementRecord,
@@ -109,12 +112,25 @@ _TRACE_EVENT_TYPES = (
     EventType.ESCALATION.value,
 )
 
+_T = TypeVar("_T")
+
 
 class AuditStore:
     """Append-only trace log for one collector deployment.
 
     The path is a constructor argument with no hidden default lookup so tests
     can point at a ``tmp_path`` and never touch the real ``data/`` directory.
+
+    The sqlite3 connection is only ever touched from one dedicated worker
+    thread, owned by this store for its entire life (``self._executor``, a
+    single-worker ``ThreadPoolExecutor``). Callers — the asyncio event loop
+    via ``asyncio.to_thread``, which does not guarantee the same OS thread
+    across separate calls, and the plain synchronous callers in
+    ``text_app.py`` — can be on any thread; every touch of ``self._conn``
+    routes through ``self._run``, which hands the work to the store's own
+    worker thread and blocks for the result. This keeps the public API fully
+    synchronous while satisfying sqlite3's ``check_same_thread`` requirement
+    that the connection only ever be used from the thread that created it.
     """
 
     def __init__(
@@ -127,31 +143,66 @@ class AuditStore:
         default_json_dir = self.db_path.parent / "agreements"
         self.json_dir = Path(json_dir) if json_dir is not None else default_json_dir
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path)
-        self._conn.row_factory = sqlite3.Row
+        self._store_thread: threading.Thread | None = None
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="audit-store")
+        self._conn = self._run(self._connect)
         self.create_schema()
+
+    def _run(self, fn: Callable[[], _T]) -> _T:
+        """Run ``fn`` on the store's dedicated worker thread and block for its
+        result, so ``self._conn`` is only ever touched from the one thread
+        that created it — regardless of which thread the caller is on.
+
+        Reentrancy-aware: if this is already running as a task on the store's
+        own worker thread (e.g. a wrapped method calling another wrapped
+        method), run ``fn`` inline instead of submitting. With
+        ``max_workers=1``, submitting from inside the one worker thread while
+        it is busy running this very call would block forever waiting on a
+        queue only that same, currently-busy thread could ever drain.
+        """
+        if self._store_thread is not None and threading.current_thread() is self._store_thread:
+            return fn()
+
+        def _task() -> _T:
+            self._store_thread = threading.current_thread()
+            return fn()
+
+        return self._executor.submit(_task).result()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
     def create_schema(self) -> None:
         """Idempotent: every statement is IF NOT EXISTS, so reopening an
         existing database is a no-op rather than an error or a truncation."""
-        with self._conn:
-            self._conn.executescript(SCHEMA)
+
+        def _create() -> None:
+            with self._conn:
+                self._conn.executescript(SCHEMA)
+
+        self._run(_create)
 
     # -- recording ---------------------------------------------------------
 
     def record(self, event: TraceEvent) -> None:
         """Single entry point for the agent loop: hand it any trace event."""
-        match event:
-            case CallStarted():
-                self._record_call_started(event)
-            case CallEnded():
-                self._record_call_ended(event)
-            case DecisionRecorded():
-                self._record_decision(event)
-            case TurnRecorded() | GuardrailTripped() | Escalated():
-                self._record_trace_row(event)
-            case _:
-                raise TypeError(f"not a trace event: {type(event).__name__}")
+
+        def _dispatch() -> None:
+            match event:
+                case CallStarted():
+                    self._record_call_started(event)
+                case CallEnded():
+                    self._record_call_ended(event)
+                case DecisionRecorded():
+                    self._record_decision(event)
+                case TurnRecorded() | GuardrailTripped() | Escalated():
+                    self._record_trace_row(event)
+                case _:
+                    raise TypeError(f"not a trace event: {type(event).__name__}")
+
+        self._run(_dispatch)
 
     def _record_call_started(self, event: CallStarted) -> None:
         with self._conn:
@@ -273,32 +324,36 @@ class AuditStore:
 
     def record_agreement(self, record: AgreementRecord) -> Path:
         """Persist a pre-assembled record. Returns the standalone JSON path."""
-        json_path = self.export_agreement(record)
-        final_day = max((i.due_day_offset for i in record.schedule), default=0)
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT OR REPLACE INTO agreements
-                    (agreement_id, call_id, tier, total, payment_count, cadence,
-                     final_day_offset, rationale_code, confirmed, record_json, json_path, at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.agreement_id,
-                    record.call_id,
-                    record.tier.name,
-                    str(record.total.amount),
-                    len(record.schedule),
-                    record.cadence.value,
-                    final_day,
-                    record.rationale_code.value,
-                    int(record.confirmation.confirmed),
-                    record.to_json(indent=None),
-                    str(json_path),
-                    record.at,
-                ),
-            )
-        return json_path
+
+        def _persist() -> Path:
+            json_path = self.export_agreement(record)
+            final_day = max((i.due_day_offset for i in record.schedule), default=0)
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO agreements
+                        (agreement_id, call_id, tier, total, payment_count, cadence,
+                         final_day_offset, rationale_code, confirmed, record_json, json_path, at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.agreement_id,
+                        record.call_id,
+                        record.tier.name,
+                        str(record.total.amount),
+                        len(record.schedule),
+                        record.cadence.value,
+                        final_day,
+                        record.rationale_code.value,
+                        int(record.confirmation.confirmed),
+                        record.to_json(indent=None),
+                        str(json_path),
+                        record.at,
+                    ),
+                )
+            return json_path
+
+        return self._run(_persist)
 
     def agreement_json_path(self, agreement_id: str) -> Path:
         return self.json_dir / f"{agreement_id}.json"
@@ -314,7 +369,7 @@ class AuditStore:
     # -- querying ----------------------------------------------------------
 
     def _rows(self, sql: str, params: tuple[Any, ...]) -> list[sqlite3.Row]:
-        return self._conn.execute(sql, params).fetchall()
+        return self._run(lambda: self._conn.execute(sql, params).fetchall())
 
     def _trace_events(self, call_id: str, event_type: EventType) -> tuple[TraceEvent, ...]:
         rows = self._rows(
@@ -324,9 +379,7 @@ class AuditStore:
         return tuple(event_from_json(_loads(r["payload_json"])) for r in rows)
 
     def turns(self, call_id: str) -> tuple[TurnRecorded, ...]:
-        return cast(
-            tuple[TurnRecorded, ...], self._trace_events(call_id, EventType.TURN)
-        )
+        return cast(tuple[TurnRecorded, ...], self._trace_events(call_id, EventType.TURN))
 
     def guardrail_events(self, call_id: str) -> tuple[GuardrailTripped, ...]:
         return cast(
@@ -335,9 +388,7 @@ class AuditStore:
         )
 
     def escalations(self, call_id: str) -> tuple[Escalated, ...]:
-        return cast(
-            tuple[Escalated, ...], self._trace_events(call_id, EventType.ESCALATION)
-        )
+        return cast(tuple[Escalated, ...], self._trace_events(call_id, EventType.ESCALATION))
 
     def trace(self, call_id: str) -> tuple[TraceEvent, ...]:
         """The whole timeline in order: utterances, trips, and escalations."""
@@ -354,9 +405,7 @@ class AuditStore:
             "SELECT payload_json FROM decisions WHERE call_id = ? ORDER BY decision_id",
             (call_id,),
         )
-        return tuple(
-            _as_decision(event_from_json(_loads(r["payload_json"]))) for r in rows
-        )
+        return tuple(_as_decision(event_from_json(_loads(r["payload_json"]))) for r in rows)
 
     def agreement(self, call_id: str) -> AgreementRecord | None:
         rows = self._rows("SELECT record_json FROM agreements WHERE call_id = ?", (call_id,))
@@ -379,7 +428,8 @@ class AuditStore:
     # -- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:
-        self._conn.close()
+        self._run(self._conn.close)
+        self._executor.shutdown(wait=True)
 
     def __enter__(self) -> AuditStore:
         return self

@@ -21,10 +21,11 @@ class Money:
 
     def __init__(self, value: Decimal | int | str) -> None:
         if isinstance(value, float):
-            raise TypeError(
-                f"Money rejects float ({value!r}); use Decimal, int, or str. SPEC §9."
-            )
-        object.__setattr__(self, "amount", Decimal(value).quantize(CENTS, rounding=ROUND_HALF_UP))
+            raise TypeError(f"Money rejects float ({value!r}); use Decimal, int, or str. SPEC §9.")
+        amount = Decimal(value)
+        if not amount.is_finite():
+            raise ValueError(f"Money rejects non-finite values ({value!r}). SPEC §9.")
+        object.__setattr__(self, "amount", amount.quantize(CENTS, rounding=ROUND_HALF_UP))
 
     def __str__(self) -> str:
         return f"${self.amount:,.2f}"

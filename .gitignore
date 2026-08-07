@@ -1,4 +1,8 @@
 .env
+# The documented LiveKit flow (`lk app env --write --destination .env.local`)
+# writes secrets to `.env.local`, which a bare `.env` rule does not cover.
+.env.*
+!.env.example
 data/
 __pycache__/
 *.py[cod]
@@ -6,4 +10,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
 *.db
+# Per-session agent scratch: worktree checkouts and subagent memory.
+.claude/worktrees/
+.claude/agent-memory/

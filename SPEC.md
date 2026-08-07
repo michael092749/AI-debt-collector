@@ -1,8 +1,8 @@
 # SPEC — Voice Debt Collection Negotiation Agent
 
 **Status:** Draft, awaiting approval
-**Source brief:** `task.md`
-**Background research:** `Production_LLM_Agent_Systems_Research.md`
+**Source brief:** `docs/brief.md`
+**Background research:** `docs/research/Production_LLM_Agent_Systems_Research.md`
 
 ---
 
@@ -109,6 +109,35 @@ These are not arbitrary rules — they fall out of the constants, and each is a 
   dispute/hardship/distress/attorney/cease trigger the agent stops negotiating, states that
   a human will follow up, closes politely, and writes an `escalation` record with full
   context. A real deployment swaps in a warm transfer; the trigger logic is identical.
+- **A7 — Legal is not the same as agreeable.** §2.2 is a *preference* order, so a proposal
+  that clears every policy floor but sits below the current ladder position is `counter`ed
+  at the ladder rather than accepted — the `LADDER` condition, rationale
+  `PREFERRED_TIER_AVAILABLE`. Likewise capacity shapes a schedule but never selects a tier.
+  Without this the first figure a consumer names decides the call: "$250 a month for four
+  months" is policy-legal and the *worst* listed outcome, and it used to be taken on turn
+  one; naming "$77 a week" used to collect all three concessions at once. Each step down
+  now costs exactly one refusal.
+
+  **Asked past once, not held out against.** `LADDER` also passes when the consumer has
+  already proposed this tier in an earlier round, *that round was countered for the ladder
+  alone* (`PREFERRED_TIER_AVAILABLE`), and the terms are no worse than the ones they put up
+  then. They have heard the better ask and held to legal terms — holding out further loses
+  an account that was closable. Both qualifiers are load-bearing: keyed on tier alone, an
+  *illegal* proposal would unlock its tier for a later legal one ("$77 a week" refused on
+  the payment floor, then "$250 a month" walking straight into the worst outcome); without
+  the no-worse clause, "settle at $900" countered would become "$800, then", and the ladder
+  would have talked us *down* $100.
+  It is also the *only* route to T4 once the ladder is at T3, since the agent may never
+  raise its own ask from an $800 settlement back to the full balance (**A4**; see
+  `_is_concession`). Two consequences accepted deliberately: countering a legal proposal
+  risks the consumer walking, bounded by the round cap and the escalation triggers; and a
+  consumer who names an $800 settlement twice gets it, without the agent ever having
+  conceded to T3 — tighter than the pre-A7 behaviour, where once was enough.
+
+  *Known limit:* the engine is turn-free, so a model that calls `validate_consumer_offer`
+  twice for the same proposal inside one turn satisfies the repeat without the counter ever
+  reaching the consumer's ear. The round trip cap (`MAX_TOOL_ROUNDS`) bounds it; closing it
+  properly needs a turn index the engine deliberately does not have.
 
 ---
 
@@ -176,18 +205,19 @@ def validate_offer(
 ```python
 @dataclass(frozen=True)
 class Condition:
-    rule_id: str          # "MIN_PAYMENT", "SETTLEMENT_FLOOR", "MAX_DURATION", ...
+    rule_id: str  # "MIN_PAYMENT", "SETTLEMENT_FLOOR", "MAX_DURATION", ...
     passed: bool
-    actual: str           # "$150.00"
-    limit: str            # ">= $250.00"
+    actual: str  # "$150.00"
+    limit: str  # ">= $250.00"
+
 
 @dataclass(frozen=True)
 class Verdict:
     outcome: Literal["accept", "counter", "reject"]
-    tier: Tier | None                        # tier the proposal landed in, if any
-    conditions: tuple[Condition, ...]        # EVERY rule evaluated, pass and fail alike
-    counter: Offer | None                    # engine-computed counter-offer
-    rationale_code: str                      # stable code the LLM phrases, never invents
+    tier: Tier | None  # tier the proposal landed in, if any
+    conditions: tuple[Condition, ...]  # EVERY rule evaluated, pass and fail alike
+    counter: Offer | None  # engine-computed counter-offer
+    rationale_code: str  # stable code the LLM phrases, never invents
 ```
 
 `conditions` is non-negotiable. The research report's vendor test is: *"Show me the decision
@@ -196,9 +226,11 @@ conditions and a policy path, the engine did."* The record must pass that test.
 
 ### 4.2 Counter algorithm
 
-On `reject` or `counter`, the engine selects the **highest-preference tier still feasible**
-given the consumer's signaled capacity and the concessions already made (never below the
-current ladder position, per **A4**), and returns it as a fully-structured `Offer`.
+On `reject` or `counter`, the engine offers **the tier the ladder currently stands on** —
+`ladder_floor`, which starts at T1 and moves down one step per refusal earned (**A4**). The
+consumer's signaled capacity shapes the *schedule inside* that tier (how large a
+downpayment, how many installments) and never selects the tier itself, per **A7**. The
+result is returned as a fully-structured `Offer`.
 
 ### 4.3 Hard invariants (property tests, not examples)
 
