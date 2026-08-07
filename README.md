@@ -30,7 +30,7 @@ decided. If it's evaluated conditions and a policy path, the engine did."*
 
 ```bash
 uv sync                            # everything below needs no keys at all
-uv run pytest                      # 747 tests, offline
+uv run pytest                      # 792 tests, offline
 uv run collector-text              # negotiate in a terminal, mock model, no keys
 ```
 
@@ -256,7 +256,7 @@ rounding nit, so `Money` refuses to be constructed from one at all.
 
 ## Testing
 
-`uv run pytest` — **747 tests, no API key, no network.** `addopts = "-m 'not evals'"`
+`uv run pytest` — **792 tests, no API key, no network.** `addopts = "-m 'not evals'"`
 deselects the 73 tier-2 evals; run those explicitly with `uv run pytest -m evals
 tests/evals`.
 
