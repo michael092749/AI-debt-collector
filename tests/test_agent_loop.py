@@ -548,6 +548,35 @@ class TestTurnLoop:
             "so speaking it would be blocked as a leak"
         )
 
+    @pytest.mark.parametrize(
+        "utterance",
+        [
+            # The decline bridge the prompt asks for, in the phrasings a model
+            # following that instruction actually produces.
+            "That one will not work on your end, and here is another option.",
+            "That one won't work on your end, and here is another option.",
+            "Okay, that is not one I can do. Here is what I can offer instead.",
+            "I'm not able to do that figure, but here is another option.",
+            # Answering "who are you?" by echoing the persona line.
+            "I'm a collections representative for Meridian Recovery Services, "
+            "and I'm calling about an overdue account.",
+        ],
+    )
+    def test_prompt_directed_phrasings_are_not_quotable(self, utterance: str) -> None:
+        """The prompt may *ask* for a sentence; it must not supply one.
+
+        The script constants were never the whole exposure. An instruction that
+        hands over the exact words — "say the human version: <sentence>" — is
+        the same trap wearing prose: the model says what it was told to, and the
+        guard blocks it for reciting the prompt. That is not hypothetical; the
+        decline-bridge line below was written into the prompt as an em-dash
+        aside during this work and tripped on every phrasing that kept its
+        opening clause.
+        """
+        assert not _contains_verbatim_leak(utterance, _CONFIDENTIAL_REFERENCE), (
+            "the prompt hands the model this phrasing, and speaking it would be blocked as a leak"
+        )
+
     def test_the_opening_turn_is_not_quotable_from_the_prompt(self) -> None:
         """The regression itself: the opening is the turn that broke.
 
