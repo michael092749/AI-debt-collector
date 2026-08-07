@@ -316,6 +316,10 @@ class NegotiationAgent:
         self.last_consumer_utterance: str = ""
         self.ended = False
         self._turn_index = 0
+        # Scripted lines spoken back-to-back with nothing the model wrote in
+        # between. Reset by any sentence that clears the guard, so this counts
+        # an agent going in circles rather than a call's fallbacks in total.
+        self._consecutive_fallbacks = 0
         # Inert unless a process called ``configure_tracing()``; see tracing.py.
         self.trace = CallTrace()
 
@@ -684,6 +688,7 @@ class NegotiationAgent:
         check = check_outbound(self.guard, candidate, authorized=self.authorized)
         self.guard = check.state
         if check.allowed:
+            self._consecutive_fallbacks = 0
             self._record(
                 TurnRecorded(
                     call_id=self.call_id,
@@ -1031,6 +1036,7 @@ class NegotiationAgent:
             self.guard = check.state
 
             if check.allowed:
+                self._consecutive_fallbacks = 0
                 self._record_spoken(candidate)
                 return candidate, tuple(blocked)
 
@@ -1079,6 +1085,50 @@ class NegotiationAgent:
 
         return None, tuple(blocked)
 
+    def _standing_offer_line(self) -> str | None:
+        """The offer on the table, rendered from the engine's own numbers.
+
+        Reached only after the fallback has already been spoken once: asking
+        "what would work for you?" a second time, with no model sentence in
+        between, is the agent going in circles in front of a consumer who is
+        waiting on terms it has already produced. Saying the terms is more
+        use than asking the question again.
+
+        Three gates, and they are not belt-and-braces — ``_speak_verbatim``
+        bypasses ``check_outbound`` entirely, so this line reaches TTS
+        unchecked and has to be safe by construction:
+
+        * **An offer must exist.** Nothing on the table, nothing to restate.
+        * **Identity must be confirmed**, and it is revocable mid-call
+          (``with_identity_revoked``). A code-authored line full of dollar
+          figures would otherwise be the way around the identity ring.
+        * **No escalation.** ``fallback_for`` returns the closing line once
+          the consumer has escalated, and reading them terms instead is
+          negotiating past the point where negotiation stops (A6).
+
+        The rendered line is then put through the guard anyway and dropped if
+        it does not clear. Every figure in it came from ``offers_made``, which
+        is what ``authorized_for`` derives the authorized set from, so it
+        should always clear — and "should" is not the standard for something
+        that bypasses the gate.
+        """
+        offer = self.tools.standing_offer
+        if offer is None or not self.guard.identity_confirmed or self.guard.escalated:
+            return None
+
+        parts = [
+            f"{installment.amount} today"
+            if installment.due_day_offset == 0
+            else f"{installment.amount} in {installment.due_day_offset} days"
+            for installment in offer.installments
+        ]
+        schedule = parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} and then {parts[-1]}"
+        line = f"To be clear about what's on the table: {schedule}."
+
+        if not check_outbound(self.guard, line, authorized=self.authorized).allowed:
+            return None
+        return line
+
     def _fallback_line(self) -> str:
         """The scripted line to speak when a generated one cannot be.
 
@@ -1087,15 +1137,22 @@ class NegotiationAgent:
         turn got blocked, so the line that replaces the turn is the answer they
         actually hear, and the rule wants it answered on request rather than
         deferred to a turn that will be blocked for the same reason.
+
+        A second consecutive trip reaches for the standing offer instead of
+        asking the same open question twice — see ``_standing_offer_line``,
+        which declines when there is nothing safe to say.
         """
         line = fallback_for(self.guard)
         if self.guard.disclosures.ai_disclosure_requested:
             return f"{AI_DISCLOSURE_TEXT} {line}"
+        if self._consecutive_fallbacks >= 1 and (restated := self._standing_offer_line()):
+            return restated
         return line
 
     def _speak_fallback(self) -> str:
         """The scripted line, spoken on the text path — transcript and all."""
         line = self._fallback_line()
+        self._consecutive_fallbacks += 1
         self._observe_scripted(line)
         self._speak_verbatim(line)
         return line
@@ -1127,6 +1184,7 @@ class NegotiationAgent:
         """The same line on the streaming path, where the transcript entry for
         the round this closes belongs to ``_transcribe``, not to each line."""
         line = self._fallback_line()
+        self._consecutive_fallbacks += 1
         self._observe_scripted(line)
         self._record_audio(line)
         return line

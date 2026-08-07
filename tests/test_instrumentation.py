@@ -48,6 +48,7 @@ from collector.guardrails.rings import (
     MAX_REGENERATION_STRIKES,
     SAFE_FALLBACK_TEXT,
     PreCallContext,
+    check_outbound,
 )
 from collector.llm.base import (
     LLMClient,
@@ -1298,6 +1299,107 @@ class TestABlockAfterRealSpeechClosesTheThought:
 
         assert agent.guard.escalated
         assert agent._stream_connective() != CONNECTIVE_TEXT
+
+
+class _AlwaysBlocked:
+    """Never produces a sentence the guard will pass, on any turn."""
+
+    def __init__(self, opened: bool = False) -> None:
+        self.opened = opened
+
+    def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+        if not self.opened:
+            self.opened = True
+            return LLMResponse(text=_GREETING)
+        return LLMResponse(text="Pay today or we will garnish your wages.")
+
+    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        yield TextDelta("Pay today or we will garnish your wages. ")
+        yield StreamCompleted(LLMResponse(text="..."))
+
+
+class TestRepeatedFallbacksEscalateToTheStandingOffer:
+    """Two fallbacks in a row is the agent asking "what would work for you?"
+    twice while the consumer waits for terms it has already been given. The
+    second trip says something instead: the offer on the table, rendered by
+    code from the engine's own numbers.
+    """
+
+    def _agent_with_an_offer(self, llm: object) -> NegotiationAgent:
+        """Mid-call: identity confirmed, both disclosures made, an offer on
+        the table. The Mini-Miranda matters — nothing substantive clears the
+        guard before it, so a restatement of terms cannot precede it either."""
+        agent = _agent(llm=llm)
+        agent.open_call()
+        agent._perceive("Yes, this is Dana.")
+        agent._observe_scripted(MINI_MIRANDA_TEXT)
+        agent._run_tool(_call("propose_offer"))
+        return agent
+
+    def test_the_first_fallback_still_asks_the_open_question(self) -> None:
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        first = agent.turn("What are my options?")
+
+        assert first.spoken == SAFE_FALLBACK_TEXT
+
+    def test_the_second_consecutive_fallback_restates_the_offer(self) -> None:
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        agent.turn("What are my options?")
+        second = agent.turn("You still haven't told me anything.")
+
+        offer = agent.tools.standing_offer
+        assert offer is not None
+        assert second.spoken is not None
+        assert second.spoken != SAFE_FALLBACK_TEXT
+        for installment in offer.installments:
+            assert str(installment.amount) in second.spoken
+
+    def test_the_restatement_clears_the_guard_on_its_own_figures(self) -> None:
+        """It is spoken through ``_speak_verbatim``, which bypasses
+        ``check_outbound`` entirely — so a line that would *not* have cleared
+        is a line that reaches TTS unchecked. Every figure in it comes from
+        the engine's own offer, and that has to be true by test, not by
+        inspection."""
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        agent.turn("What are my options?")
+        line = agent._fallback_line()
+
+        assert line != SAFE_FALLBACK_TEXT
+        check = check_outbound(agent.guard, line, authorized=agent.authorized)
+        assert check.allowed, check.violations
+
+    def test_a_turn_that_speaks_resets_the_count(self) -> None:
+        """"Consecutive" is the whole point — one fallback early in a call and
+        another ten turns later is not an agent going in circles."""
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        first = agent.turn("What are my options?")
+        agent.llm = MockLLMClient()
+        spoke = agent.turn("I could do five hundred dollars.")
+        agent.llm = _AlwaysBlocked(opened=True)
+        again = agent.turn("Sorry, say that again?")
+
+        assert first.spoken == SAFE_FALLBACK_TEXT
+        assert spoke.spoken not in (None, SAFE_FALLBACK_TEXT), "the middle turn has to speak"
+        assert again.spoken == SAFE_FALLBACK_TEXT, "the count restarts, it does not accumulate"
+
+    def test_no_offer_on_the_table_means_nothing_to_restate(self) -> None:
+        agent = _agent(llm=_AlwaysBlocked())
+        agent.open_call()
+        agent._perceive("Yes, this is Dana.")
+        agent.turn("What are my options?")
+        second = agent.turn("You still haven't told me anything.")
+
+        assert second.spoken == SAFE_FALLBACK_TEXT
+
+    def test_an_unidentified_consumer_is_never_read_the_terms(self) -> None:
+        """``_speak_verbatim`` bypasses the identity ring, and identity is
+        revocable mid-call. A code-authored line full of dollar figures must
+        gate on it explicitly or it becomes the way around it."""
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        agent.turn("What are my options?")
+        agent.guard = agent.guard.with_identity_revoked()
+
+        assert agent._fallback_line() == SAFE_FALLBACK_TEXT
 
 
 class TestTurnScopedDisclosuresOnTheStreamingPath:
