@@ -1,4 +1,4 @@
-"""Value objects for offers and consumer proposals (SPEC §2.2).
+"""Value objects for offers and consumer proposals.
 
 Schedules carry day *offsets* from the call, never absolute dates: the decision
 engine must stay clock-free so it is testable as a pure input/output table.

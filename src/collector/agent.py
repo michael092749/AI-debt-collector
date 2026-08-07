@@ -1,4 +1,4 @@
-"""The turn loop — SPEC §3, §5.2.
+"""The turn loop.
 
     perceive -> guard -> think -> tool -> guard -> speak
 
@@ -79,6 +79,7 @@ from collector.negotiation import CallOutcome
 from collector.offers import Offer
 from collector.policy import PolicyConfig
 from collector.tools import TOOL_SCHEMAS, ToolContext, ToolResult, execute
+from collector.tracing import CallTrace
 
 logger = logging.getLogger("collector.agent")
 
@@ -111,7 +112,7 @@ def _sanitize_consumer_text(text: str) -> str:
 
 
 # Tools that discuss or decide financial terms. Identity must be confirmed
-# before any of these run (SPEC §5.1) — the outbound speech guard was
+# before any of these run — the outbound speech guard was
 # previously the only line of defense, and a decision got computed and
 # durably logged before identity was ever confirmed (ADVERSARIAL_TESTING.md
 # C3). ``end_call`` is deliberately not gated: ending the call without terms
@@ -158,7 +159,7 @@ def _loggable(arguments: dict[str, object]) -> dict[str, object]:
     """The model's raw arguments, made safe to write to the audit log.
 
     ``to_jsonable`` raises on a float, deliberately — a float in a payment
-    schedule is a compliance defect (SPEC §9). But JSON has one number type and
+    schedule is a compliance defect. But JSON has one number type and
     it decodes to float, so the model saying ``total: 500.5`` is *ordinary* and
     ``_parse_money`` exists to absorb it. Logging the raw arguments without
     this would mean the tool succeeded and then recording that success killed
@@ -277,6 +278,8 @@ class NegotiationAgent:
         self.last_consumer_utterance: str = ""
         self.ended = False
         self._turn_index = 0
+        # Inert unless a process called ``configure_tracing()``; see tracing.py.
+        self.trace = CallTrace()
 
     # -- ring 1 ------------------------------------------------------------
 
@@ -662,7 +665,19 @@ class NegotiationAgent:
 
     def _escalate(self, consumer_utterance: str, escalation: EscalationRecord) -> AgentTurn:
         """A6: negotiation stops here. The closing line is code-authored, so
-        there is no generated turn to guard and nothing left to negotiate."""
+        there is no generated turn to guard and nothing left to negotiate.
+
+        The call still ends — what changes is what it ends owing. For the
+        triggers ``owes_callback`` names, the closing line commits a human to
+        calling back and this record is that commitment, durable and readable
+        without the transcript.
+
+        Reached only from ``_perceive``'s deterministic detector, and reached
+        *before* the model is consulted on the turn at all. That is what keeps
+        the obligation out of the model's hands in both directions: it cannot
+        manufacture one, because no tool writes this record, and it cannot
+        talk its way out of one, because on this turn it is never asked.
+        """
         trigger = escalation.trigger
         closing = escalation.closing_line
         detail = f"{trigger}: {consumer_utterance}"
@@ -673,6 +688,9 @@ class NegotiationAgent:
                 turn_index=self._turn_index,
                 trigger=trigger,
                 detail=detail,
+                consumer_utterance=consumer_utterance,
+                account_ref=self.account_ref,
+                callback_owed=escalation.callback_owed,
             )
         )
         self._record(
@@ -695,7 +713,11 @@ class NegotiationAgent:
         # record embeds the consumer's own words, so it stays out of the log.
         logger.warning(
             "escalated",
-            extra={"turn": self._turn_index, "trigger": str(trigger)},
+            extra={
+                "turn": self._turn_index,
+                "trigger": str(trigger),
+                "callback_owed": escalation.callback_owed,
+            },
         )
         return turn
 
@@ -945,7 +967,7 @@ class NegotiationAgent:
         ``fallback_for`` alone is not enough when the consumer has just asked
         whether they are talking to a machine. That question is the reason the
         turn got blocked, so the line that replaces the turn is the answer they
-        actually hear, and SPEC §5.2 wants it answered on request rather than
+        actually hear, and the rule wants it answered on request rather than
         deferred to a turn that will be blocked for the same reason.
         """
         line = fallback_for(self.guard)
@@ -993,7 +1015,7 @@ class NegotiationAgent:
 
     def record_fallback_speech(self, text: str) -> AgentTurn:
         """Account for a code-authored line the transport spoke after
-        ``turn()`` raised (issues.md C4).
+        ``turn()`` raised.
 
         ``turn()`` records the consumer's utterance and increments the turn
         index before anything that can raise, then appends to ``self.turns``
@@ -1040,7 +1062,7 @@ class NegotiationAgent:
 
         # The score reaches the log rather than only the caller: "was this call
         # compliant?" is the question the log exists to answer, and computing
-        # it and then dropping it left that answer nowhere (SPEC §5.3).
+        # it and then dropping it left that answer nowhere.
         self._record(
             CallEnded(
                 call_id=self.call_id,
@@ -1086,5 +1108,13 @@ class NegotiationAgent:
     # -- audit -------------------------------------------------------------
 
     def _record(self, event: object) -> None:
+        # The span goes out whether or not there is a store. The two are
+        # independent surfaces — a call run with ``--no-store`` is still a call
+        # worth tracing — and neither may take the other down, which is why
+        # ``CallTrace.record`` swallows its own failures rather than being
+        # wrapped here. ``disclosures_fired`` rides along because a disclosure
+        # landing is guard state, not an event: nothing is recorded when the
+        # Mini-Miranda fires, the set just grows.
+        self.trace.record(event, disclosures_fired=self.guard.disclosures.fired)
         if self.store is not None:
             self.store.record(event)  # type: ignore[arg-type]

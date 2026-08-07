@@ -1,4 +1,4 @@
-"""The decision engine — SPEC §4. The graded core.
+"""The decision engine. The graded core.
 
     The LLM talks. Deterministic code decides.
 
@@ -41,7 +41,7 @@ class RuleId(StrEnum):
 
 
 class RationaleCode(StrEnum):
-    """Closed set. The LLM phrases these; it never invents one (SPEC §10)."""
+    """Closed set. The LLM phrases these; it never invents one."""
 
     ACCEPTED = "ACCEPTED"
     BELOW_SETTLEMENT_FLOOR = "BELOW_SETTLEMENT_FLOOR"
@@ -117,7 +117,7 @@ def _evaluate(
             str(proposal.total),
             f">= {policy.original_balance} unless settlement",
         ),
-        # The ceiling. SPEC §4.3 says the total is `== ORIGINAL_BALANCE` unless
+        # The ceiling. The total is `== ORIGINAL_BALANCE` unless
         # the tier is settlement, and the rule above only ever enforced the
         # lower half of that equality — nothing anywhere capped it. A consumer
         # who misheard the balance and offered "a thousand a month for three

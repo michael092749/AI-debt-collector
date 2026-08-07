@@ -1,4 +1,4 @@
-"""Exact money. Floats are a bug in this codebase (SPEC §9)."""
+"""Exact money. Floats are a bug in this codebase."""
 
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ class Money:
 
     def __init__(self, value: Decimal | int | str) -> None:
         if isinstance(value, float):
-            raise TypeError(f"Money rejects float ({value!r}); use Decimal, int, or str. SPEC §9.")
+            raise TypeError(f"Money rejects float ({value!r}); use Decimal, int, or str.")
         amount = Decimal(value)
         if not amount.is_finite():
-            raise ValueError(f"Money rejects non-finite values ({value!r}). SPEC §9.")
+            raise ValueError(f"Money rejects non-finite values ({value!r}).")
         object.__setattr__(self, "amount", amount.quantize(CENTS, rounding=ROUND_HALF_UP))
 
     def __str__(self) -> str:
@@ -47,7 +47,7 @@ class Money:
 
     def __mul__(self, factor: Decimal | int) -> Money:
         if isinstance(factor, float):
-            raise TypeError("Money cannot be scaled by a float. SPEC §9.")
+            raise TypeError("Money cannot be scaled by a float.")
         return Money(self.amount * Decimal(factor))
 
     def __neg__(self) -> Money:

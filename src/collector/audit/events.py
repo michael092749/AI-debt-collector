@@ -1,4 +1,4 @@
-"""Structured trace events — SPEC §6.
+"""Structured trace events.
 
 Everything the call did, in a form a compliance reviewer can read without a
 decoder ring: who said what, which rules the engine evaluated, which guardrails
@@ -7,7 +7,7 @@ tripped, and the agreement that came out the other end.
 Two rules govern this module:
 
 1. **Money serializes as an exact decimal string, never a float.** A float in a
-   payment schedule is a compliance defect, not a rounding nit (SPEC §9), so
+   payment schedule is a compliance defect, not a rounding nit, so
    ``to_jsonable`` raises on one rather than quietly emitting it.
 2. **The condition trail is carried verbatim.** The research report's vendor
    test is "show me the decision record; if they show you a transcript, the
@@ -226,12 +226,31 @@ class GuardrailTripped:
 
 @dataclass(frozen=True)
 class Escalated:
+    """An escalation, and the callback obligation it leaves behind.
+
+    Deliberately self-contained, for the same reason ``AgreementRecord`` is:
+    this row is what a human picks the consumer back up from, and an
+    obligation that can only be understood by going and reading the
+    transcript alongside it is one that gets dropped. So the account and the
+    words that triggered it are carried here rather than referenced.
+
+    ``callback_owed`` is false for the two triggers where calling back is
+    itself the wrong move — see ``rings.owes_callback``. The escalation still
+    stands and a human still owns it; the phone call is what does not happen.
+    """
+
     EVENT_TYPE: ClassVar[EventType] = EventType.ESCALATION
 
     call_id: str
     turn_index: int
     trigger: EscalationTrigger
     detail: str
+    # The consumer's own words, as a field rather than only inside ``detail``:
+    # the human acting on this reads them, and picking them back out of a
+    # formatted string is not something a reader should have to do.
+    consumer_utterance: str = ""
+    account_ref: str = ""
+    callback_owed: bool = False
     at: str = field(default_factory=utc_now)
 
 
@@ -242,7 +261,7 @@ class CallEnded:
     call_id: str
     outcome: CallOutcome
     turn_count: int
-    # The post-call compliance score (SPEC §5.3). ``None`` means the call never
+    # The post-call compliance score. ``None`` means the call never
     # reached the post-call ring — a dropped process, not a clean sheet.
     compliant: bool | None = None
     blocked_turns: int = 0
@@ -268,7 +287,7 @@ def event_json(event: TraceEvent) -> JsonDict:
     return {"event_type": event.EVENT_TYPE.value, **payload}
 
 
-# -- the agreement record — SPEC §6, the brief's deliverable ----------------
+# -- the agreement record — the brief's deliverable ------------------------
 
 
 @dataclass(frozen=True)
@@ -530,6 +549,12 @@ def event_from_json(data: JsonDict) -> TraceEvent:
                 turn_index=int(data["turn_index"]),
                 trigger=EscalationTrigger(data["trigger"]),
                 detail=data["detail"],
+                # ``.get``: rows written before the callback obligation existed
+                # carry none of these keys, and an evidence store that cannot
+                # read its own older rows back has lost the evidence.
+                consumer_utterance=data.get("consumer_utterance", ""),
+                account_ref=data.get("account_ref", ""),
+                callback_owed=bool(data.get("callback_owed", False)),
                 at=data["at"],
             )
         case EventType.CALL_ENDED:

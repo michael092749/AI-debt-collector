@@ -1,4 +1,4 @@
-"""LiveKit Agents worker — SPEC §3, step 9.
+"""LiveKit Agents worker.
 
     lk agent dev src/collector/voice_app.py    # connect to LiveKit, wait for a room
     uv run collector-voice start               # production mode
@@ -52,6 +52,7 @@ from collector.guardrails.rings import PreCallContext
 from collector.llm.anthropic_client import AnthropicClient
 from collector.llm.base import LLMClient
 from collector.policy import PolicyConfig
+from collector.tracing import configure_tracing, flush_traces
 
 load_dotenv()
 
@@ -67,7 +68,7 @@ _TRANSIENT_ERROR_APOLOGY = (
 # Speech runs through LiveKit Inference rather than the Deepgram and Cartesia
 # plugins: same two models, reached with the LiveKit credentials the worker
 # already holds instead of two more third-party keys, and zero data retention
-# by default — which is the same reason issues.md R2 leaves Cloud recording off.
+# by default — the same reason `_recording_options()` leaves Cloud recording off.
 #
 # Every value below is the plugin default this replaced, pinned explicitly.
 # `cartesia.TTS()` in particular chose the voice implicitly; the agent's
@@ -220,7 +221,7 @@ async def _say_opening(session: AgentSession[None], opening: str) -> None:
 class _ConsumerContextError(ValueError):
     """Dispatch metadata was present but could not be parsed into a consumer
     context. Raised rather than silently substituting the fixture consumer —
-    see issues.md R1: a live call must never proceed under the wrong name or
+    a live call must never proceed under the wrong name or
     account just because its dispatch metadata was malformed."""
 
 
@@ -230,16 +231,16 @@ def _recording_options() -> bool | RecordingOptions:
 
     * unset / ``off`` — **the default.** Nothing is uploaded.
     * ``diagnostics`` — pipeline traces and agent-server logs, no audio and no
-      transcript. The granular middle ground ``OBSERVABILITY.md`` named: it
+      transcript. The granular middle ground: it
       buys the Agent-insights timeline for latency and failures without a
       third-party copy of the consumer's words.
     * ``full`` — everything, i.e. the SDK's own default. Local debugging in
       the Agent Console only.
 
-    The default does not move. R2's reasoning is unchanged: this project's
-    ``AuditStore`` is the SPEC's compliance record, and nothing here collects
-    consent for a second copy of a consumer's speech held by anyone else.
-    ``diagnostics`` is narrower than what R2 declined, but it is still a
+    The default does not move: this project's ``AuditStore`` is the
+    compliance record, and nothing here collects consent for a second copy of
+    a consumer's speech held by anyone else. ``diagnostics`` is narrower than
+    a full upload, but it is still a
     product decision to make deliberately, per call deployment — not a
     default to drift into.
     """
@@ -355,7 +356,7 @@ class CollectorAgent(Agent):
             # just never produced a response to this one.
             logger.exception("negotiation_agent.turn() raised; apologizing and continuing the call")
             # The apology is about to be spoken, so it has to be in the record
-            # before it is (issues.md C4). Off the event loop for the same
+            # before it is. Off the event loop for the same
             # reason turn() is: AuditStore.record() blocks on the store's own
             # worker thread.
             await asyncio.to_thread(
@@ -381,7 +382,7 @@ def _consumer_context(ctx: JobContext) -> tuple[str, str]:
     """Consumer name and account ref for this call, from job metadata if the
     dispatcher supplied it, the same defaults ``text_app.py`` uses otherwise.
 
-    No metadata at all (manual/local testing, per VOICE_QUICKSTART.md) falls
+    No metadata at all (manual or local testing) falls
     back to the fixture consumer — that case is legitimate and expected.
     Metadata that IS present but malformed raises instead: silently
     substituting a different real consumer's identity on a live call would
@@ -417,7 +418,7 @@ def _log_turn_latency(session: AgentSession[None]) -> None:
     showed the sum, which is the number a phone call is judged on.
 
     Both figures come from the framework and neither needs the LiveKit Cloud
-    recording that issues.md R2 turned off:
+    recording this project leaves off:
 
     * ``e2e_latency`` — consumer stopped speaking to agent audio playing.
     * ``llm_node_ttft`` — normally time-to-first-token, but ``llm_node`` here
@@ -465,7 +466,7 @@ def _log_session_events(session: AgentSession[None]) -> None:
     Deliberately metadata-only. ``user_input_transcribed`` carries the
     consumer's words; the character count and finality are what diagnose a
     stuck STT stream, and the words themselves are already in the audit store
-    under a consent posture the log does not share (issues.md R2).
+    under a consent posture the log does not share.
     """
 
     @session.on("error")
@@ -552,6 +553,14 @@ AGENT_NAME = "collections-negotiator"
 
 @server.rtc_session(agent_name=AGENT_NAME)
 async def entrypoint(ctx: JobContext) -> None:
+    # Before anything connects, and before a consumer is on the line: a
+    # malformed COLLECTOR_TRACING raises here and the job never dials. Off
+    # unless the operator asked for it, idempotent across the jobs one worker
+    # handles, and it points the SDK's own session spans at the same backend
+    # (docs.livekit.io, "Export traces"). See tracing.py for what does and does
+    # not reach a span.
+    configure_tracing()
+
     # These fields are stamped onto every log record emitted for this job,
     # including `collector.agent`'s: the SDK installs its context filter on
     # the *root* handlers (`job.py:_on_setup`), so it reaches this project's
@@ -562,7 +571,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # `call_id` and `account_ref` identify the call; the consumer's *name* is
     # deliberately absent. It buys nothing a reader of the audit store cannot
     # get, and logs leave the process by a route (stdout, a log drain) that
-    # carries none of the consent posture issues.md R2 set for their speech.
+    # carries none of the consent posture that governs their speech.
     ctx.log_context_fields = {
         "room": ctx.room.name,
         "call_id": ctx.job.id,
@@ -625,6 +634,10 @@ async def entrypoint(ctx: JobContext) -> None:
         # this callback does. Nothing after this point can cost the call its
         # record.
         _log_session_usage(session)
+        # After close(), so the CallEnded that ends the call's root span is in
+        # the batch this drains. BatchSpanProcessor holds spans that process
+        # exit would otherwise drop.
+        await asyncio.to_thread(flush_traces)
 
     ctx.add_shutdown_callback(_finalize_call)
 
@@ -633,7 +646,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # Explicit, not the SDK default: omitting `record` uploads audio,
     # transcripts, traces, and logs to LiveKit Cloud's observability store
     # for every call. See `_recording_options()` for the three modes and why
-    # the default stays off (issues.md R2).
+    # the default stays off.
     await session.start(
         agent=CollectorAgent(negotiation_agent), room=ctx.room, record=_recording_options()
     )

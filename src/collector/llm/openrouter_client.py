@@ -13,8 +13,7 @@ Two details of this model shape the mapping:
    but empirically does nothing.** OpenRouter's unified `reasoning` parameter is
    passed via `extra_body` (it isn't a native field on the OpenAI SDK's
    `create()`) as the closest equivalent for a model routed through it. Live
-   probing against `anthropic/claude-sonnet-5` (this session, see
-   `VOICE_QUICKSTART.md` troubleshooting) found `reasoning_tokens: 0` in the
+   probing against `anthropic/claude-sonnet-5` found `reasoning_tokens: 0` in the
    response usage at every effort level from `"low"` through `"high"` — the
    parameter is not observably changing model behavior on this route. It is
    kept at `"low"` for cost, not because a higher setting was shown to help.

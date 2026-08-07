@@ -1,4 +1,4 @@
-"""The full loop, offline — SPEC §7.1.
+"""The full loop, offline.
 
 Everything here runs with an empty ``.env``: the scripted client stands in for
 Claude, and the Claude mapping is tested as a pure function so it needs no key
@@ -36,6 +36,7 @@ from collector.money import Money
 from collector.negotiation import CallOutcome
 from collector.offers import Cadence, Tier
 from collector.policy import PolicyConfig
+from collector.text_app import _summarize
 from collector.tools import TOOL_NAMES, ToolContext, execute
 
 POLICY = PolicyConfig.default()
@@ -62,7 +63,7 @@ def _run(script: list[str], store: AuditStore | None = None) -> NegotiationAgent
 
 class TestToolWhitelist:
     def test_unknown_tool_is_refused_not_executed(self) -> None:
-        """SPEC §5.2: the agent may only take the actions in tools.py."""
+        """The agent may only take the actions in tools.py."""
         result = execute(ToolCall(name="wire_me_the_money"), ToolContext.opening(POLICY))
         assert not result.ok
         assert "not an available action" in result.payload["error"]
@@ -498,6 +499,144 @@ class TestTurnLoop:
         )
 
 
+class TestEscalationCallback:
+    """A6 ends the call; it must not end it on a dismissal.
+
+    A consumer who discloses hardship, disputes the debt, or signals distress
+    gets told a person will call them back, and the obligation outlives the
+    process. The model is not in this loop in either direction — it cannot
+    manufacture the promise and it cannot talk the call out of it.
+    """
+
+    HARDSHIP = "I lost my job and I can't pay anything."
+
+    def test_each_trigger_ends_the_call_with_a_spoken_callback_commitment(self) -> None:
+        for utterance, trigger in (
+            (self.HARDSHIP, EscalationTrigger.HARDSHIP),
+            ("I dispute this, it isn't my account.", EscalationTrigger.DISPUTE),
+            ("I can't go on any more.", EscalationTrigger.DISTRESS),
+        ):
+            agent = _agent()
+            agent.open_call()
+            turn = agent.turn(utterance)
+
+            assert turn.escalated
+            assert turn.ended and agent.ended, "the call still ends — with a commitment"
+            assert turn.spoken is not None
+            assert "call you back" in turn.spoken, (trigger, turn.spoken)
+
+    def test_the_obligation_outlives_the_process(self, tmp_path: Path) -> None:
+        """Read back out of SQLite, not off the agent: the human who owes the
+        call back is not the one who was on it."""
+        with AuditStore(tmp_path / "collector.db", json_dir=tmp_path) as store:
+            agent = _run(["Yes, speaking.", self.HARDSHIP], store)
+            agent.close()
+
+        with AuditStore(tmp_path / "collector.db", json_dir=tmp_path) as reopened:
+            (record,) = reopened.escalations("call-1")
+
+        assert record.callback_owed
+        assert record.trigger is EscalationTrigger.HARDSHIP
+        assert record.account_ref == "ACCT-0001"
+        assert record.consumer_utterance == self.HARDSHIP
+        assert record.turn_index == 2
+        assert record.at, "a timestamp, so the queue can be aged"
+
+    def test_a_cease_request_escalates_without_promising_a_call(self, tmp_path: Path) -> None:
+        """The consumer just asked us to stop phoning. The escalation still
+        reaches a human; the phone call is what must not be promised."""
+        with AuditStore(tmp_path / "collector.db", json_dir=tmp_path) as store:
+            agent = _run(["Yes.", "Stop calling me and take me off your list."], store)
+            (record,) = store.escalations(agent.call_id)
+
+        assert not record.callback_owed
+        assert agent.turns[-1].spoken is not None
+        assert "call you back" not in agent.turns[-1].spoken
+
+    def test_the_model_is_never_consulted_on_the_escalating_turn(self, tmp_path: Path) -> None:
+        """The invariant behind the commitment: the escalation short-circuits
+        before the model is asked anything, so a model that wants to keep
+        negotiating — or to run a tool — cannot suppress the callback."""
+
+        class ClosingClient:
+            def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+                return LLMResponse(
+                    text="No need for anyone to call you back.",
+                    tool_calls=(
+                        ToolCall(name="end_call", arguments={"reason": "consumer_hostile"}),
+                    ),
+                )
+
+        with AuditStore(tmp_path / "collector.db", json_dir=tmp_path) as store:
+            agent = NegotiationAgent(llm=ClosingClient(), policy=POLICY, store=store)
+            agent.open_call()
+            turn = agent.turn(self.HARDSHIP)
+            call_id = agent.call_id
+
+            escalating_turn = 1
+            assert [e for e in store.model_calls(call_id) if e.turn_index == escalating_turn] == []
+            assert [e for e in store.tool_calls(call_id) if e.turn_index == escalating_turn] == []
+            (record,) = store.escalations(call_id)
+
+        assert record.callback_owed
+        assert "call you back" in (turn.spoken or "")
+
+    def test_the_model_cannot_manufacture_a_callback(self, tmp_path: Path) -> None:
+        """Saying the words is not the same as owing the call. Nothing in the
+        whitelist writes this record, so an unescalated turn leaves none."""
+
+        class PromisingClient:
+            def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+                return LLMResponse(text="I'll escalate this and someone will call you back.")
+
+        with AuditStore(tmp_path / "collector.db", json_dir=tmp_path) as store:
+            agent = NegotiationAgent(llm=PromisingClient(), policy=POLICY, store=store)
+            agent.open_call()
+            agent.turn("Yes, speaking.")
+
+            assert store.escalations(agent.call_id) == ()
+            assert not agent.ended
+            assert agent.guard.escalation is None
+
+    def test_the_streamed_path_records_the_same_obligation(self, tmp_path: Path) -> None:
+        """The voice path escalates through the same code; assert it, because
+        this is where a durable write is easiest to lose in a refactor."""
+        with AuditStore(tmp_path / "collector.db", json_dir=tmp_path) as store:
+            agent = _agent(store)
+            agent.open_call()
+            agent.turn("Yes, speaking.")
+            spoken = "".join(agent.stream_turn(self.HARDSHIP))
+
+            (record,) = store.escalations(agent.call_id)
+
+        assert "call you back" in spoken
+        assert record.callback_owed
+        assert record.consumer_utterance == self.HARDSHIP
+        assert agent.ended
+
+    def test_the_terminal_harness_shows_the_pending_callback(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """End-to-end without a phone: the obligation is visible where the
+        call is actually driven from."""
+        with AuditStore(tmp_path / "collector.db", json_dir=tmp_path) as store:
+            agent = _run(["Yes, speaking.", self.HARDSHIP], store)
+            _summarize(agent.close(), store)
+
+        printed = capsys.readouterr().out
+        assert "callback:" in printed
+        assert "owes a call back" in printed
+
+    def test_the_terminal_harness_shows_no_callback_for_a_cease(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with AuditStore(tmp_path / "collector.db", json_dir=tmp_path) as store:
+            agent = _run(["Yes.", "Stop calling me."], store)
+            _summarize(agent.close(), store)
+
+        assert "callback:" not in capsys.readouterr().out
+
+
 class TestCallRecord:
     def test_the_agreement_record_carries_its_decision_trail(self, tmp_path: Path) -> None:
         with AuditStore(tmp_path / "collector.db", json_dir=tmp_path) as store:
@@ -817,7 +956,7 @@ class TestAnthropicMapping:
         assert first == second
 
     def test_the_opening_call_with_only_a_system_prompt_still_has_a_message(self) -> None:
-        """`open_call` (SPEC ring 1) calls `respond()` with just the system
+        """`open_call` (ring 1) calls `respond()` with just the system
         prompt in `self.messages`. If that strips down to an empty
         conversation, the Messages API rejects it outright with 'at least
         one message is required' and no call can ever open."""

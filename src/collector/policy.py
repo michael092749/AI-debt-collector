@@ -1,7 +1,7 @@
-"""Policy constants — the single source of truth (SPEC §2.1).
+"""Policy constants — the single source of truth.
 
 Every limit is derived from the brief. Nothing here is duplicated in a prompt:
-compliance rules live in code with stable ids, never as prose (SPEC §9).
+compliance rules live in code with stable ids, never as prose.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ class PolicyConfig:
 
     @property
     def max_installments(self) -> int:
-        """§2.3 rule 1: falls out of the floor. $1,000 / $250 = 4, never more.
+        """Falls out of the floor: $1,000 / $250 = 4, never more.
 
         This is why a 'weekly over 3 months' plan (~13 payments) is structurally
         impossible and must be countered rather than accommodated.

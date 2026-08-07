@@ -75,7 +75,7 @@ def to_openai_messages(messages: tuple[Message, ...]) -> list[JsonDict]:
             conversation.extend(_tool_exchange(message))
 
     if all(m.role == "system" for m in messages):
-        # open_call's first respond() (SPEC ring 1), and every regeneration
+        # open_call's first respond() (ring 1), and every regeneration
         # retry off of it, has nothing but system-role turns — a note is
         # appended on each retry (above), never a real consumer/agent/tool
         # turn. The chat completions format tolerates that shape (unlike

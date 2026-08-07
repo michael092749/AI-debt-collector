@@ -1,4 +1,4 @@
-"""Guardrail tests — SPEC §5, build step 4.
+"""Guardrail tests.
 
 Three things are being proven here:
 
@@ -50,7 +50,7 @@ from collector.guardrails import (
     requests_ai_disclosure,
     scan_prohibited,
 )
-from collector.guardrails.rings import _LEAK_MIN_WORDS, _contains_verbatim_leak
+from collector.guardrails.rings import _LEAK_MIN_WORDS, _contains_verbatim_leak, owes_callback
 from collector.llm.base import SYSTEM_PROMPT
 from collector.money import Money
 from collector.negotiation import NegotiationState
@@ -65,7 +65,7 @@ def policy() -> PolicyConfig:
 
 @pytest.fixture
 def settlement_offer() -> Offer:
-    """$800 over three monthly payments, structured 250/250/300 per §2.3 rule 3."""
+    """$800 over three monthly payments, each clearing the $250 floor."""
     return Offer(
         tier=Tier.SETTLEMENT,
         installments=(
@@ -92,7 +92,7 @@ def rule_ids(violations: tuple[object, ...]) -> set[str]:
 
 
 # ==========================================================================
-# Prohibited persuasion — SPEC §5.2. "Fails regardless of how well it converts."
+# Prohibited persuasion. "Fails regardless of how well it converts."
 # ==========================================================================
 
 
@@ -262,7 +262,7 @@ class TestProhibitedFalsePositives:
 
 
 # ==========================================================================
-# Numeric authorization — SPEC §5.2. The model may never originate a number.
+# Numeric authorization. The model may never originate a number.
 # ==========================================================================
 
 
@@ -345,7 +345,7 @@ class TestNumericAuthorization:
     def test_the_balance_is_authorized_but_the_policy_limits_are_not(
         self, policy: PolicyConfig
     ) -> None:
-        """SPEC §5.2: a figure must be in the engine's *currently*-authorized set.
+        """A figure must be in the engine's *currently*-authorized set.
 
         The balance is an account fact handed over with the file. The $250
         minimum and the 20% discount ceiling are the engine's private
@@ -479,7 +479,7 @@ class TestNumericAuthorization:
     def test_a_refusal_cannot_launder_terms_the_counter_does_not_contain(
         self, policy: PolicyConfig
     ) -> None:
-        """The impossible-schedule persona (SPEC §7.2), which is where refused
+        """The impossible-schedule persona, which is where refused
         consumer figures diverge furthest from anything legal: $25/week × 40 is
         a tenth of the minimum payment and ten times the payment cap. The engine
         counters 4 × $250, and only *those* figures may be spoken.
@@ -668,7 +668,7 @@ class TestNumericAuthorization:
 
 
 # ==========================================================================
-# Disclosures — SPEC §5.2 / §10
+# Disclosures
 # ==========================================================================
 
 
@@ -816,7 +816,7 @@ class TestDisclosureGating:
 
 
 # ==========================================================================
-# Escalation — SPEC §5.2, assumption A6
+# Escalation — A6: a trigger ends the call, there is no human queue here
 # ==========================================================================
 
 
@@ -1001,6 +1001,96 @@ class TestEscalationBehavior:
         result = check_outbound(ready, closing, authorized=AuthorizedFigures.empty())
         assert result.allowed, result.violations
 
+    @pytest.mark.parametrize(
+        "trigger",
+        [EscalationTrigger.HARDSHIP, EscalationTrigger.DISPUTE, EscalationTrigger.DISTRESS],
+    )
+    def test_a_callback_trigger_commits_to_a_human_calling_back(
+        self, trigger: EscalationTrigger
+    ) -> None:
+        """The defect this closes: the agent used to answer a hardship claim,
+        a dispute or a distress signal by saying goodbye. A6 still ends the
+        call — it now ends it owing the consumer a call from a person."""
+        assert owes_callback(trigger)
+        assert "call you back" in escalation_closing(trigger)
+
+    @pytest.mark.parametrize(
+        ("trigger", "utterance"),
+        [
+            (EscalationTrigger.DISTRESS, "I can't go on any more."),
+            (EscalationTrigger.CEASE_AND_DESIST, "Stop calling me."),
+            (EscalationTrigger.ATTORNEY_REPRESENTATION, "Talk to my lawyer."),
+            (EscalationTrigger.DISPUTE, "I dispute this."),
+            (EscalationTrigger.HARDSHIP, "I lost my job."),
+        ],
+    )
+    def test_the_closing_line_clears_the_guard_in_the_state_it_is_spoken_in(
+        self, trigger: EscalationTrigger, utterance: str, ready: GuardrailState
+    ) -> None:
+        """The line is spoken verbatim, but it still reaches ``check_outbound``
+        through ``fallback_for`` — in an *escalated* state, where
+        NEGOTIATION_AFTER_ESCALATION applies and the un-escalated fixture
+        above cannot see it. A trip there is silent and expensive: the
+        disclosure state machine stops advancing over a line that was spoken
+        anyway, and the call scores non-compliant for a disclosure it made."""
+        state = check_inbound(ready, utterance).state
+        assert state.escalation is not None and state.escalation.trigger is trigger
+        result = check_outbound(
+            state, escalation_closing(trigger), authorized=AuthorizedFigures.empty()
+        )
+        assert result.allowed, result.violations
+
+    @pytest.mark.parametrize("trigger", list(EscalationTrigger))
+    def test_no_closing_line_is_substantive(self, trigger: EscalationTrigger) -> None:
+        """An escalation can arrive on turn one, before identity is ever
+        confirmed. A closing line that reads as balance-or-terms talk would
+        trip IDENTITY_NOT_CONFIRMED on that same ``fallback_for`` path."""
+        assert not is_substantive(escalation_closing(trigger))
+
+    @pytest.mark.parametrize(
+        "trigger",
+        [EscalationTrigger.CEASE_AND_DESIST, EscalationTrigger.ATTORNEY_REPRESENTATION],
+    )
+    def test_no_callback_where_calling_back_is_itself_the_violation(
+        self, trigger: EscalationTrigger
+    ) -> None:
+        """A consumer who said stop calling, and a consumer whose counsel owns
+        the contact, must not be promised a call. Both still escalate."""
+        assert not owes_callback(trigger)
+        assert "call you back" not in escalation_closing(trigger)
+
+    @pytest.mark.parametrize("trigger", list(EscalationTrigger))
+    def test_every_closing_line_clears_the_prohibited_ring(
+        self, trigger: EscalationTrigger
+    ) -> None:
+        """The closing line is code-authored and spoken verbatim, so it is the
+        one utterance no regeneration loop stands behind."""
+        assert scan_prohibited(escalation_closing(trigger)) == ()
+
+    @pytest.mark.parametrize("trigger", list(EscalationTrigger))
+    def test_no_closing_line_promises_a_callback_window(self, trigger: EscalationTrigger) -> None:
+        """Nothing in the policy layer computes when the callback happens, so
+        the line must not invent it. A promise the system cannot keep is worse
+        than the silence it replaced."""
+        closing = escalation_closing(trigger).lower()
+        assert not any(
+            cue in closing
+            for cue in ("within", "hour", "minute", "tomorrow", "shortly", "business day")
+        )
+
+    def test_the_escalation_record_carries_the_callback_obligation(
+        self, policy: PolicyConfig
+    ) -> None:
+        result = check_inbound(GuardrailState.opening(policy), "I just lost my job.")
+        assert result.escalation is not None
+        assert result.escalation.trigger is EscalationTrigger.HARDSHIP
+        assert result.escalation.callback_owed
+
+    def test_a_cease_record_carries_no_callback_obligation(self, policy: PolicyConfig) -> None:
+        result = check_inbound(GuardrailState.opening(policy), "Stop calling me.")
+        assert result.escalation is not None
+        assert not result.escalation.callback_owed
+
     def test_negotiation_after_escalation_is_blocked(
         self, ready: GuardrailState, settlement_offer: Offer
     ) -> None:
@@ -1023,7 +1113,7 @@ class TestEscalationBehavior:
 
 
 # ==========================================================================
-# Rings — SPEC §5.1 / §5.2 / §5.3
+# Rings — pre-call / during-call / post-call
 # ==========================================================================
 
 

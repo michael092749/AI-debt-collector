@@ -1,4 +1,4 @@
-"""Negotiation ladder and concession tracking — SPEC build step 3.
+"""Negotiation ladder and concession tracking.
 
 The engine decides whether a given proposal is legal. This module decides how
 fast the agent is allowed to give ground, and records what was exchanged so the

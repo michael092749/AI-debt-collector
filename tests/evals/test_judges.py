@@ -1,4 +1,4 @@
-"""LLM-judged conversation quality — SPEC §7.2, alongside the hard invariants.
+"""LLM-judged conversation quality, alongside the hard invariants.
 
 ``test_scenarios.py`` asserts the load-bearing compliance claims with this
 project's own detectors: a figure is authorized or it is not, a prohibited

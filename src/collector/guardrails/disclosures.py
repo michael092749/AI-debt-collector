@@ -1,4 +1,4 @@
-"""Required disclosures — SPEC §5.2, during-call check 3.
+"""Required disclosures — during-call check 3.
 
 Two disclosures gate the call:
 
@@ -164,7 +164,7 @@ _IDENTITY_EXPLICIT_DENIAL_RE = re.compile(
 
 
 def confirms_identity(text: str) -> bool:
-    """Did the consumer just confirm they are the account holder? (SPEC §5.1)
+    """Did the consumer just confirm they are the account holder?
 
     Code decides this, not the model: it gates every substantive word that
     follows, so it cannot be a judgement call made inside a generated turn. A

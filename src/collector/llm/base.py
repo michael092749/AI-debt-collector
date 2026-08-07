@@ -1,12 +1,12 @@
-"""The model boundary — SPEC §3, ``llm/base.py``.
+"""The model boundary.
 
 One protocol, two implementations: a scripted client for offline tests and
 Claude for real calls. The agent loop is written against this protocol only, so
 the entire system runs, and is tested, with no API key.
 
 The system prompt lives here rather than in ``agent.py`` because of what it is
-*not* allowed to contain. Compliance rules live in code with stable ids (SPEC
-§9); prose asking a model nicely to obey them is not a control. What the prompt
+*not* allowed to contain. Compliance rules live in code with stable ids;
+prose asking a model nicely to obey them is not a control. What the prompt
 carries is register and procedure — how to sound, and which tool to reach for.
 """
 

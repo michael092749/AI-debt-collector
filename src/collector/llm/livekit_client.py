@@ -19,8 +19,8 @@ the OpenRouter route:
    right budget on a phone call is none, not a small one.
 3. **Zero data retention by default.** Prompts and outputs pass through the
    gateway without being logged, stored, or trained on. That matters here for
-   the same reason `voice_app.py` leaves LiveKit Cloud recording off (issues.md
-   R2): nothing on this call collects consent for a third-party copy of what
+   the same reason `voice_app.py` leaves LiveKit Cloud recording off:
+   nothing on this call collects consent for a third-party copy of what
    the consumer said.
 
 The gateway is reached over plain HTTP rather than through the SDK's
@@ -30,7 +30,7 @@ Going through the raw endpoint also keeps `text_app.py` — which has no LiveKit
 job context and no event loop — able to use this route unchanged.
 
 Model default is Gemini 3 Flash, which is `-preview` on the gateway. See the
-note in README/VOICE_QUICKSTART: this route is opt-in and has not been certified
+note in the README: this route is opt-in and has not been certified
 against `tests/evals/` or the adversarial pass.
 """
 

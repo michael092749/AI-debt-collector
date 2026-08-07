@@ -1,4 +1,4 @@
-"""Numeric authorization — SPEC §5.2, during-call check 2. The important one.
+"""Numeric authorization — during-call check 2. The important one.
 
     The model may never originate a number.
 
@@ -187,7 +187,7 @@ def _from_verdict(verdict: Verdict) -> AuthorizedFigures:
     """What the engine *offered*, which is narrower than what it printed.
 
     A verdict states three kinds of figure and only one of them is a term the
-    engine put on the table. SPEC §5.2 authorizes an "offer set", so the test is
+    engine put on the table. The rule authorizes an "offer set", so the test is
     provenance — was this figure ever offered — not whether a condition passed:
 
     * ``verdict.counter`` is an ``Offer``, built by the engine. This is the only
@@ -232,8 +232,8 @@ def authorized_for(
 ) -> AuthorizedFigures:
     """Build the authorized set for *the current point in the call*.
 
-    SPEC §5.2 says a figure must appear in "the engine's currently-authorized
-    offer set", and the emphasis is on *currently*. Only two things go in the
+    A figure must appear in the engine's currently-authorized offer set, and
+    the emphasis is on *currently*. Only two things go in the
     base set:
 
     * **The balance.** An account fact the agent was handed with the file, not

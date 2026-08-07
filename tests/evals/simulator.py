@@ -1,4 +1,4 @@
-"""Drives a full call for one persona — SPEC §7.2, tier 2.
+"""Drives a full call for one persona — tier 2.
 
 Two consumer sources for the same personas: a live one, where Claude
 improvises the character from ``persona.instructions`` and reacts to whatever
@@ -91,7 +91,7 @@ def _drive_scripted(agent: NegotiationAgent, persona: Persona) -> None:
 
 _NOTHING_HEARD = "..."
 
-# A blocked turn is the guard working (SPEC §5.2), not the end of the call: no
+# A blocked turn is the guard working, not the end of the call: no
 # sentence reached the consumer, so there is nothing for the persona to react
 # to. React to silence rather than stopping, the way a human on the other end
 # of a dropped word would.

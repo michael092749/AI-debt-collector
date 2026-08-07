@@ -1,4 +1,4 @@
-"""Compliance guardrails — SPEC §5. Three rings, in code, never in the prompt.
+"""Compliance guardrails. Three rings, in code, never in the prompt.
 
 The brief's automatic-fail condition is persuasion by threats, false urgency or
 invented consequences, so none of this lives in prompt prose where a jailbreak

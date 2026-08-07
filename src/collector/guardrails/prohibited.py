@@ -1,4 +1,4 @@
-"""Prohibited persuasion — SPEC §5.2, during-call check 1.
+"""Prohibited persuasion — during-call check 1.
 
 The brief is explicit: persuasion that relies on threats, false urgency, or
 invented consequences fails *regardless of how well it converts*. So this runs
@@ -11,9 +11,9 @@ hear. A matched phrase is therefore cleared when a negation cue appears earlier
 in the same clause.
 
 This module also carries the shared violation vocabulary (``Severity``,
-``Violation``) used by the other three checks: SPEC §3 fixes this package at
-four modules, so the common types live with the first check rather than in a
-fifth file.
+``Violation``) used by the other three checks: the package is fixed at four
+modules, so the common types live with the first check rather than in a fifth
+file.
 """
 
 from __future__ import annotations
@@ -192,7 +192,7 @@ _RULES: tuple[_Rule, ...] = (
     ),
     _rule(
         ProhibitedRuleId.UNAUTHORIZED_ADVICE,
-        "gives legal or financial advice the agent is not licensed to give (SPEC §10)",
+        "gives legal or financial advice the agent is not licensed to give",
         r"\byou\s+should\s+(?:file\s+for\s+|declare\s+)?bankrupt(?:cy)?\b",
         r"\byou\s+should\s+(?:take\s+out|get)\s+a\s+loan\b",
         r"\byou\s+should\s+borrow\b",

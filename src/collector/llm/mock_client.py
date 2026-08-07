@@ -1,4 +1,4 @@
-"""A scripted stand-in for the model — SPEC §3, §7.1.
+"""A scripted stand-in for the model.
 
 Rule-based and deterministic, so the whole agent loop runs in CI with an empty
 ``.env``. It is not a simulation of Claude and does not try to be; it is a

@@ -119,7 +119,7 @@ def _agent_lines(store: AuditStore, call_id: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------
-# issues.md C4 — a spoken line the audit log never saw
+# A spoken line the audit log never saw
 # --------------------------------------------------------------------------
 
 
@@ -148,8 +148,8 @@ async def test_transient_failure_apology_is_recorded_as_spoken(store: AuditStore
 @pytest.mark.asyncio
 async def test_transient_failure_turn_is_counted(store: AuditStore) -> None:
     """The errored turn still counts. ``turn()`` never reaches its own
-    ``self.turns.append`` when ``_act()`` raises, which is what issues.md C4
-    described — but ``record_fallback_speech`` appends an ``AgentTurn`` of its
+    ``self.turns.append`` when ``_act()`` raises — but
+    ``record_fallback_speech`` appends an ``AgentTurn`` of its
     own on the way out, so the call report and the ``CallEnded`` count agree
     with what the consumer actually experienced: one turn, one reply."""
     negotiation_agent, agent = _voice_agent(store, _RaisingLLMClient())
@@ -281,7 +281,7 @@ async def test_an_ended_call_says_nothing_more(store: AuditStore) -> None:
 
 
 # --------------------------------------------------------------------------
-# OBSERVABILITY.md G2 — the seven-round-trip turn has to be measurable
+# The seven-round-trip turn has to be measurable
 # --------------------------------------------------------------------------
 
 
@@ -354,7 +354,7 @@ async def test_consumer_turns_are_not_logged_as_agent_latency(
 
 
 # --------------------------------------------------------------------------
-# issues.md R1 — dispatch metadata must not fail open
+# Dispatch metadata must not fail open
 # --------------------------------------------------------------------------
 
 
@@ -369,7 +369,7 @@ class _FakeCtx:
 
 
 def test_absent_metadata_falls_back_to_the_fixture_consumer() -> None:
-    """Local and manual testing, per VOICE_QUICKSTART.md — legitimate."""
+    """Local and manual testing — legitimate."""
     name, account = _consumer_context(_FakeCtx(""))  # type: ignore[arg-type]
     assert (name, account) == ("Dana Whitfield", "ACCT-4471")
 
@@ -432,7 +432,7 @@ def test_text_mode_attaches_no_speech_pipeline(store: AuditStore) -> None:
 
 
 # --------------------------------------------------------------------------
-# Recording mode — the default must not move (issues.md R2)
+# Recording mode — the default must not move
 # --------------------------------------------------------------------------
 
 

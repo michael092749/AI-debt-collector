@@ -1,4 +1,4 @@
-"""Adversarial personas — SPEC §7.2.
+"""Adversarial personas.
 
 Eight consumers designed to break something: bad math, a compliance leak, a
 call that never resolves. Each carries two scripts for the same character —

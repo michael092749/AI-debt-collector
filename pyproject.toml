@@ -22,6 +22,10 @@ dev = [
 collector-text = "collector.text_app:run"
 collector-agreements = "collector.text_app:dump_agreements"
 collector-voice = "collector.voice_app:run"
+# Retention purging is destructive and irreversible, so it is a command an
+# operator runs on a schedule they own — never something the store does to
+# itself on open (see AuditStore.purge_older_than).
+collector-purge = "collector.audit.store:purge_main"
 
 [build-system]
 requires = ["hatchling"]
@@ -40,7 +44,7 @@ addopts = "-m 'not evals'"
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
-    "evals: exercises tests/evals; makes live Anthropic calls when ANTHROPIC_API_KEY is set (VOICE_QUICKSTART.md). Run explicitly with `pytest -m evals tests/evals`.",
+    "evals: exercises tests/evals; makes live Anthropic calls when ANTHROPIC_API_KEY is set. Run explicitly with `pytest -m evals tests/evals`.",
 ]
 
 [tool.ruff]

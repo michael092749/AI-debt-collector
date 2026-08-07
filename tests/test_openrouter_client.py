@@ -76,7 +76,7 @@ class TestOpenRouterMapping:
         assert json.loads(encoded) == {"payment_count": 3}
 
     def test_an_all_system_conversation_gets_a_call_started_nudge(self) -> None:
-        """The opening `respond()` call (SPEC ring 1), and every regeneration
+        """The opening `respond()` call (ring 1), and every regeneration
         retry off of it, has nothing but system-role turns. The chat
         completions format tolerates that (unlike Anthropic's Messages API,
         which rejects it outright), but a synthetic user turn is added anyway

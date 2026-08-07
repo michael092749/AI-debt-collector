@@ -51,6 +51,23 @@ COPY --from=build --chown=appuser:appuser /app /app
 
 USER appuser
 
+# The audit log — verbatim transcripts of debt-collection calls — lives here.
+# AuditStore creates the directory 0700 and every file in it 0600, and refuses
+# to start if it cannot: the container runs as UID 10001, so a volume mounted
+# with a different owner fails loudly rather than writing readable transcripts.
+# Set COLLECTOR_DB_PATH to move the log off the container filesystem.
+#
+# THE MOUNTED VOLUME MUST BE ON AN ENCRYPTED FILESYSTEM (dm-crypt/LUKS, an
+# encrypted EBS volume, or the equivalent). 0600 is an access control between
+# accounts on one host and nothing more: it does not protect the data from
+# root, from a stolen disk, from a snapshot, or from a backup. There is no
+# application-level encryption in this build — that decision was deliberate,
+# and this line is the other half of it.
+#
+# Deliberately no VOLUME instruction: an anonymous volume comes up root-owned,
+# and this image runs as UID 10001, so the directory chmod would fail on every
+# start. Mount the encrypted volume at /app/data with `docker run -v`, owned by
+# UID 10001.
+
 # `start` is the production worker mode (dev/console are for local runs).
-# AuditStore creates its own data/ directory relative to this WORKDIR.
 CMD ["uv", "run", "collector-voice", "start"]

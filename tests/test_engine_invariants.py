@@ -1,7 +1,7 @@
 """T6 - invariants and purity, enforced structurally.
 
 The tests in test_decision_engine.py check examples. These check *rules*: they
-sweep the input space and assert SPEC §4.3 holds everywhere, and they assert the
+sweep the input space and assert the total rule holds everywhere, and they assert
 engine's purity via AST inspection so it cannot quietly acquire an I/O import
 six months from now.
 """
@@ -67,7 +67,7 @@ def _proposals() -> list[ConsumerProposal]:
 def _assert_legal_under(offer: Offer, policy: PolicyConfig, label: str) -> None:
     assert offer.smallest_payment >= policy.min_payment, f"{label}: sub-floor instalment"
     assert offer.total >= policy.settlement_floor, f"{label}: below settlement floor"
-    # The ceiling, not just the floor. SPEC §4.3 reads "== ORIGINAL_BALANCE
+    # The ceiling, not just the floor. The rule reads "== ORIGINAL_BALANCE
     # unless tier is SETTLEMENT", and this sweep only ever checked the lower
     # half — so it passed 320 cases while the engine was accepting $3,000 on a
     # $1,000 debt. An invariant asserted in one direction is half an invariant.
@@ -91,7 +91,7 @@ def _assert_offer_legal(offer: Offer, label: str) -> None:
 
 class TestInvariantsHoldEverywhere:
     def test_no_verdict_ever_authorises_something_illegal(self) -> None:
-        """SPEC §4.3 over the whole sweep - ~4,900 proposals."""
+        """The total rule over the whole sweep - ~4,900 proposals."""
         state = NegotiationState.opening(POLICY)
         for p in _proposals():
             verdict = validate_offer(p, state, POLICY)

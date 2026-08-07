@@ -1,4 +1,4 @@
-"""The action whitelist — SPEC §3, §5.2.
+"""The action whitelist.
 
 Six tools. The model may do these things and nothing else: no arithmetic, no
 free-form state changes, no way to reach the audit log or the guardrails. Every
@@ -121,7 +121,7 @@ def _parse_money(value: object) -> Money:
     """Parse an amount from tool arguments.
 
     JSON has one number type and it decodes to ``float``, which ``Money``
-    refuses on purpose (SPEC §9). Routing through ``str`` at this boundary
+    refuses on purpose. Routing through ``str`` at this boundary
     keeps the exact digits the model actually emitted — ``str(50.5)`` is
     "50.5" — without letting a float any further into the system.
     """
@@ -631,7 +631,7 @@ def _confirm_agreement(args: JsonDict, context: ToolContext) -> ToolResult:
     # here was engine-authored, so this should always pass — which is exactly
     # why it is worth asserting, and it gives the agreement record the
     # evaluated-condition trail for the terms actually agreed to rather than
-    # for some earlier proposal (SPEC §4.1, §6).
+    # for some earlier proposal.
     verdict = validate_offer(_as_proposal(offer), context.state, context.policy)
     if verdict.outcome != "accept":
         return _error(

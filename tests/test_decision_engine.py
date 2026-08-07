@@ -1,4 +1,4 @@
-"""Decision engine tests — SPEC §4, plan tasks T1-T6.
+"""Decision engine tests.
 
 The engine is a pure function of (proposal, state, policy). Every test here is a
 table of inputs and expected verdicts: no mocks, no I/O, no clock.
@@ -30,7 +30,7 @@ def fresh(policy: PolicyConfig) -> NegotiationState:
 
 class TestMoney:
     def test_rejects_float(self) -> None:
-        """Floats are a bug in money code. SPEC §9."""
+        """Floats are a bug in money code."""
         with pytest.raises(TypeError):
             Money(1000.0)  # type: ignore[arg-type]
 
@@ -74,7 +74,7 @@ class TestFullPayment:
     def test_records_every_condition_evaluated_not_just_failures(
         self, policy: PolicyConfig, fresh: NegotiationState
     ) -> None:
-        """SPEC §4.1: the decision record must show evaluated conditions and a
+        """The decision record must show evaluated conditions and a
         policy path, not just an outcome. This is the vendor test from the
         research report - it is what proves the engine decided, not the model."""
         from collector.decision_engine import validate_offer
@@ -106,7 +106,7 @@ class TestFullPayment:
 
 
 class TestOverCollection:
-    """SPEC §4.3: the total is `== ORIGINAL_BALANCE` unless the tier is
+    """The total is `== ORIGINAL_BALANCE` unless the tier is
     settlement. Only the lower half of that equality was ever enforced.
 
     This is the worst shape a defect can take in this system. The model did not
@@ -147,7 +147,7 @@ class TestOverCollection:
 
     def test_the_condition_trail_names_the_ceiling_either_way(self, policy: PolicyConfig) -> None:
         """A passing condition is part of the record too — that is the whole
-        point of carrying every evaluated rule (SPEC §4.1)."""
+        point of carrying every evaluated rule."""
         from collector.decision_engine import RuleId, validate_offer
 
         verdict = validate_offer(
@@ -164,7 +164,7 @@ class TestOverCollection:
 
 class TestPolicyConstants:
     def test_derives_floors_from_the_brief(self, policy: PolicyConfig) -> None:
-        """SPEC §2.1. A1 resolved: 25% is of the ORIGINAL BALANCE, fixed at $250."""
+        """A1: 25% is of the ORIGINAL BALANCE, not the agreed total — fixed at $250."""
         assert policy.original_balance == Money("1000.00")
         assert policy.min_payment == Money("250.00")
         assert policy.settlement_floor == Money("800.00")
@@ -175,7 +175,7 @@ class TestPolicyConstants:
         assert doubled.settlement_floor == Money("1600.00")
 
     def test_max_installments_falls_out_of_the_floor(self, policy: PolicyConfig) -> None:
-        """§2.3 rule 1: $1000 / $250 = 4. No plan can ever exceed 4 payments."""
+        """$1000 / $250 = 4. No plan can ever exceed 4 payments."""
         assert policy.max_installments == 4
 
 
@@ -201,7 +201,7 @@ def _propose(
 
 
 def _assert_offer_is_legal(offer: object, policy: PolicyConfig) -> None:
-    """Every engine-authored counter must itself satisfy SPEC §4.3."""
+    """Every engine-authored counter must itself satisfy the total rule."""
     from collector.offers import Offer
 
     assert isinstance(offer, Offer)
@@ -541,7 +541,7 @@ class TestSettlement:
     def test_settlement_of_800_over_3_respects_the_250_floor(
         self, policy: PolicyConfig, fresh: NegotiationState
     ) -> None:
-        """§2.3 rule 3: the $250 floor binds harder than the discount.
+        """The $250 floor binds harder than the discount.
 
         A1 makes the floor 25% of the ORIGINAL balance, so 200/300/300 is
         illegal even though $200 is 25% of the $800 settlement. Any split
@@ -607,7 +607,7 @@ class TestPaymentPlan:
     def test_weekly_over_three_months_is_impossible_and_gets_countered(
         self, policy: PolicyConfig, fresh: NegotiationState
     ) -> None:
-        """§2.3 rule 1. 13 weekly payments of ~$77 is below the $250 floor.
+        """13 weekly payments of ~$77 is below the $250 floor.
         The engine must counter with a legal structure, not accommodate it.
 
         Read at the bottom of the ladder, where a plan is what is on the table:

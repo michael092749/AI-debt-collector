@@ -1,4 +1,4 @@
-"""Audit and agreement log — SPEC §6.
+"""Audit and agreement log.
 
 The agent loop only needs two things from here: ``AuditStore.record(event)``
 during the call, and ``AuditStore.finalize_agreement(...)`` at the end of it.

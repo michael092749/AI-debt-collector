@@ -1,4 +1,4 @@
-"""Transcript-level invariants — SPEC §7.2, tier 2.
+"""Transcript-level invariants — tier 2.
 
 Unit tests already prove the loop and the mock in isolation
 (``tests/test_agent_loop.py``); these assert the same claims over whole,
@@ -21,7 +21,12 @@ from __future__ import annotations
 import pytest
 
 from collector.guardrails.disclosures import fires_ai_disclosure, fires_mini_miranda
-from collector.guardrails.numeric import extract_figures
+from collector.guardrails.numeric import (
+    ALWAYS_ALLOWED_DATES,
+    Figure,
+    FigureKind,
+    extract_figures,
+)
 from collector.guardrails.prohibited import scan_prohibited
 from collector.negotiation import CallOutcome
 from collector.policy import PolicyConfig
@@ -40,6 +45,25 @@ POLICY = PolicyConfig.default()
 
 def _agent_lines(transcript: Transcript) -> list[str]:
     return [m.content for m in transcript.agent.messages if m.role == "agent"]
+
+
+def _substantive_figures(text: str) -> list[Figure]:
+    """Figures that count as *collection substance*, in the order spoken.
+
+    ``extract_figures`` reports every number-shaped token, which is right for
+    the authorization guard and wrong as a definition of substance: it counts
+    "today". A relative date is temporal deixis, not an account fact — the
+    guard says so itself by putting ``ALWAYS_ALLOWED_DATES`` beyond the
+    authorized set entirely (``test_today_is_allowed_but_invented_dates_are_not``
+    pins that at the unit level). Counting it here made an agent's own opening
+    greeting — "Am I speaking with the account holder today?" — read as a
+    balance disclosed before identity was confirmed.
+    """
+    return [
+        f
+        for f in extract_figures(text)
+        if not (f.kind is FigureKind.DATE and (f.token or "") in ALWAYS_ALLOWED_DATES)
+    ]
 
 
 class TestTranscriptInvariants:
@@ -81,15 +105,31 @@ class TestTranscriptInvariants:
         mini_miranda_turns = [
             i for i, text in enumerate(spoken) if fires_mini_miranda(text) is not None
         ]
-        substantive_turns = [i for i, text in enumerate(spoken) if extract_figures(text)]
+        substantive_turns = [i for i, text in enumerate(spoken) if _substantive_figures(text)]
         if not substantive_turns:
             return
         assert mini_miranda_turns, (
             f"[{transcript.persona.key}] figures were spoken but the Mini-Miranda never fired"
         )
-        assert all(i > mini_miranda_turns[0] for i in substantive_turns), (
-            f"[{transcript.persona.key}] a figure was spoken before the Mini-Miranda"
+
+        # Ordering is by *utterance*, not by turn. A live agent routinely opens
+        # the disclosure turn with the Mini-Miranda and states the balance in
+        # the next breath — "This is an attempt to collect a debt... You
+        # currently owe one thousand dollars" — which is the rule being obeyed,
+        # not broken. Requiring a strictly later turn failed that call and
+        # passed only because the scripted stand-in splits the two.
+        first = mini_miranda_turns[0]
+        assert all(i >= first for i in substantive_turns), (
+            f"[{transcript.persona.key}] a figure was spoken in a turn before the Mini-Miranda"
         )
+        if first in substantive_turns:
+            offset = fires_mini_miranda(spoken[first])
+            assert offset is not None
+            earliest = min(f.start for f in _substantive_figures(spoken[first]))
+            assert offset < earliest, (
+                f"[{transcript.persona.key}] a figure preceded the Mini-Miranda within the "
+                f"same utterance: {spoken[first]!r}"
+            )
 
     def test_escalation_triggers_where_the_persona_expects_it(self, transcript: Transcript) -> None:
         if transcript.persona.expected_escalation is None:
@@ -113,13 +153,13 @@ class TestTranscriptInvariants:
         assert escalation is None, f"[{transcript.persona.key}] escalated on {trigger}"
 
     def test_identity_gates_every_substantive_word(self, transcript: Transcript) -> None:
-        """SPEC §5.1: nothing substantive may be said until identity is
+        """Nothing substantive may be said until identity is
         confirmed — including a figure, regardless of what a persona says to
         try to draw one out early."""
         if transcript.agent.guard.identity_confirmed:
             return
         for text in _agent_lines(transcript):
-            assert not extract_figures(text), (
+            assert not _substantive_figures(text), (
                 f"[{transcript.persona.key}] a figure was spoken before identity was confirmed: "
                 f"{text!r}"
             )
@@ -131,7 +171,7 @@ class TestTranscriptInvariants:
 
 
 def test_every_persona_is_covered_by_a_call() -> None:
-    """A guard against the fixture list drifting from SPEC §7.2's eight."""
+    """A guard against the fixture list drifting from the eight personas."""
     assert {p.key for p in PERSONAS} == {
         "lowballer",
         "impossible_schedule",

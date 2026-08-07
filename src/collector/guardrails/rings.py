@@ -1,21 +1,23 @@
-"""Guardrail rings — SPEC §5. Pre-call, during-call, post-call.
+"""Guardrail rings. Pre-call, during-call, post-call.
 
 ``agent.py`` drives three entry points and threads the returned state through
 the call:
 
     state  = GuardrailState.opening(policy)
-    pre    = check_pre_call(context)                 # §5.1, once
-    inbound  = check_inbound(state, consumer_text)   # §5.2, every consumer turn
-    outbound = check_outbound(state, candidate)      # §5.2, before every TTS call
-    summary  = finalize_call(state)                  # §5.3, once
+    pre    = check_pre_call(context)                 # once
+    inbound  = check_inbound(state, consumer_text)   # every consumer turn
+    outbound = check_outbound(state, candidate)      # before every TTS call
+    summary  = finalize_call(state)                  # once
 
 Every result carries the successor state and the full violation detail. Nothing
 here returns a bare boolean: the audit log is the deliverable, and "blocked" with
 no reason is not a record.
 
-Escalation follows A6 — there is no human queue in this build, so a dispute,
-hardship, distress, attorney or cease trigger stops negotiation, states that a
-human will follow up, closes politely, and writes an escalation record.
+Escalation follows A6 — there is no live transfer in this build, so a dispute,
+hardship, distress, attorney or cease trigger stops negotiation, closes
+politely, and writes an escalation record. Where a call back is the right
+follow-up the closing line commits to one and the record carries the
+obligation; where it is not, it deliberately does not. See ``owes_callback``.
 """
 
 from __future__ import annotations
@@ -342,6 +344,15 @@ class EscalationRecord:
     turn_index: int
     closing_line: str
 
+    @property
+    def callback_owed(self) -> bool:
+        """Does a human owe this consumer a call back?
+
+        Derived from the trigger rather than stored, so the sentence the
+        consumer hears and the obligation on the trail cannot drift apart.
+        """
+        return owes_callback(self.trigger)
+
 
 def detect_escalation(utterance: str) -> tuple[EscalationSignal, ...]:
     """Escalation triggers in a *consumer* utterance, most serious first.
@@ -373,8 +384,42 @@ def detect_escalation(utterance: str) -> tuple[EscalationSignal, ...]:
     return tuple(signals)
 
 
+# The triggers whose follow-up is a human calling this consumer back. The
+# other two are left out deliberately and it is not an oversight: under
+# CEASE_AND_DESIST the consumer has just asked us to stop phoning them, so
+# committing to phone them again is the one thing that request forbids, and
+# under ATTORNEY_REPRESENTATION further contact belongs to counsel rather than
+# to the consumer. Both still stop the call and both still leave an escalation
+# record for a human to pick up — neither promises a call.
+_CALLBACK_TRIGGERS = frozenset(
+    {
+        EscalationTrigger.DISTRESS,
+        EscalationTrigger.DISPUTE,
+        EscalationTrigger.HARDSHIP,
+    }
+)
+
+
+def owes_callback(trigger: EscalationTrigger) -> bool:
+    """Does this trigger commit a human to calling the consumer back?"""
+    return trigger in _CALLBACK_TRIGGERS
+
+
 def escalation_closing(trigger: EscalationTrigger) -> str:
-    """The scripted close for each trigger. No figures, no persuasion, no promises."""
+    """The scripted close for each trigger. No figures, no persuasion.
+
+    A hardship claim, a dispute or a distress signal used to end with a
+    goodbye and nothing behind it — the consumer disclosed the worst thing
+    happening to them and the agent hung up. These lines commit a human to
+    calling back instead, and ``owes_callback`` decides which get to.
+
+    The callback is the only promise here and it is deliberately silent about
+    *when*: nothing in the policy layer computes a callback window, so a
+    scripted "within twenty-four hours" would be a figure this system cannot
+    honour and does not record. What it does record is the obligation itself
+    (``audit.events.Escalated``), so the sentence and the trail commit to
+    exactly the same thing.
+    """
     if trigger is EscalationTrigger.CEASE_AND_DESIST:
         return (
             "Understood. I'll note your request and pass it to a member of our team, "
@@ -383,7 +428,8 @@ def escalation_closing(trigger: EscalationTrigger) -> str:
     if trigger is EscalationTrigger.DISTRESS:
         return (
             "I hear you, and this call is not worth your wellbeing. I'm going to stop here. "
-            "A member of our team will follow up, and there's nothing you need to do right now."
+            "A member of our team will call you back, and there's nothing you need to do "
+            "right now."
         )
     if trigger is EscalationTrigger.ATTORNEY_REPRESENTATION:
         return (
@@ -392,12 +438,13 @@ def escalation_closing(trigger: EscalationTrigger) -> str:
         )
     if trigger is EscalationTrigger.DISPUTE:
         return (
-            "Thank you for telling me. I'm going to stop here and have a member of our team "
-            "follow up with you in writing. Have a good day."
+            "Thank you for telling me. I'm going to stop here, and a member of our team will "
+            "call you back about it. Have a good day."
         )
     return (
-        "Thank you for telling me. I'm going to stop here and have a member of our team "
-        "follow up with you directly. Have a good day."
+        "Thank you for telling me, and I'm sorry you're dealing with that. I'm going to stop "
+        "here, and a member of our team will call you back to talk it through. "
+        "Have a good day."
     )
 
 
@@ -406,7 +453,7 @@ def escalation_closing(trigger: EscalationTrigger) -> str:
 
 @dataclass(frozen=True)
 class GuardrailEvent:
-    """One guardrail decision, retained for the post-call trail (SPEC §5.3)."""
+    """One guardrail decision, retained for the post-call trail."""
 
     ring: GuardrailRing
     speaker: Speaker
@@ -464,7 +511,7 @@ class GuardrailState:
         return replace(self, events=(*self.events, event))
 
 
-# -- ring 1: pre-call (SPEC §5.1) ------------------------------------------
+# -- ring 1: pre-call ------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -618,7 +665,7 @@ class OutboundCheck:
         return self.fallback_text
 
     def regeneration_note(self) -> str:
-        """The violation named back to the model so the retry is informed, per SPEC §5.2."""
+        """The violation named back to the model so the retry is informed."""
         return "; ".join(v.detail for v in self.blocking_violations)
 
 
@@ -635,7 +682,7 @@ def check_outbound(
     to the system prompt alone; callers that also want tool-schema text
     covered (``agent.py`` does) pass a wider reference string — kept a
     parameter rather than an import so this module does not depend on
-    ``tools.py`` (SPEC's four-module guardrail package would otherwise become
+    ``tools.py`` (the four-module guardrail package would otherwise become
     a cycle: ``tools`` -> ``audit.events`` -> ``rings``).
     """
     figure_set = authorized if authorized is not None else state.authorized
@@ -659,7 +706,7 @@ def check_outbound(
             _ring_violation(
                 RingRuleId.IDENTITY_NOT_CONFIRMED,
                 candidate,
-                "no balance or terms before the consumer's identity is confirmed (SPEC §5.1)",
+                "no balance or terms before the consumer's identity is confirmed",
             )
         )
     if state.escalated and _NEGOTIATION_RE.search(candidate) is not None:
@@ -725,7 +772,7 @@ def _ring_violation(rule_id: RingRuleId, candidate: str, detail: str) -> Violati
     )
 
 
-# -- ring 3: post-call (SPEC §5.3) -----------------------------------------
+# -- ring 3: post-call -----------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -765,7 +812,7 @@ def finalize_call(state: GuardrailState, *, transcript_persisted: bool = True) -
             )
         )
     if state.disclosures.ai_disclosure_requested:
-        # SPEC §5.2 requires the AI disclosure at open *and on request*, and
+        # The AI disclosure is required at open *and on request*, and
         # those are different obligations. Scoring only the first meant a call
         # where the consumer asked "am I talking to a machine?", never got an
         # answer, and heard the scripted fallback on every turn afterwards
@@ -783,7 +830,7 @@ def finalize_call(state: GuardrailState, *, transcript_persisted: bool = True) -
         violations.append(
             _post_violation(
                 RingRuleId.TRANSCRIPT_NOT_PERSISTED,
-                "the transcript was not persisted; SPEC §5.3 requires it",
+                "the transcript was not persisted; the post-call ring requires it",
             )
         )
 

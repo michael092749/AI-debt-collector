@@ -1,1 +1,0 @@
-- [Audit 2026-08-07 — streaming path & tightened numeric guard](audit-2026-08-07-streaming-numeric.md) — confirmed bypasses, streaming-only false positives, and the surfaces that held; includes why the 337-test suite misses all of it.

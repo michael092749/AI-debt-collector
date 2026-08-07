@@ -1,4 +1,4 @@
-"""Text harness — SPEC §3, §8.
+"""Text harness.
 
 The same agent, the same engine, the same guardrails, with a terminal where the
 phone would be. No audio, no keys, no network: if a negotiation misbehaves this
@@ -26,6 +26,7 @@ from collector.guardrails.rings import PreCallContext
 from collector.llm.base import LLMClient
 from collector.llm.mock_client import MockLLMClient
 from collector.policy import PolicyConfig
+from collector.tracing import configure_tracing, flush_traces
 
 PROMPT = "you> "
 
@@ -87,12 +88,17 @@ def run(argv: list[str] | None = None) -> int:
     parser.add_argument("--verbose", action="store_true", help="Show engine calls and guard trips.")
     args = parser.parse_args(argv)
 
+    # Before the store, so a malformed COLLECTOR_TRACING is a start-up failure
+    # rather than a call that quietly exports nothing (see tracing.py).
+    configure_tracing()
+
     store = None if args.no_store else AuditStore(args.db, json_dir=args.db.parent)
     try:
         return _negotiate(args, store)
     finally:
         if store is not None:
             store.close()
+        flush_traces()
 
 
 def _negotiate(args: argparse.Namespace, store: AuditStore | None) -> int:
@@ -163,8 +169,14 @@ def _summarize(report: CallReport, store: AuditStore | None) -> None:
     print(f"compliant:   {summary.compliant}")
     print(f"turns:       {report.turns}   blocked: {summary.blocked_turns}")
     print(f"disclosures: {', '.join(d.value for d in summary.disclosures_fired) or 'none'}")
-    if summary.escalation is not None:
-        print(f"escalation:  {summary.escalation.trigger}")
+    escalation = summary.escalation
+    if escalation is not None:
+        print(f"escalation:  {escalation.trigger}")
+        # The obligation the call ended owing. It is on the audit trail either
+        # way; printing it is what makes the commitment checkable from the
+        # terminal, with no phone and no human queue in the loop.
+        if escalation.callback_owed:
+            print(f"callback:    owed — a human owes a call back (turn {escalation.turn_index})")
     if offer is not None:
         schedule = ", ".join(f"{i.amount} on day {i.due_day_offset}" for i in offer.installments)
         print(f"agreement:   {offer.tier.label} — {offer.total} ({offer.cadence.value})")

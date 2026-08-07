@@ -1,4 +1,4 @@
-"""Audit log tests — SPEC §6, build step 5.
+"""Audit log tests.
 
 The agreement record is the brief's deliverable ("log the final agreement"), so
 these tests hold it to the vendor test from the research report: the record has
@@ -11,6 +11,10 @@ client. Everything runs offline against a tmp_path database; the real
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
+import stat
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -34,6 +38,13 @@ from collector.audit import (
     TurnRecorded,
     to_jsonable,
 )
+from collector.audit.store import (
+    DB_PATH_ENV_VAR,
+    DEFAULT_DB_PATH,
+    DEFAULT_RETENTION_DAYS,
+    RETENTION_DAYS_ENV_VAR,
+    retention_days,
+)
 from collector.decision_engine import RuleId, Verdict, validate_offer
 from collector.money import Money
 from collector.negotiation import NegotiationState
@@ -42,9 +53,13 @@ from collector.policy import PolicyConfig
 
 CALL_ID = "CALL-0001"
 
-# The settlement the engine authorizes: $800 over three monthly payments,
-# structured 250/250/300 because the $250 floor binds harder than the discount
-# (SPEC §2.3 rule 3).
+#: The four evidence tables, plus the hash chain that makes an edit to any of
+#: them detectable and the log of what retention purges have deleted.
+TABLES = ("agreements", "audit_chain", "calls", "decisions", "purges", "turns")
+
+# A legal settlement: $800 over three monthly payments, each clearing the $250
+# floor. Hand-built rather than engine-emitted — the engine's own even split is
+# 266.67/266.67/266.66.
 SETTLEMENT = Offer(
     tier=Tier.SETTLEMENT,
     installments=(
@@ -188,8 +203,8 @@ def floats_in(value: Any, path: str = "$") -> list[str]:
 
 
 class TestSchema:
-    def test_creates_the_four_tables(self, store: AuditStore) -> None:
-        assert store.table_names() == ("agreements", "calls", "decisions", "turns")
+    def test_creates_the_evidence_tables(self, store: AuditStore) -> None:
+        assert store.table_names() == TABLES
 
     def test_creation_is_idempotent(self, tmp_path: Path, accepted: Verdict) -> None:
         """Reopening an existing database must not error and must not truncate."""
@@ -202,11 +217,11 @@ class TestSchema:
         with AuditStore(path, json_dir=tmp_path / "j") as second:
             second.create_schema()  # explicit second run, same result
             second.create_schema()
-            assert second.table_names() == ("agreements", "calls", "decisions", "turns")
+            assert second.table_names() == TABLES
             assert len(second.turns(CALL_ID)) == 1
 
     def test_uses_the_configured_path_only(self, tmp_path: Path) -> None:
-        """Tests must never write to the real data/ directory (SPEC §10)."""
+        """Tests must never write to the real data/ directory."""
         with AuditStore(tmp_path / "sub" / "collector.db") as s:
             assert s.db_path == tmp_path / "sub" / "collector.db"
             assert s.json_dir == tmp_path / "sub" / "agreements"
@@ -258,7 +273,7 @@ class TestTrace:
         self, store: AuditStore, lowball: Verdict, accepted: Verdict
     ) -> None:
         """A blocked utterance is evidence the guardrail worked; keeping it is
-        the point of the log (SPEC §5.3)."""
+        the point of the log."""
         record_call(store, lowball, accepted)
         (trip,) = store.guardrail_events(CALL_ID)
 
@@ -449,7 +464,7 @@ class TestRoundTrip:
     def test_agreements_are_queryable_by_scalar_columns(
         self, store: AuditStore, agreement: AgreementRecord
     ) -> None:
-        """Production sampling (SPEC §7.3) needs to filter without parsing JSON."""
+        """Production sampling needs to filter without parsing JSON."""
         row = store._rows(
             "SELECT * FROM agreements WHERE tier = ? AND total >= ?",
             (Tier.SETTLEMENT.name, "800.00"),
@@ -494,7 +509,7 @@ class TestJsonExport:
 
     def test_export_is_complete(self, store: AuditStore, agreement: AgreementRecord) -> None:
         """Inspectable with no SQLite client: everything a reviewer needs is in
-        this one file (SPEC §6)."""
+        this one file."""
         data = json.loads(store.agreement_json_path(agreement.agreement_id).read_text())
 
         assert data["tier"] == "SETTLEMENT"
@@ -521,8 +536,383 @@ class TestJsonExport:
         assert AgreementRecord.from_json(raw) == agreement
 
 
+# --------------------------------------------------------------------------
+# file permissions — the log is plaintext consumer speech
+# --------------------------------------------------------------------------
+
+
+def mode_of(path: Path) -> int:
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+class TestFilePermissions:
+    """0600 on every file this store creates, 0700 on the directory.
+
+    Not encryption — an access control, and the only one this build has. The
+    rows are verbatim debt-collection transcripts; the SQLite default of
+    0644 publishes them to every other account on the host.
+    """
+
+    def test_database_and_its_wal_sidecars_are_owner_only(self, tmp_path: Path) -> None:
+        """The WAL holds committed rows not yet checkpointed back — the same
+        transcripts, in a second file SQLite creates for itself."""
+        with AuditStore(tmp_path / "data" / "collector.db") as store:
+            store.record(TurnRecorded(CALL_ID, 0, Speaker.AGENT, "hello", at="t0"))
+            for path in (
+                store.db_path,
+                Path(f"{store.db_path}-wal"),
+                Path(f"{store.db_path}-shm"),
+            ):
+                assert path.exists(), path
+                assert mode_of(path) == 0o600, path
+
+    def test_the_data_directory_is_owner_only(self, tmp_path: Path) -> None:
+        with AuditStore(tmp_path / "data" / "collector.db") as store:
+            assert mode_of(store.db_path.parent) == 0o700
+
+    def test_the_agreement_json_is_owner_only(
+        self, store: AuditStore, agreement: AgreementRecord
+    ) -> None:
+        path = store.agreement_json_path(agreement.agreement_id)
+
+        assert mode_of(path) == 0o600
+        assert mode_of(store.json_dir) == 0o700
+
+    def test_a_log_written_before_this_is_tightened_on_open(self, tmp_path: Path) -> None:
+        """The fix has to reach databases that already exist, or the only
+        protected deployments are the ones that never took a call."""
+        path = tmp_path / "collector.db"
+        with AuditStore(path):
+            pass
+        os.chmod(path, 0o644)
+
+        with AuditStore(path) as store:
+            assert mode_of(store.db_path) == 0o600
+
+
+# --------------------------------------------------------------------------
+# tamper-evidence — the hash chain
+# --------------------------------------------------------------------------
+
+
+class TestHashChain:
+    def test_a_recorded_call_verifies_clean(
+        self, store: AuditStore, agreement: AgreementRecord
+    ) -> None:
+        del agreement
+        assert store.verify_chain() is None
+
+    def test_the_call_row_being_rewritten_at_the_end_is_not_tampering(
+        self, store: AuditStore
+    ) -> None:
+        """CallStarted then CallEnded legitimately UPDATE the same row. Each
+        chain entry was true when it was written; only the newest is held
+        against the row as it stands."""
+        store.record(
+            CallStarted(
+                call_id=CALL_ID,
+                account_ref="ACCT-77",
+                consumer_ref="CONS-77",
+                original_balance=Money("1000.00"),
+                channel="text",
+                at="2026-01-01T12:00:00+00:00",
+            )
+        )
+        store.record(CallEnded(CALL_ID, CallOutcome.ABANDONED, turn_count=2, at="t9"))
+
+        assert store.verify_chain() is None
+
+    def test_a_row_mutated_behind_the_stores_back_is_caught(
+        self, tmp_path: Path, lowball: Verdict, accepted: Verdict
+    ) -> None:
+        """The threat: someone with file access edits what was said. They can
+        — that is why this is tamper-*evidence*. What they cannot do is leave
+        the digests agreeing."""
+        db = tmp_path / "collector.db"
+        with AuditStore(db, json_dir=tmp_path / "agreements") as store:
+            record_call(store, lowball, accepted)
+            assert store.verify_chain() is None
+
+            raw = sqlite3.connect(db)
+            raw.execute("UPDATE turns SET text = 'I never said that' WHERE turn_index = 1")
+            raw.commit()
+            raw.close()
+
+            broken = store.verify_chain()
+
+        assert broken is not None
+        assert broken.table_name == "turns"
+        assert broken.reason == "payload"
+
+    def test_an_edited_chain_entry_is_caught(self, store: AuditStore) -> None:
+        """Rewriting the chain to cover a doctored row breaks the link math
+        instead — the entry no longer follows from the one before it."""
+        store.record(TurnRecorded(CALL_ID, 0, Speaker.AGENT, "hello", at="t0"))
+        store.record(TurnRecorded(CALL_ID, 1, Speaker.CONSUMER, "hi", at="t1"))
+        raw = sqlite3.connect(store.db_path)
+        raw.execute("UPDATE audit_chain SET payload_hash = ? WHERE seq = 2", ("0" * 64,))
+        raw.commit()
+        raw.close()
+
+        broken = store.verify_chain()
+
+        assert broken is not None
+        assert (broken.seq, broken.reason) == (2, "entry_hash")
+
+    def test_every_evidence_table_is_chained(
+        self, store: AuditStore, agreement: AgreementRecord
+    ) -> None:
+        del agreement
+        chained = {r["table_name"] for r in store._rows("SELECT table_name FROM audit_chain", ())}
+
+        assert chained == {"calls", "turns", "decisions", "agreements"}
+
+
+# --------------------------------------------------------------------------
+# retention and purge
+# --------------------------------------------------------------------------
+
+
+def aged_call(
+    store: AuditStore,
+    accepted: Verdict,
+    confirmation: ConsumerConfirmation,
+    call_id: str,
+    at: str,
+) -> AgreementRecord:
+    """A whole closed-out call — turn, decision, agreement, JSON — dated ``at``."""
+    store.record(
+        CallStarted(
+            call_id=call_id,
+            account_ref="ACCT-77",
+            consumer_ref="CONS-77",
+            original_balance=Money("1000.00"),
+            channel="text",
+            at=at,
+        )
+    )
+    store.record(TurnRecorded(call_id, 0, Speaker.CONSUMER, "Eight hundred?", at=at))
+    store.record(
+        DecisionRecorded(
+            call_id, 0, ConsumerProposal(Money("800"), 3, Cadence.MONTHLY), accepted, at=at
+        )
+    )
+    record = store.finalize_agreement(
+        call_id=call_id,
+        final_offer=SETTLEMENT,
+        authorizing_verdict=accepted,
+        confirmation=confirmation,
+        at=at,
+    )
+    store.record(CallEnded(call_id, CallOutcome.AGREED, turn_count=1, at=at))
+    return record
+
+
+def iso_days_ago(days: int) -> str:
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+
+class TestRetention:
+    def test_the_default_window_is_three_years(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Regulation F: evidence of compliance is kept for three years after
+        the last collection activity, so a shorter default is a violation."""
+        monkeypatch.delenv(RETENTION_DAYS_ENV_VAR, raising=False)
+
+        assert DEFAULT_RETENTION_DAYS == 1095
+        assert retention_days() == 1095
+
+    def test_the_window_can_be_set_by_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(RETENTION_DAYS_ENV_VAR, "2555")
+
+        assert retention_days() == 2555
+
+    def test_an_unparseable_window_raises_rather_than_defaulting(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Falling back to the default would keep three years of records an
+        operator believed they had deleted."""
+        monkeypatch.setenv(RETENTION_DAYS_ENV_VAR, "90d")
+
+        with pytest.raises(ValueError, match="whole number of days"):
+            retention_days()
+
+
+class TestPurge:
+    @pytest.fixture
+    def aged(
+        self,
+        store: AuditStore,
+        accepted: Verdict,
+        confirmation: ConsumerConfirmation,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[AgreementRecord, AgreementRecord]:
+        """One call four years old, one from today."""
+        monkeypatch.delenv(RETENTION_DAYS_ENV_VAR, raising=False)
+        old = aged_call(store, accepted, confirmation, "CALL-OLD", iso_days_ago(4 * 365))
+        recent = aged_call(store, accepted, confirmation, "CALL-NEW", iso_days_ago(1))
+        return old, recent
+
+    def test_deletes_the_expired_call_and_every_dependent_row(
+        self, store: AuditStore, aged: tuple[AgreementRecord, AgreementRecord]
+    ) -> None:
+        del aged
+        record = store.purge_older_than()
+
+        assert (record.calls, record.turns, record.decisions, record.agreements) == (1, 1, 1, 1)
+        assert store.turns("CALL-OLD") == ()
+        assert store.decisions("CALL-OLD") == ()
+        assert store.agreement("CALL-OLD") is None
+        assert store._rows("SELECT * FROM calls WHERE call_id = ?", ("CALL-OLD",)) == []
+
+    def test_keeps_everything_inside_the_window(
+        self, store: AuditStore, aged: tuple[AgreementRecord, AgreementRecord]
+    ) -> None:
+        _, recent = aged
+        store.purge_older_than()
+
+        assert store.agreement("CALL-NEW") == recent
+        assert len(store.turns("CALL-NEW")) == 1
+        assert len(store.decisions("CALL-NEW")) == 1
+
+    def test_deletes_the_agreement_json_sidecars_too(
+        self, store: AuditStore, aged: tuple[AgreementRecord, AgreementRecord]
+    ) -> None:
+        """A record deleted from the database and left on disk as JSON has not
+        been deleted."""
+        old, recent = aged
+        old_json = store.agreement_json_path(old.agreement_id)
+        recent_json = store.agreement_json_path(recent.agreement_id)
+        assert old_json.exists()
+
+        record = store.purge_older_than()
+
+        assert record.json_files == 1
+        assert not old_json.exists()
+        assert recent_json.exists()
+
+    def test_the_purge_is_itself_recorded_and_survives_the_next_one(
+        self, store: AuditStore, aged: tuple[AgreementRecord, AgreementRecord]
+    ) -> None:
+        """Once the evidence is gone, the record of its deletion is the only
+        answer left to "where are the records?"."""
+        del aged
+        first = store.purge_older_than()
+        second = store.purge_older_than(days=0)
+
+        assert store.purges() == (first, second)
+        assert first.retention_days == 1095
+        assert first.cutoff < datetime.now(UTC).isoformat()
+        assert second.calls == 1, "the second pass takes the call the first one kept"
+
+    def test_the_chain_still_verifies_after_a_purge(
+        self, store: AuditStore, aged: tuple[AgreementRecord, AgreementRecord]
+    ) -> None:
+        """Purging is a legitimate deletion and must not read as forgery.
+
+        Also the canary for VACUUM: the chain references rows by rowid, and
+        rowids surviving the rebuild is what keeps every entry pointing at the
+        row it was written for rather than at its neighbour.
+        """
+        del aged
+        store.purge_older_than()
+
+        assert store.verify_chain() is None
+
+    def test_permissions_survive_the_vacuum(
+        self, store: AuditStore, aged: tuple[AgreementRecord, AgreementRecord]
+    ) -> None:
+        del aged
+        store.purge_older_than()
+
+        assert mode_of(store.db_path) == 0o600
+        assert mode_of(Path(f"{store.db_path}-wal")) == 0o600
+
+    def test_opening_the_store_never_purges(
+        self, tmp_path: Path, accepted: Verdict, confirmation: ConsumerConfirmation
+    ) -> None:
+        """A silent purge on startup would be a compliance incident, not a
+        feature: this is only ever the operator's explicit act."""
+        db = tmp_path / "collector.db"
+        with AuditStore(db, json_dir=tmp_path / "agreements") as first:
+            aged_call(first, accepted, confirmation, "CALL-ANCIENT", "2015-01-01T00:00:00+00:00")
+
+        with AuditStore(db, json_dir=tmp_path / "agreements") as second:
+            assert second.agreement("CALL-ANCIENT") is not None
+            assert second.purges() == ()
+
+
+# --------------------------------------------------------------------------
+# durability — the WAL checkpoint
+# --------------------------------------------------------------------------
+
+
+def traced(store: AuditStore) -> list[str]:
+    """Every statement the store's connection executes from here on.
+
+    Asserted on the statement rather than on the file: SQLite auto-checkpoints
+    and removes the WAL when the last connection closes anyway, so "the WAL is
+    gone afterwards" passes with the checkpoint deleted.
+    """
+    statements: list[str] = []
+    store._run(lambda: store._conn.set_trace_callback(statements.append))
+    return statements
+
+
+class TestCheckpoint:
+    def test_close_forces_a_checkpoint(self, tmp_path: Path) -> None:
+        """A call abandoned mid-turn writes no CallEnded and no agreement, so
+        close() is the only checkpoint it will ever get."""
+        store = AuditStore(tmp_path / "c.db", json_dir=tmp_path / "agreements")
+        store.record(TurnRecorded(CALL_ID, 0, Speaker.AGENT, "hello", at="t0"))
+        statements = traced(store)
+
+        store.close()
+
+        assert any("wal_checkpoint" in s for s in statements)
+
+    def test_a_call_ending_without_an_agreement_forces_a_checkpoint(
+        self, store: AuditStore
+    ) -> None:
+        """Escalation, hang-up and refusal are exactly the commits a crash
+        would lose under synchronous = NORMAL, and exactly the calls a
+        compliance reviewer comes looking for."""
+        statements = traced(store)
+
+        store.record(CallEnded(CALL_ID, CallOutcome.ESCALATED, turn_count=3, at="t3"))
+
+        assert any("wal_checkpoint" in s for s in statements)
+
+    def test_a_turn_does_not_checkpoint(self, store: AuditStore) -> None:
+        """One fsync per turn is what synchronous = NORMAL exists to avoid; a
+        checkpoint per row puts it back on the voice critical path."""
+        statements = traced(store)
+
+        store.record(TurnRecorded(CALL_ID, 0, Speaker.AGENT, "hello", at="t0"))
+
+        assert not [s for s in statements if "wal_checkpoint" in s]
+
+
+def test_the_default_path_constant_is_resolved_through_the_env_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """voice_app.py passes DEFAULT_DB_PATH itself rather than calling
+    default_db_path(), so $COLLECTOR_DB_PATH had no effect on the voice path at
+    all: the deploy target set it and the log still landed in a CWD-relative
+    data/. The constant is resolved where the path is used instead."""
+    monkeypatch.setenv(DB_PATH_ENV_VAR, str(tmp_path / "elsewhere" / "collector.db"))
+
+    with AuditStore(DEFAULT_DB_PATH, json_dir=DEFAULT_DB_PATH.parent) as store:
+        assert store.db_path == tmp_path / "elsewhere" / "collector.db"
+        # The sidecars follow the database, or the agreements end up on a
+        # different volume from the log that references them.
+        assert store.json_dir == tmp_path / "elsewhere"
+        assert store.db_path.exists()
+
+
 def test_default_db_path_is_under_data(tmp_path: Path) -> None:
-    """SPEC §10: never write outside ./data. Asserted on the constant, not by
+    """Never write outside ./data. Asserted on the constant, not by
     opening it — this suite must not create the real database."""
     from collector.audit import DEFAULT_DB_PATH
 

@@ -125,7 +125,7 @@ class TestArgumentSchema:
 
     def test_a_float_never_gets_past_the_boundary(self) -> None:
         """JSON has one number type and it decodes to float; Money refuses one
-        (SPEC §9). The exact digits the model emitted survive the trip."""
+        The exact digits the model emitted survive the trip."""
         parsed = next(s for s in TOOL_SCHEMAS if s.name == "validate_consumer_offer").parse(
             {"total": 500.5, "payment_count": 1, "cadence": "immediate"}
         )
@@ -269,7 +269,7 @@ class TestInstrumentationDoesNotBreakTheCall:
         assert result.ok
         assert not agent.ended
         # The digits the model actually emitted, kept as a string — never a
-        # float in the record (SPEC §9).
+        # float in the record.
         assert invocation.arguments["total"] == "500.5"
 
     def test_a_failed_model_call_with_no_usage_still_leaves_a_reason(self, tmp_path: Path) -> None:
@@ -436,7 +436,7 @@ class TestPricing:
 
         cost = estimate_cost("claude-sonnet-5", input_tokens=1_000_000, output_tokens=0)
         assert cost == Decimal("3.00")
-        assert isinstance(cost, Decimal), "SPEC §9: no floats, cost reports included"
+        assert isinstance(cost, Decimal), "no floats, cost reports included"
 
     def test_an_unpriced_model_reports_no_cost_rather_than_a_guess(self) -> None:
         from collector.llm.anthropic_client import estimate_cost
@@ -455,7 +455,7 @@ class TestPricing:
 
 
 # ==========================================================================
-# The compliance score — SPEC §5.3
+# The compliance score
 # ==========================================================================
 
 
@@ -844,7 +844,7 @@ class TestStreamingTurn:
 
         for agent in (text_agent, stream_agent):
             assert any(fires_ai_disclosure(s) for s in transcript(agent)[1:]), (
-                "the consumer asked mid-call; SPEC §5.2 wants it answered, not deferred"
+                "the consumer asked mid-call; it must be answered, not deferred"
             )
             assert not agent.guard.disclosures.ai_disclosure_requested, (
                 "a request left pending blocks every turn after it, with no way out"
@@ -1042,7 +1042,7 @@ class TestStreamingTurn:
 class TestTurnScopedDisclosuresOnTheStreamingPath:
     """The disclosure rules ask what the *turn* said. Applied one sentence at a
     time they quietly become "what the *first* sentence said", which is a
-    different and much stricter rule than SPEC §5.2 states.
+    different and much stricter rule than the one that applies.
     """
 
     def test_the_answer_may_arrive_in_the_second_sentence(self) -> None:
@@ -1071,7 +1071,7 @@ class TestTurnScopedDisclosuresOnTheStreamingPath:
         agent.open_call()
         first = list(agent.stream_turn("Wait, am I talking to a machine?"))
 
-        assert fires_ai_disclosure(" ".join(first)), "SPEC §5.2: at open *and on request*"
+        assert fires_ai_disclosure(" ".join(first)), "required at open *and on request*"
         assert not agent.guard.disclosures.ai_disclosure_requested
 
         second = list(agent.stream_turn("Fine. What are my options?"))

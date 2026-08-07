@@ -1,4 +1,4 @@
-"""Claude client — SPEC §3, step 7.
+"""Claude client.
 
 The same `LLMClient` the scripted client implements, backed by
 ``claude-sonnet-5``. Nothing above this file changes when you swap them: the
@@ -98,7 +98,7 @@ def estimate_cost(
 
     Decimal throughout, like every other figure in this system: a float here
     would be a rounding error in a cost report rather than in a payment
-    schedule, but the rule is the rule (SPEC §9).
+    schedule, but the rule is the rule.
     """
     rates = PRICES.get(model)
     if rates is None:
@@ -358,7 +358,7 @@ def _to_anthropic(messages: tuple[Message, ...]) -> tuple[str, list[JsonDict]]:
             conversation.extend(_tool_exchange(message))
 
     if not conversation:
-        # open_call's first respond() (SPEC ring 1) has nothing but the system
+        # open_call's first respond() (ring 1) has nothing but the system
         # prompt in `messages`, which is stripped above into `system`. The
         # Messages API rejects an empty `messages` list outright, so a
         # synthetic turn kicks the model into producing the opening line.
