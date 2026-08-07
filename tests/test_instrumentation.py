@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from collector.agent import NegotiationAgent, _split_sentences
+from collector.agent import MAX_TOOL_ROUNDS, NegotiationAgent, _split_sentences
 from collector.audit.events import (
     EventType,
     GuardrailAction,
@@ -752,6 +752,7 @@ class _AlwaysAnotherTool:
 
     def __init__(self) -> None:
         self.opened = False
+        self.rounds = 0
 
     def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
         if not self.opened:
@@ -760,6 +761,7 @@ class _AlwaysAnotherTool:
         return LLMResponse(tool_calls=(ToolCall(name="record_refusal"),))
 
     def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        self.rounds += 1
         yield StreamCompleted(LLMResponse(tool_calls=(ToolCall(name="record_refusal"),)))
 
 
@@ -1071,11 +1073,35 @@ def _notes(agent: NegotiationAgent) -> list[str]:
 class _ThreateningStreamer:
     """Speaks one clean sentence, then one the prohibited-language ring blocks."""
 
+    def __init__(self) -> None:
+        self.attempts = 0
+
     def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
         return LLMResponse(text=_GREETING)
 
     def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        self.attempts += 1
         yield TextDelta("Am I speaking with the account holder? ")
+        yield TextDelta("Pay today or we will garnish your wages. ")
+        yield StreamCompleted(LLMResponse(text="..."))
+
+
+class _ToolsForeverThenThreatens:
+    """Asks for one more tool every round until the budget is nearly gone,
+    then blocks — putting the block on the loop's last available iteration."""
+
+    def __init__(self, tool_rounds: int) -> None:
+        self.tool_rounds = tool_rounds
+        self.attempts = 0
+
+    def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+        return LLMResponse(text=_GREETING)
+
+    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        self.attempts += 1
+        if self.attempts <= self.tool_rounds:
+            yield StreamCompleted(LLMResponse(tool_calls=(ToolCall(name="record_refusal"),)))
+            return
         yield TextDelta("Pay today or we will garnish your wages. ")
         yield StreamCompleted(LLMResponse(text="..."))
 
@@ -1147,6 +1173,20 @@ class _BlocksThenComplies:
         yield StreamCompleted(LLMResponse(text="..."))
 
 
+class TestTheRoundBudgetIsNotInflatedByTheRewriteAllowance:
+    def test_a_turn_that_never_blocks_gets_the_tool_budget_it_always_had(self) -> None:
+        """The rewrite allowance was added to the loop bound unconditionally,
+        so every turn — including one with no guard trip at all — bought two
+        extra model round-trips and two extra tool batches before giving up.
+        On a voice line that is latency and spend the budget exists to cap."""
+        llm = _AlwaysAnotherTool()
+        agent = _agent(llm=llm)
+        agent.open_call()
+        list(agent.stream_turn("Yes, this is Dana."))
+
+        assert llm.rounds == MAX_TOOL_ROUNDS + 1, llm.rounds
+
+
 class TestAZeroSpokenStreamBlockRegenerates:
     """The streaming path aborted to the scripted fallback on *any* block.
 
@@ -1201,9 +1241,41 @@ class TestAZeroSpokenStreamBlockRegenerates:
         agent.open_call()
         list(agent.stream_turn("Yes, this is Dana."))
 
-        assert llm.__class__ is _ThreateningStreamer
+        assert llm.attempts == 1, "the model was asked again after speech was already out"
         assert agent.turns[-1].spoken is not None
         assert "Am I speaking with the account holder?" in agent.turns[-1].spoken
+
+    @pytest.mark.parametrize("tool_rounds", [MAX_TOOL_ROUNDS, MAX_TOOL_ROUNDS + 2])
+    def test_a_rewrite_is_never_recorded_when_no_round_remains_to_run_it(
+        self, tmp_path: Path, tool_rounds: int
+    ) -> None:
+        """The action was decided from "nothing spoken, strikes left" alone,
+        which ignores whether the loop has an iteration left to *do* the
+        rewrite in. A block on the last one recorded REGENERATED and then
+        fell straight out of the loop to the scripted line — an audit trail
+        claiming a rewrite that never happened.
+
+        The invariant, whatever the budget: a recorded rewrite means the
+        model really was asked to speak again. So a turn that reached the
+        guard only once cannot have rewritten anything.
+        """
+        llm = _ToolsForeverThenThreatens(tool_rounds=tool_rounds)
+        with AuditStore(tmp_path / f"budget{tool_rounds}.db", json_dir=tmp_path) as store:
+            agent = _agent(store, llm=llm)
+            agent.open_call()
+            list(agent.stream_turn("Yes, this is Dana."))
+            actions = [
+                event.action
+                for event in store.trace(agent.call_id)
+                if isinstance(event, GuardrailTripped)
+            ]
+
+        speaking_attempts = llm.attempts - tool_rounds
+        if GuardrailAction.REGENERATED in actions:
+            assert speaking_attempts >= 2, (
+                f"claimed a rewrite after {speaking_attempts} attempt(s) to speak"
+            )
+        assert agent.turns[-1].was_regenerated == bool(actions)
 
     def test_the_audit_log_says_regenerated_only_when_it_regenerated(
         self, tmp_path: Path
@@ -1407,6 +1479,41 @@ class TestRepeatedFallbacksEscalateToTheStandingOffer:
         assert first.spoken == SAFE_FALLBACK_TEXT
         assert spoke.spoken not in (None, SAFE_FALLBACK_TEXT), "the middle turn has to speak"
         assert again.spoken == SAFE_FALLBACK_TEXT, "the count restarts, it does not accumulate"
+
+    def test_the_restatement_is_said_once_not_on_every_trip_thereafter(self) -> None:
+        """Reading the consumer identical terms every turn from the second
+        onward is the same circling this was meant to break, in a different
+        line. It is the *second* trip that says the terms."""
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        lines = [agent.turn(f"Still nothing? ({i})").spoken for i in range(4)]
+
+        assert lines[0] == SAFE_FALLBACK_TEXT
+        assert lines[1] is not None and lines[1] != SAFE_FALLBACK_TEXT
+        assert lines[2:] == [SAFE_FALLBACK_TEXT, SAFE_FALLBACK_TEXT], lines
+
+    def test_the_restatement_reads_back_a_multi_payment_plan(self) -> None:
+        """Every other test offer is a single payment due today, so the join
+        and the "in N days" duration figures went unexercised — and a
+        duration the engine did not authorize is exactly what the guard
+        exists to catch."""
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        agent._run_tool(
+            _call(
+                "validate_consumer_offer",
+                payment_count=3,
+                cadence="monthly",
+                total="1000.00",
+            )
+        )
+        agent._run_tool(_call("concede"))
+        agent.turn("What are my options?")
+        line = agent._fallback_line()
+        offer = agent.tools.standing_offer
+
+        assert offer is not None and offer.payment_count > 1, offer
+        assert line != SAFE_FALLBACK_TEXT
+        assert " days" in line, line
+        assert check_outbound(agent.guard, line, authorized=agent.authorized).allowed
 
     def test_no_offer_on_the_table_means_nothing_to_restate(self) -> None:
         agent = _agent(llm=_AlwaysBlocked())

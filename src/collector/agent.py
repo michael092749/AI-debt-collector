@@ -233,12 +233,18 @@ class _Round:
     def failed(self) -> bool:
         return self.response is not None and self.response.error is not None
 
-    def outcome(self, spoken: list[str]) -> _Outcome:
+    def outcome(self, spoken: list[str], *, may_rewrite: bool) -> _Outcome:
         """What the turn does next, given what it has already put on the wire.
 
         ``spoken`` is the whole turn's speech, not this round's: once any
         sentence is audio, every later block in the same turn is judged
         against the fact that the consumer has heard something.
+
+        ``may_rewrite`` is the caller's promise that a round is actually
+        available to do the rewrite in. Without it this returns
+        ``REGENERATE`` on the loop's last iteration, the turn falls out to
+        the scripted line, and the audit record claims a rewrite that never
+        ran.
         """
         if self.blocked is not None:
             # Nothing spoken means nothing contradicted, so the turn can be
@@ -246,7 +252,7 @@ class _Round:
             # the old always-abort rule handled worst: a scripted
             # non-sequitur spent on a turn that had every chance of clearing
             # on the second attempt.
-            if not spoken and not self.exhausted:
+            if may_rewrite and not spoken and not self.exhausted:
                 return _Outcome.REGENERATE
             # Something substantive is already in the consumer's ear, and it
             # stands on its own. The scripted fallback restarts the
@@ -479,14 +485,21 @@ class NegotiationAgent:
         # the call in silence is a dead line, not a goodbye.
         closing = False
 
+        # Two budgets, deliberately not one. Folding the rewrite allowance
+        # into the round count spends it on turns that never blocked — every
+        # clean turn would buy extra model round-trips and extra tool batches
+        # before giving up, which on a voice line is latency the cap exists
+        # to prevent. A rewrite hands its round back instead, so the
+        # allowance is drawn on only when a rewrite actually happens.
+        rounds_left = MAX_TOOL_ROUNDS + 1
+        rewrites_left = MAX_REGENERATION_STRIKES
+
         try:
-            # Tool rounds plus, at most, the guard's strike budget in
-            # rewrites. Rewrites only happen while nothing has been spoken and
-            # each one spends a strike that a clean sentence would have to
-            # reset, so the two budgets cannot compound past this.
-            for _ in range(MAX_TOOL_ROUNDS + MAX_REGENERATION_STRIKES + 1):
+            while rounds_left > 0:
+                rounds_left -= 1
+                may_rewrite = rewrites_left > 0
                 round_ = _Round()
-                for sentence in self._stream_round(round_, spoken):
+                for sentence in self._stream_round(round_, spoken, may_rewrite=may_rewrite):
                     spoken.append(sentence)
                     yield sentence
 
@@ -494,11 +507,13 @@ class NegotiationAgent:
                     blocked.append(round_.blocked)
                     pending_note = round_
 
-                outcome = round_.outcome(spoken)
+                outcome = round_.outcome(spoken, may_rewrite=may_rewrite)
                 if outcome is _Outcome.REGENERATE:
                     # Nothing is on the wire, so nothing is contradicted by
                     # trying again — but the retry has to be told what it may
                     # not say, or it writes the blocked sentence a second time.
+                    rewrites_left -= 1
+                    rounds_left += 1  # the rewrite is not a tool round
                     self._note_block(round_)
                     pending_note = None
                     continue
@@ -558,7 +573,9 @@ class NegotiationAgent:
             self.messages.append(Message(role="agent", content=" ".join(spoken[already:])))
         return len(spoken)
 
-    def _stream_round(self, round_: _Round, spoken: Sequence[str] = ()) -> Iterator[str]:
+    def _stream_round(
+        self, round_: _Round, spoken: Sequence[str], *, may_rewrite: bool
+    ) -> Iterator[str]:
         """One streamed round, yielding each chunk that clears the guard.
 
         Stops at the first blocked chunk. What the round produced besides
@@ -586,7 +603,9 @@ class NegotiationAgent:
                             if self._owes_a_disclosure(held):
                                 continue
                             candidate, held = held, ""
-                            allowed = self._guard_sentence(candidate, round_, spoken)
+                            allowed = self._guard_sentence(
+                                candidate, round_, spoken, may_rewrite=may_rewrite
+                            )
                             if allowed is None:
                                 return
                             yield allowed
@@ -601,7 +620,7 @@ class NegotiationAgent:
             # the whole chunk gets judged on that.
             tail = f"{held} {buffer.strip()}".strip() if held else buffer.strip()
             if tail:
-                allowed = self._guard_sentence(tail, round_, spoken)
+                allowed = self._guard_sentence(tail, round_, spoken, may_rewrite=may_rewrite)
                 if allowed is not None:
                     yield allowed
         finally:
@@ -672,7 +691,7 @@ class NegotiationAgent:
         return bool(self.guard.disclosures.check_agent_turn(candidate))
 
     def _guard_sentence(
-        self, sentence: str, round_: _Round, spoken: Sequence[str] = ()
+        self, sentence: str, round_: _Round, spoken: Sequence[str], *, may_rewrite: bool = False
     ) -> str | None:
         """The pre-TTS gate for one sentence. ``None`` means do not speak it.
 
@@ -680,12 +699,17 @@ class NegotiationAgent:
         own account of why — because the caller is what decides between
         aborting and retrying, and both need the reason.
 
-        The trip is recorded as whichever of the two actually follows, which
-        is decidable here: a turn is rewritten only when nothing has been
-        spoken and the strike budget is unspent, and both are known at the
-        moment of the block. An audit log that says "regenerated" about a
-        turn that was abandoned — or "blocked" about one that was rewritten —
-        is a false record of what the guard did.
+        The trip is recorded as whichever of the two actually follows. That is
+        decidable here only because the caller passes ``may_rewrite``: a turn
+        is rewritten when nothing has been spoken, the strike budget is
+        unspent, *and a round remains to do it in*. The third was missing, so
+        a block on the loop's last iteration recorded "regenerated" and then
+        fell out to the scripted line. An audit log that says "regenerated"
+        about a turn that was abandoned — or "blocked" about one that was
+        rewritten — is a false record of what the guard did.
+
+        ``may_rewrite`` defaults to the conservative side: a caller that does
+        not say gets "blocked", never a claimed rewrite.
         """
         candidate = sentence.strip()
         if not candidate:
@@ -709,7 +733,7 @@ class NegotiationAgent:
         round_.blocked = sentence
         round_.note = check.regeneration_note()
         round_.exhausted = check.fallback_text is not None
-        rewriting = not spoken and not round_.exhausted
+        rewriting = may_rewrite and not spoken and not round_.exhausted
         for violation in check.blocking_violations:
             self._record(
                 GuardrailTripped(
@@ -1152,7 +1176,10 @@ class NegotiationAgent:
         line = fallback_for(self.guard)
         if self.guard.disclosures.ai_disclosure_requested:
             return f"{AI_DISCLOSURE_TEXT} {line}"
-        if self._consecutive_fallbacks >= 1 and (restated := self._standing_offer_line()):
+        # Exactly the second trip. Reading the consumer identical terms on
+        # every trip from the second onward is the same circling this exists
+        # to break, in a different line.
+        if self._consecutive_fallbacks == 1 and (restated := self._standing_offer_line()):
             return restated
         return line
 

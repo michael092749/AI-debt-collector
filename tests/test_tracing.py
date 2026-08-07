@@ -243,7 +243,7 @@ class TestEveryLayerReachesTheTrace:
                 arguments={"payment_count": 2, "cadence": "monthly", "total": "500.00"},
             )
         )
-        agent._guard_sentence("Pay today or we will garnish your wages.", _Round())
+        agent._guard_sentence("Pay today or we will garnish your wages.", _Round(), ())
 
         assert {"llm_call", "tool_call", "decision", "guardrail_trip"} <= _names(spans)
 
