@@ -81,7 +81,7 @@ MAX_TOOL_ROUNDS = 4
 # decimal point has a digit after it, not a space. Good enough for speech, which
 # is what this splits — an abbreviation mid-sentence costs one early TTS flush,
 # not a compliance failure, because every fragment is guarded either way.
-_SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]]*\s+")
+_SENTENCE_END = re.compile(r"[.!?][\"')\]]*(?=\s)")
 
 
 def _split_sentences(buffer: str) -> tuple[list[str], str]:
@@ -93,11 +93,13 @@ def _split_sentences(buffer: str) -> tuple[list[str], str]:
     sentences: list[str] = []
     cursor = 0
     for match in _SENTENCE_END.finditer(buffer):
-        sentence = buffer[cursor : match.start()].strip()
+        if match.start() < cursor:
+            continue
+        sentence = buffer[cursor : match.end()].strip()
         if sentence:
             sentences.append(sentence)
         cursor = match.end()
-    return sentences, buffer[cursor:]
+    return sentences, buffer[cursor:].lstrip()
 
 
 @dataclass(frozen=True)

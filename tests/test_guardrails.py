@@ -466,6 +466,46 @@ class TestEscalationTriggers:
         assert expected in {s.trigger for s in detect_escalation(utterance)}
 
     @pytest.mark.parametrize(
+        ("utterance", "expected"),
+        [
+            # Distress, indirectly. Nobody in distress says "I am experiencing
+            # distress", and a guard that only catches the clinical phrasing is
+            # a guard that fires after it mattered.
+            ("Honestly, everything's falling apart right now.", EscalationTrigger.DISTRESS),
+            ("I'm drowning here.", EscalationTrigger.DISTRESS),
+            ("I'm at my breaking point with all of this.", EscalationTrigger.DISTRESS),
+            ("I don't know what else to do anymore.", EscalationTrigger.DISTRESS),
+            ("I just can't cope with this.", EscalationTrigger.DISTRESS),
+            # Hardship described rather than named.
+            ("We're being evicted at the end of the month.", EscalationTrigger.HARDSHIP),
+            ("I got laid off back in March.", EscalationTrigger.HARDSHIP),
+            ("My hours were cut and I'm behind on everything.", EscalationTrigger.HARDSHIP),
+            ("The power got shut off last week.", EscalationTrigger.HARDSHIP),
+            ("I'm living in my car at the moment.", EscalationTrigger.HARDSHIP),
+        ],
+    )
+    def test_indirect_phrasings_are_detected_too(
+        self, utterance: str, expected: EscalationTrigger
+    ) -> None:
+        assert expected in {s.trigger for s in detect_escalation(utterance)}
+
+    @pytest.mark.parametrize(
+        "utterance",
+        [
+            # The line the broadened patterns must not cross: haggling and
+            # capacity signals are the decision engine's input, not escalations.
+            "That's more than I can manage right now.",
+            "Two fifty a month is a stretch for me.",
+            "Can you do any better on the total?",
+            "My car payment lands the same week as that.",
+            "Things are tight but I want to get this sorted.",
+            "I'd rather pay it off than drag it out.",
+        ],
+    )
+    def test_haggling_is_still_not_an_escalation(self, utterance: str) -> None:
+        assert detect_escalation(utterance) == ()
+
+    @pytest.mark.parametrize(
         "utterance",
         [
             "I don't owe that much — be reasonable.",
