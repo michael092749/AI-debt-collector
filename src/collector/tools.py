@@ -249,9 +249,23 @@ TOOL_SCHEMAS: tuple[ToolSchema, ...] = (
                 name="total",
                 kind=ParamKind.MONEY,
                 description=(
-                    "Total they offered to pay, as a decimal string, e.g. '500.00'. "
-                    "Omit it when they proposed only a structure and no sum — "
-                    "'weekly for a year' — and the full balance is assumed."
+                    "The one overall sum they offered to pay, as a decimal string, "
+                    "e.g. '850.00'. Only for a sum they named as the whole amount. "
+                    "If they sized the payments instead — 'two payments of five "
+                    "hundred' — pass amount_each and leave this out; never multiply "
+                    "it out yourself. Omit both when they proposed only a structure "
+                    "and no figure — 'weekly for a year' — and the full balance is "
+                    "assumed."
+                ),
+            ),
+            Param(
+                name="amount_each",
+                kind=ParamKind.MONEY,
+                description=(
+                    "What they offered per payment, as a decimal string, when they "
+                    "named the size of each payment rather than an overall sum. "
+                    "Relay their figure verbatim; the engine does the multiplying. "
+                    "Never pass both this and total."
                 ),
             ),
             Param(
@@ -400,12 +414,30 @@ def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult
             "this call has run its course; close it out with end_call rather than "
             "evaluating another proposal",
         )
-    proposal = ConsumerProposal(
+    # Two ways to name the money, because that is how it arrives: "eight
+    # fifty all in" is a total, "two payments of five hundred" is a size of
+    # each. The model relays whichever was said verbatim — it is forbidden
+    # arithmetic — so the multiplication happens here. Both at once is a
+    # contradiction to send back, not a guess to make.
+    if "amount_each" in args and "total" in args:
+        return _error(
+            name,
+            context,
+            "total and amount_each together are ambiguous: pass the one figure "
+            "the consumer actually said, and let the engine do the rest",
+        )
+    amount_each = args.get("amount_each")
+    total = (
+        amount_each * args["payment_count"]
+        if amount_each is not None
         # Membership, not truthiness. "They proposed $0" and "they named no sum
         # at all" are different negotiation states — the first is a lowball to
         # rule on, the second means the balance stands and only the structure
         # is in question — and a falsy-zero would silently merge them.
-        total=args.get("total", context.policy.original_balance),
+        else args.get("total", context.policy.original_balance)
+    )
+    proposal = ConsumerProposal(
+        total=total,
         payment_count=args["payment_count"],
         cadence=args["cadence"],
         signaled_capacity=args.get("signaled_capacity"),

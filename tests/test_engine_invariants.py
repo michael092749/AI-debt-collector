@@ -219,6 +219,45 @@ class TestInvariantsHoldEverywhere:
                         f"{label}: instalment above the capacity on record"
                     )
 
+    def test_per_payment_phrasing_reaches_the_engine_as_the_full_sum(self) -> None:
+        """ "Two payments of five hundred" is an offer of $1,000, not $500.
+
+        Consumers name per-payment figures; the model is forbidden arithmetic,
+        so the schema must accept the figure verbatim and multiply in the
+        engine's world. Before ``amount_each`` existed the model's only move
+        was ``total=500``, which the engine read as a $500 lowball with a $250
+        capacity — and countered $250/$750 at a consumer offering the whole
+        balance (live call, 2026-08-07).
+        """
+        result = execute(
+            ToolCall(
+                name="validate_consumer_offer",
+                arguments={"amount_each": "500.00", "payment_count": 2, "cadence": "monthly"},
+            ),
+            ToolContext.opening(POLICY),
+        )
+        assert result.ok, result.payload
+        ruled = result.context.state.rounds[-1].proposal
+        assert ruled is not None
+        assert ruled.total == Money("1000"), (
+            f"engine ruled on {ruled.total}, not the 2 x $500 the consumer offered"
+        )
+
+    def test_amount_each_and_total_together_are_rejected_not_guessed(self) -> None:
+        result = execute(
+            ToolCall(
+                name="validate_consumer_offer",
+                arguments={
+                    "total": "1000.00",
+                    "amount_each": "500.00",
+                    "payment_count": 2,
+                    "cadence": "monthly",
+                },
+            ),
+            ToolContext.opening(POLICY),
+        )
+        assert not result.ok
+
     def test_ladder_never_moves_backwards(self) -> None:
         """A4: once conceded to a tier, the engine never counters above it."""
         state = NegotiationState.opening(POLICY).conceded_to(Tier.SETTLEMENT)
