@@ -376,3 +376,204 @@ def test_an_offer_is_never_described_with_another_tiers_name() -> None:
     spoken = " ".join(agent.spoken).lower()
     mislabels = {tier.label for tier in Tier if tier is not standing.tier and tier.label in spoken}
     assert not mislabels, f"a {standing.tier.label} offer was described as: {sorted(mislabels)}"
+
+
+# --------------------------------------------------------------------------
+# The 2026-08-08 call: an accepted arrangement nobody said out loud
+# --------------------------------------------------------------------------
+
+# What the agent actually said on the turn the engine accepted $400/$600. Every
+# figure of the deal is in ``you_must_confirm``; none of them is in the sentence.
+_SILENT_ACCEPT = (
+    "That works. So that'll be a payment today and one more after it. Does that work for you?"
+)
+
+
+def _through_the_concession(final: LLMResponse) -> NegotiationAgent:
+    """The live call up to the turn that accepted the consumer's own split.
+
+    "I can pay four hundred today, and then I can pay six hundred next month"
+    against a conceded DOWNPAYMENT_PLUS_ONE — the engine returns ``accept`` on
+    a $400/$600 schedule and hands the model the line naming both figures.
+    """
+    split = _tool(
+        "validate_consumer_offer",
+        total="1000",
+        payment_count=2,
+        cadence="monthly",
+        signaled_capacity="400",
+    )
+    agent = _agent(
+        LLMResponse(text=_OPENING),
+        _tool("propose_offer", preferred_cadence="immediate"),
+        LLMResponse(
+            text=f"{MINI_MIRANDA_TEXT} The balance is one thousand dollars. Can you clear it today?"
+        ),
+        # Their split, ruled on while the ladder still stands at pay-in-full:
+        # a counter, and the $400 goes on the record as their capacity.
+        split,
+        LLMResponse(text="I can't set that up as things stand. Is the full amount possible?"),
+        # The refusal buys the step down, and the concession is built on the
+        # capacity the first ruling recorded — $400 today, $600 in thirty days.
+        LLMResponse(
+            tool_calls=(
+                ToolCall(name="record_refusal"),
+                ToolCall(name="concede", arguments={"preferred_cadence": "monthly"}),
+            )
+        ),
+        split,
+        final,
+    )
+    for said in (
+        "Yes.",
+        "I can pay four hundred today, and then I can pay six hundred next month.",
+        "No, that's really all I can manage.",
+    ):
+        agent.turn(said)
+    return agent
+
+
+def test_an_accepted_arrangement_is_read_back_with_its_figures() -> None:
+    """ "That works. So that'll be a payment today and one more after it." —
+    and the consumer had to ask "So what's the deal?" to hear the numbers
+    (live call, 2026-08-08).
+
+    The turn is not a guard failure: it states no figure, so nothing is
+    unauthorized and it clears the pre-TTS check untouched. It is a *silence*
+    failure, and the guard has no rule that fires on what a sentence leaves out.
+
+    ``you_must_confirm`` carries the whole schedule and the model is told to say
+    it. On the one turn where the terms become an obligation, "told to" is not a
+    control — the deal the consumer just agreed to has to be the deal they
+    heard, so the figures are ours to supply the way the Mini-Miranda is.
+    """
+    agent = _through_the_concession(LLMResponse(text=_SILENT_ACCEPT))
+
+    spoken = agent.turns[-1].spoken or ""
+    assert "400" in spoken and "600" in spoken, (
+        f"the engine accepted $400/$600 and the consumer heard: {spoken!r}"
+    )
+
+
+def test_a_read_back_the_model_wrote_itself_is_left_alone() -> None:
+    """The repair is for silence, not for phrasing. A turn that already names
+    the schedule must reach TTS as the model wrote it — appending a second
+    canonical read-back would have the consumer hear the terms twice, which is
+    the stutter that killed the same shape of fix for MINI_MIRANDA_OUT_OF_ORDER.
+    """
+    said = (
+        "That works. Just to confirm: $400.00 today, then $600.00 in 30 days "
+        "— $1,000.00 in total. Should I set that up?"
+    )
+    agent = _through_the_concession(LLMResponse(text=said))
+
+    assert agent.turns[-1].spoken == said
+
+
+def test_the_streaming_path_reads_the_agreement_back_too() -> None:
+    """The repair has to live on the path that carries real calls.
+
+    ``turn()`` guards a finished paragraph and can rewrite it; ``stream_turn``
+    puts each sentence on the wire as it completes and cannot take one back. So
+    the read-back cannot be spliced into the candidate here — it is spoken after
+    the model has finished, as its own chunk, which is also the only ordering
+    that makes sense out loud: acknowledge, then state the terms.
+
+    Fixing only ``turn()`` would leave production exactly as broken as the
+    transcript that prompted this, and every test above would still pass — the
+    same gap ``test_the_streaming_path_can_satisfy_the_gate`` was written for.
+    """
+    split = _tool(
+        "validate_consumer_offer",
+        total="1000",
+        payment_count=2,
+        cadence="monthly",
+        signaled_capacity="400",
+    )
+    agent = _agent(
+        LLMResponse(text=_OPENING),
+        _tool("propose_offer", preferred_cadence="immediate"),
+        LLMResponse(
+            text=f"{MINI_MIRANDA_TEXT} The balance is one thousand dollars. Can you clear it today?"
+        ),
+        split,
+        LLMResponse(text="I can't set that up as things stand. Is the full amount possible?"),
+        LLMResponse(
+            tool_calls=(
+                ToolCall(name="record_refusal"),
+                ToolCall(name="concede", arguments={"preferred_cadence": "monthly"}),
+            )
+        ),
+        split,
+        LLMResponse(text=_SILENT_ACCEPT),
+    )
+
+    for said in (
+        "Yes.",
+        "I can pay four hundred today, and then I can pay six hundred next month.",
+        "No, that's really all I can manage.",
+    ):
+        list(agent.stream_turn(said))
+
+    heard = agent.turns[-1].spoken or ""
+    assert "400" in heard and "600" in heard, (
+        f"the engine accepted $400/$600 and the streamed turn was: {heard!r}"
+    )
+
+
+def test_the_read_back_is_never_bolted_onto_a_scripted_recovery() -> None:
+    """A turn that fell back is not a turn to append terms to.
+
+    Observed in a live trial (2026-08-08): "I'd rather not misstate anything,
+    so let me keep this simple. What would work for you? Just to confirm:
+    $1,000.00 today. Should I set that up?" — the recovery line reopens the
+    negotiation and the read-back closes it, in one breath, on a turn where the
+    model had already lost the thread.
+
+    The same reasoning ``_stream_connective`` gives for not spending
+    ``SAFE_FALLBACK_TEXT`` over a good offer, in the other direction. The
+    agreement stays owed; ``_accepted`` is not cleared, so the next turn that
+    the model actually writes still carries it.
+    """
+    split = _tool(
+        "validate_consumer_offer",
+        total="1000",
+        payment_count=2,
+        cadence="monthly",
+        signaled_capacity="400",
+    )
+    agent = _agent(
+        LLMResponse(text=_OPENING),
+        _tool("propose_offer", preferred_cadence="immediate"),
+        LLMResponse(
+            text=f"{MINI_MIRANDA_TEXT} The balance is one thousand dollars. Can you clear it today?"
+        ),
+        split,
+        LLMResponse(text="I can't set that up as things stand. Is the full amount possible?"),
+        LLMResponse(
+            tool_calls=(
+                ToolCall(name="record_refusal"),
+                ToolCall(name="concede", arguments={"preferred_cadence": "monthly"}),
+            )
+        ),
+        split,
+        # Accepted terms, and then a turn that cannot be spoken: an invented
+        # balance takes both strikes and the scripted line closes the turn.
+        LLMResponse(text="Your balance is $1,573.97."),
+        LLMResponse(text="Your balance is $1,573.97."),
+        LLMResponse(text="Your balance is $1,573.97."),
+    )
+
+    for said in (
+        "Yes.",
+        "I can pay four hundred today, and then I can pay six hundred next month.",
+        "No, that's really all I can manage.",
+    ):
+        list(agent.stream_turn(said))
+
+    heard = agent.turns[-1].spoken or ""
+    assert "400" not in heard and "600" not in heard, (
+        f"a read-back was appended to a scripted recovery line: {heard!r}"
+    )
+    # Still owed, not written off: the next real turn has to carry it.
+    assert agent._accepted is not None

@@ -290,8 +290,17 @@ TOOL_SCHEMAS: tuple[ToolSchema, ...] = (
                 name="signaled_capacity",
                 kind=ParamKind.MONEY,
                 description=(
-                    "What they said they can afford at one time, if they said it "
-                    "at all, as a decimal string. Omit rather than guessing."
+                    "The largest single payment they said they can make, as a "
+                    "decimal string. Two shapes of sentence carry one, and both "
+                    "belong here: a ceiling they named ('I can only manage four "
+                    "hundred at a time'), and the first payment of a schedule "
+                    "they laid out — 'four hundred today, and then six hundred "
+                    "next month' signals 400. The second is the one that gets "
+                    "missed, because the sentence also names a total and reads "
+                    "as a finished plan rather than a limit. Their schedule is "
+                    "built to start from this figure, so omitting it re-splits "
+                    "their own plan evenly and asks them for more on the day "
+                    "than they offered. Omit only when they named no figure."
                 ),
             ),
         ),

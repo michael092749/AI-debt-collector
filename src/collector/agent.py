@@ -420,6 +420,11 @@ class NegotiationAgent:
         # between. Reset by any sentence that clears the guard, so this counts
         # an agent going in circles rather than a call's fallbacks in total.
         self._consecutive_fallbacks = 0
+        # The arrangement the engine has accepted and the consumer has not yet
+        # heard read back. Held across turns rather than cleared with each one:
+        # it is owed until it is said, and a turn that swallows it does not
+        # cancel the debt. Cleared by ``_unread_agreement`` seeing it spoken.
+        self._accepted: Offer | None = None
         # Inert unless a process called ``configure_tracing()``; see tracing.py.
         self.trace = CallTrace()
 
@@ -579,6 +584,9 @@ class NegotiationAgent:
         # by never reaching its own append when ``_act()`` raises. A caller
         # that merely stops listening is *not* this case; see the docstring.
         record_turn = True
+        # The turn ended on a code-authored recovery line rather than on the
+        # model's own words. Suppresses the read-back below; see there.
+        scripted_close = False
 
         # Two budgets, deliberately not one. Folding the rewrite allowance
         # into the round count spends it on turns that never blocked — every
@@ -620,6 +628,7 @@ class NegotiationAgent:
                     )
                     spoken.append(closer)
                     yield closer
+                    scripted_close = True
                     break
 
                 response = round_.response
@@ -633,6 +642,33 @@ class NegotiationAgent:
                 for call in response.tool_calls:
                     results.append(self._run_tool(call))
                 closing = self.ended
+
+            # Terms were accepted this turn and no sentence of it named them.
+            # Spoken here rather than spliced into a candidate the way
+            # ``_guard_and_speak`` does it: by now every sentence is already
+            # audio, and the read-back is a new chunk after them, not an edit
+            # to one of them. Judged against the whole turn, because a
+            # read-back the model split over two sentences satisfies
+            # ``repeats_back`` only when they are read together.
+            #
+            # Never onto a scripted close. The fallback restarts the
+            # conversation — "let me keep this simple, what would work for
+            # you?" — and a canonical read-back bolted to the back of it asks
+            # an open question and then answers it with terms in the same
+            # breath: "...What would work for you? Just to confirm: $1,000.00
+            # today. Should I set that up?" (live trial, 2026-08-08). The turn
+            # that reached for a scripted line is already a turn that went
+            # wrong; the debt is still owed and the next turn still owes it.
+            if (
+                spoken
+                and not scripted_close
+                and (owed := self._unread_agreement(" ".join(spoken))) is not None
+            ):
+                line = confirmation_line(owed)
+                self._observe_scripted(line)
+                self._record_audio(line)
+                spoken.append(line)
+                yield line
 
             if not spoken:
                 # Every round asked for another tool and the rounds ran out. A
@@ -1114,6 +1150,29 @@ class NegotiationAgent:
             return None
         return offer
 
+    def _unread_agreement(self, candidate: str) -> Offer | None:
+        """Terms the engine accepted that neither this turn nor any before it
+        has read back.
+
+        ``_unconfirmed_terms`` asks a neighbouring question — is the *standing*
+        offer unconfirmed — and is deliberately not reused. It is true from the
+        moment anything is on the table, including the opening balance ask, so
+        driving speech from it would append a read-back to a turn that is still
+        asking the consumer what they can manage. Acceptance is the narrower
+        trigger, and the only one where the figures have become an obligation.
+
+        ``None`` once the offer has been said, which is what retires the debt:
+        the model reading its own terms back is the good case and must not
+        earn a second, canonical copy of them.
+        """
+        offer = self._accepted
+        if offer is None:
+            return None
+        if repeats_back(candidate, offer) or any(repeats_back(said, offer) for said in self.spoken):
+            self._accepted = None
+            return None
+        return offer
+
     def _run_tool(self, call: ToolCall) -> ToolResult:
         started = time.monotonic()
         if call.name in _IDENTITY_GATED_TOOLS and not self.guard.identity_confirmed:
@@ -1168,6 +1227,10 @@ class NegotiationAgent:
 
         if result.verdict is not None:
             self.verdicts.append(result.verdict)
+            # An acceptance is the one ruling that turns a proposal into terms.
+            # From here the turn owes the consumer the figures out loud.
+            if result.verdict.outcome == "accept" and result.offer is not None:
+                self._accepted = result.offer
             if result.proposal is not None:
                 self._record(
                     DecisionRecorded(
@@ -1249,6 +1312,7 @@ class NegotiationAgent:
         """
         blocked: list[str] = []
         completed_notice = False
+        completed_read_back = False
         for _ in range(MAX_REGENERATION_STRIKES + 1):
             if not candidate.strip():
                 return None, tuple(blocked)
@@ -1285,6 +1349,24 @@ class NegotiationAgent:
             self.guard = check.state
 
             if check.allowed:
+                # The turn is compliant and still not the whole job: the engine
+                # accepted an arrangement and this sentence never named it.
+                # "That works. So that'll be a payment today and one more after
+                # it." is what the consumer heard, and they had to ask "So
+                # what's the deal?" to learn the terms they had just agreed to
+                # (live call, 2026-08-08).
+                #
+                # No rule catches it, and none should — the guard rules on what
+                # a sentence *says*, and this one says nothing wrong. It is the
+                # same shape as the Mini-Miranda: wording the consumer is owed,
+                # which the model was asked for and did not produce, so code
+                # supplies it and re-guards. ``confirmation_line`` is built from
+                # the offer's own figures and clears the numeric check by
+                # construction, so the second pass is cheap and certain.
+                if not completed_read_back and (owed := self._unread_agreement(candidate)):
+                    candidate = f"{candidate} {confirmation_line(owed)}"
+                    completed_read_back = True
+                    continue
                 self._consecutive_fallbacks = 0
                 self._record_spoken(candidate)
                 return candidate, tuple(blocked)
