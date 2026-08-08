@@ -159,15 +159,24 @@ class TestLadderAdvancesUnderRepeatedRefusal:
             f"{tiers[0].label}: {[_schedule(o) for o in offers[:3]]}"
         )
 
-    def test_sustained_refusal_walks_the_ladder_down_to_a_settlement(self) -> None:
+    def test_sustained_refusal_walks_the_ladder_off_the_top(self) -> None:
         """One refusal buys one step (A7), so a consumer who refuses through the
         round cap must be walked past pay-in-full and down to real concessions
-        rather than held at the top of the ladder until the call closes out."""
+        rather than held at the top of the ladder until the call closes out.
+
+        Past the *first* step, ``_refuse_until_exhausted`` is not sustained
+        refusal so much as one sentence repeated: it puts identical terms up
+        every round and never moves. That no longer walks the ladder to a
+        settlement, deliberately -- see
+        ``TestRepetitionDoesNotBuyTheLadder``. What this test guards is the
+        defect it was written for, which is the ladder not moving *at all*, and
+        that guarantee is unchanged.
+        """
         offers = self._refuse_until_exhausted()
         walked = sorted(set(o.tier for o in offers))
 
         assert walked[0] is Tier.PAY_IN_FULL, "the ladder must still open at the top"
-        assert walked[-1] >= Tier.SETTLEMENT, (
+        assert walked[-1] > Tier.PAY_IN_FULL, (
             f"ladder stalled at {walked[-1].label} across {len(offers)} refusals"
         )
 
@@ -195,3 +204,82 @@ class TestLadderAdvancesUnderRepeatedRefusal:
         assert all(i.amount == Money("250.00") for i in offer.installments)
         assert offer.duration_days == 90 <= POLICY.max_plan_days
         assert max(i.amount for i in offer.installments) <= Money("300.00")
+
+
+class TestRepetitionDoesNotBuyTheLadder:
+    """One number, said four times, must not walk the ladder to its floor.
+
+    A refusal buys a step because the consumer heard our counter and said no to
+    it (``tools.py``). Said once, that reading is right. Applied to every later
+    repeat of the *same* terms it makes the ladder a free elevator: a consumer
+    who says "a hundred dollars" and then says it again, and again, is walked
+    PAY_IN_FULL -> DOWNPAYMENT_PLUS_ONE -> SETTLEMENT -> PAYMENT_PLAN without
+    ever moving, and the settlement floor -- the most we are authorized to
+    discount -- is spoken aloud on the third utterance of the same number.
+
+    This is a known and named failure mode: concession that steps per *turn*
+    rather than per counterparty *move* is the canonical exploitable
+    negotiation strategy, and repeating a position until the other side folds
+    is the standard way to exploit it. A repeat is not movement.
+
+    Movement is still bought, and refusals still accumulate: what a repeat may
+    no longer do is buy a *second* step on terms that never changed.
+    """
+
+    LOWBALL = {"total": "100", "payment_count": 1, "cadence": "immediate"}
+
+    def _repeat_lowball(self, times: int) -> list[Offer]:
+        context = ToolContext.opening(POLICY)
+        offers: list[Offer] = []
+        for _ in range(times):
+            result = _call(context, "validate_consumer_offer", **self.LOWBALL)
+            context = result.context
+            assert result.offer is not None
+            offers.append(result.offer)
+        return offers
+
+    def test_one_repeated_number_never_reaches_the_settlement_floor(self) -> None:
+        offers = self._repeat_lowball(5)
+        tiers = [o.tier for o in offers]
+
+        assert Tier.SETTLEMENT not in tiers, (
+            f"repeating ${self.LOWBALL['total']} reached a settlement: "
+            f"{[t.label for t in tiers]}"
+        )
+
+    def test_the_maximum_discount_is_never_spoken_to_a_consumer_who_never_moved(
+        self,
+    ) -> None:
+        """The floor is the most we may ever give up. Reaching it must cost
+        something."""
+        totals = [o.total for o in self._repeat_lowball(5)]
+
+        assert POLICY.settlement_floor not in totals, (
+            f"floor {POLICY.settlement_floor} offered to a consumer who "
+            f"repeated one number: {[str(t) for t in totals]}"
+        )
+
+    def test_identical_terms_buy_at_most_one_step(self) -> None:
+        tiers = [o.tier for o in self._repeat_lowball(5)]
+
+        assert len(set(tiers)) <= 2, (
+            f"one unchanged proposal bought {len(set(tiers)) - 1} steps: "
+            f"{[t.label for t in tiers]}"
+        )
+
+    def test_a_consumer_who_actually_moves_is_still_answered(self) -> None:
+        """The step this removes is the one nobody earned. Naming genuinely new
+        terms is still a live negotiation and still records a refusal, so the
+        model's own ``concede`` has something to spend."""
+        context = ToolContext.opening(POLICY)
+        for total in ("100", "300", "500"):
+            result = _call(
+                context,
+                "validate_consumer_offer",
+                total=total,
+                payment_count=1,
+                cadence="immediate",
+            )
+            context = result.context
+
+        assert context.state.pending_refusals > 0

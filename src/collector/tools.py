@@ -581,7 +581,7 @@ def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult
         # own `concede` is what answers that; stepping there too would spend two
         # tiers on one exchange.
         standing = context.standing_offer
-        if standing is not None and _already_ruled_on(context.state, proposal):
+        if standing is not None and _first_repeat_of(context.state, proposal):
             state, stepped, moved = _step_down(state, context.policy, standing, proposal.cadence)
             if moved:
                 on_table = stepped
@@ -724,9 +724,28 @@ def _concede(args: JsonDict, context: ToolContext) -> ToolResult:
 _LAST_TIER = Tier.PAYMENT_PLAN
 
 
-def _already_ruled_on(state: NegotiationState, proposal: ConsumerProposal) -> bool:
-    """Have these exact terms already been put to us this call, and answered?"""
-    return any(r.proposal == proposal for r in state.rounds)
+def _first_repeat_of(state: NegotiationState, proposal: ConsumerProposal) -> bool:
+    """Are these exact terms being put to us again, for the first time?
+
+    Rounds are recorded *after* this is consulted, so the count is of earlier
+    utterances only: nothing on a first hearing, one on the first repeat, more
+    after that.
+
+    Answering every repeat alike is what made the ladder a free elevator. A
+    consumer who says "a hundred dollars" four times was walked from pay-in-full
+    to the bottom of the ladder without ever moving, and the settlement floor --
+    the most we are authorized to discount -- was spoken on the third utterance
+    of the same number.
+
+    One repeat still buys its step: they heard the counter and said no to it,
+    which is a refusal in all but wording and earns exactly one (A7). The second
+    identical repeat says nothing the first did not, and a concession ladder
+    that steps per turn rather than per counterparty move is the standard shape
+    a held position is designed to exploit. Refusals still accumulate either
+    way, so ``concede`` still has something to spend when the model judges the
+    negotiation has genuinely moved.
+    """
+    return sum(1 for r in state.rounds if r.proposal == proposal) == 1
 
 
 def _step_down(
