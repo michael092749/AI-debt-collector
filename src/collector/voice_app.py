@@ -143,7 +143,12 @@ TTS_LANGUAGE = "en"
 # customization page is a generic provider-varies list, not a Cartesia one).
 # An unsupported tag would be read aloud or silently dropped, and either way
 # it would put characters into a line the guardrails already cleared verbatim.
-GREETING_PAUSE_SECONDS = 0.7
+#
+# Smaller than the beat the consumer hears: the second `say()` only starts
+# synthesizing after this sleep, so its time-to-first-audio rides on top. At
+# 0.7 the combined gap ran long enough to read as the line going dead
+# (live call, 2026-08-08).
+GREETING_PAUSE_SECONDS = 0.25
 
 # Preemptive generation is on by the SDK's own default, and it is wrong for
 # this agent specifically. It calls `Agent.llm_node` — and so
