@@ -722,6 +722,65 @@ class TestTurnLoop:
         assert not any("garnish" in m.content for m in agent.messages if m.role == "agent")
         assert any(not e.allowed for e in agent.guard.events)
 
+    def test_a_paraphrased_mini_miranda_is_completed_not_struck_out(self) -> None:
+        """The notice has legally exact wording, so the model must not be the
+        one holding it.
+
+        Live call, 2026-08-08: the consumer confirmed identity and heard
+        "I'd rather not misstate anything..." — the safe fallback — because the
+        model answered with "This call is from a debt collector, and any
+        information obtained will be used for that purpose". That drops the
+        literal "attempt to collect a debt" the detector requires, so the notice
+        never fired and the balance sentence behind it became money-before-
+        Miranda. Two strikes, fallback, and the consumer heard a non-sequitur.
+
+        The model cannot be taught the sentence either: the prompt is forbidden
+        from quoting a required script (see
+        ``test_no_required_script_reads_as_a_prompt_leak``), because then saying
+        it would be blocked as a prompt leak. So the notice is ours to supply,
+        not the model's to remember — it says the substance, we put the exact
+        notice in front of it.
+        """
+        paraphrased = (
+            "This call is from a debt collector, and any information obtained "
+            "will be used for that purpose. Your account has a balance of "
+            "one thousand dollars. Can you clear that in full today?"
+        )
+
+        class ParaphrasingClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+                self.calls += 1
+                if self.calls == 1:
+                    return LLMResponse(
+                        text=(
+                            "Hello, this is Sarah. I am an AI assistant with Meridian "
+                            "Recovery Services. Am I speaking with Dana Whitfield?"
+                        )
+                    )
+                return LLMResponse(text=paraphrased)
+
+        agent = NegotiationAgent(llm=ParaphrasingClient(), policy=POLICY)
+        agent.open_call(PreCallContext(account_loaded=True, within_calling_window=True))
+        turn = agent.turn("Yes.")
+
+        assert turn.spoken is not None, "the turn was struck out entirely"
+        assert SAFE_FALLBACK_TEXT not in turn.spoken, (
+            "the consumer heard the fallback instead of the notice and the balance"
+        )
+        assert fires_mini_miranda(turn.spoken) is not None, "no complete Mini-Miranda was spoken"
+        assert turn.spoken.startswith(MINI_MIRANDA_TEXT), (
+            f"the notice must lead the turn, got: {turn.spoken[:80]!r}"
+        )
+        assert "one thousand dollars" in turn.spoken, "the model's substance was thrown away"
+        # The live route says its own near-miss notice right behind ours unless
+        # the repair is confined to a turn that has none. Heard once, not twice.
+        assert turn.spoken.lower().count("attempt to collect a debt") == 1, (
+            f"the notice was delivered twice in one breath: {turn.spoken!r}"
+        )
+
     def test_the_round_cap_stops_the_agent_badgering(self) -> None:
         agent = _agent()
         agent.open_call()

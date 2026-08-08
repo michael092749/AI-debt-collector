@@ -46,6 +46,7 @@ from collector.decision_engine import Verdict
 from collector.guardrails.confirmation import agreed_line, confirmation_line, repeats_back
 from collector.guardrails.disclosures import (
     AI_DISCLOSURE_WITH_HUMAN,
+    MINI_MIRANDA_TEXT,
     DisclosureRuleId,
     confirms_identity,
     denies_identity,
@@ -59,6 +60,7 @@ from collector.guardrails.rings import (
     GuardrailRing,
     GuardrailState,
     InboundCheck,
+    OutboundCheck,
     PreCallCheck,
     PreCallContext,
     check_inbound,
@@ -1216,6 +1218,26 @@ class NegotiationAgent:
             return self._speak_fallback(), ()
         return self._guard_and_speak(response.text)
 
+    @staticmethod
+    def _only_missing_notice(check: OutboundCheck) -> bool:
+        """Is an *absent* Mini-Miranda the entire objection?
+
+        Any other violation means the turn is wrong on its own terms, and
+        prefixing a disclosure to an invented figure would launder it past the
+        guard that caught it.
+
+        ``MINI_MIRANDA_OUT_OF_ORDER`` is deliberately not curable here, though
+        the prefix would satisfy it. That rule says a *complete* notice is
+        already in the turn and merely trails the collection talk, so prefixing
+        a second one has the consumer hear it twice in one breath — which is
+        what the live route actually produced: "This is an attempt to collect a
+        debt... This is a communication from a debt collector. This is an
+        attempt to collect a debt...". A turn that owns a notice in the wrong
+        place is the model's to reorder, and the regeneration note says so.
+        """
+        rules = {v.rule_id for v in check.blocking_violations}
+        return rules == {DisclosureRuleId.MINI_MIRANDA_NOT_FIRED}
+
     def _guard_and_speak(self, candidate: str) -> tuple[str | None, tuple[str, ...]]:
         """The pre-TTS gate, with the regeneration loop behind it.
 
@@ -1226,6 +1248,7 @@ class NegotiationAgent:
         that clears.
         """
         blocked: list[str] = []
+        completed_notice = False
         for _ in range(MAX_REGENERATION_STRIKES + 1):
             if not candidate.strip():
                 return None, tuple(blocked)
@@ -1237,6 +1260,28 @@ class NegotiationAgent:
                 standing_tier=self._standing_tier,
                 confidential_reference=_CONFIDENTIAL_REFERENCE,
             )
+
+            # The notice is ours to supply, not the model's to remember. Its
+            # wording is fixed by law and the prompt may not quote it — a
+            # required script written into the prompt makes saying it a leak
+            # (``test_no_required_script_reads_as_a_prompt_leak``) — so the
+            # model is left producing it from a description and paraphrases:
+            # "This call is from a debt collector" drops the literal "attempt
+            # to collect a debt" the detector requires, and the balance sentence
+            # behind it becomes money-before-Miranda. Two strikes and the
+            # consumer hears the fallback instead (live call, 2026-08-08).
+            #
+            # So put the exact notice in front and re-guard, once. Only when the
+            # notice is the *whole* objection: a turn that also invents a figure
+            # is not one to rescue, and the numeric guard must still take it.
+            # Not a strike either — the model wrote a sound turn and the wording
+            # it could not have known is now there, so there is nothing to
+            # regenerate and nothing to spend.
+            if not check.allowed and not completed_notice and self._only_missing_notice(check):
+                candidate = f"{MINI_MIRANDA_TEXT} {candidate}"
+                completed_notice = True
+                continue
+
             self.guard = check.state
 
             if check.allowed:
