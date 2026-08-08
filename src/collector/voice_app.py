@@ -50,12 +50,12 @@ from livekit.agents import (
     UserInputTranscribedEvent,
     UserTranscriptionTimeoutEvent,
     cli,
-    inference,
     llm,
 )
 from livekit.agents.llm import ChatMessage
 from livekit.agents.voice.agent import ModelSettings
 from livekit.agents.voice.agent_session import RecordingOptions
+from livekit.plugins import cartesia, deepgram
 
 from collector.agent import NegotiationAgent
 from collector.audit.store import DEFAULT_DB_PATH, AuditStore
@@ -76,16 +76,29 @@ _TRANSIENT_ERROR_APOLOGY = (
     "Sorry, I had trouble hearing that for a second — could you say that again?"
 )
 
-# Speech runs through LiveKit Inference rather than the Deepgram and Cartesia
-# plugins: same two models, reached with the LiveKit credentials the worker
-# already holds instead of two more third-party keys, and zero data retention
-# by default — the same reason `_recording_options()` leaves Cloud recording off.
+# Speech runs through the Deepgram and Cartesia plugins, on this project's own
+# keys. It used to go through LiveKit Inference — same two models, reached with
+# credentials the worker already held instead of two more third-party keys —
+# and that reasoning was sound right up until the credits ran out.
 #
-# Every value below is the plugin default this replaced, pinned explicitly.
-# `cartesia.TTS()` in particular chose the voice implicitly; the agent's
-# audible identity is not something to leave to a library default that can
-# change under it between releases.
-STT_MODEL = "deepgram/nova-3"
+# LiveKit Inference bills LLM, STT and TTS against one pooled monthly allowance
+# ($2.50 on the free Build plan, shared across every model and every free
+# project). When it emptied, all three went down together: the agent generated
+# a correct opening turn and could then neither speak it nor hear the reply
+# ("failed to recognize speech: 429", "failed to synthesize speech: 429" —
+# 2026-08-08). One exhausted pool taking out the whole voice path is a single
+# point of failure the plugins do not have, since each provider is billed
+# separately.
+#
+# Model ids are the bare plugin names. The `provider/model` form above them is
+# LiveKit Inference routing syntax, and passing it to a plugin asks Deepgram
+# for a model called "deepgram/nova-3".
+#
+# Every value below is the plugin default, pinned explicitly. `cartesia.TTS()`
+# in particular chose the voice implicitly; the agent's audible identity is not
+# something to leave to a library default that can change under it between
+# releases.
+STT_MODEL = "nova-3"
 STT_LANGUAGE = "en-US"
 
 # Keyterm prompting, Nova-3 only (`inference/stt.py:_keyterms_extra_for_model`
@@ -127,7 +140,7 @@ STT_KEYTERMS = [
     "downpayment",
 ]
 
-TTS_MODEL = "cartesia/sonic-3"
+TTS_MODEL = "sonic-3"
 TTS_VOICE = "f786b574-daa5-4673-aa0c-cbe3e8534c02"
 TTS_LANGUAGE = "en"
 
@@ -372,15 +385,15 @@ class CollectorAgent(Agent):
                 "Reasoning is delegated entirely to a deterministic engine outside "
                 "this class; this agent only carries audio."
             ),
-            stt=inference.STT(
+            stt=deepgram.STT(
                 model=STT_MODEL,
                 language=STT_LANGUAGE,
-                extra_kwargs={"keyterm": STT_KEYTERMS},
+                keyterm=STT_KEYTERMS,
             )
             if audio
             else None,
             llm=_NoOpLLM(),
-            tts=inference.TTS(model=TTS_MODEL, voice=TTS_VOICE, language=TTS_LANGUAGE)
+            tts=cartesia.TTS(model=TTS_MODEL, voice=TTS_VOICE, language=TTS_LANGUAGE)
             if audio
             else None,
         )

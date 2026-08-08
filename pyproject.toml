@@ -7,7 +7,7 @@ dependencies = [
     "anthropic>=0.120.2",
     "openai>=1.0",
     "python-dotenv>=1.2.2",
-    "livekit-agents>=1.5.2",
+    "livekit-agents[cartesia,deepgram]>=1.5.2",
 ]
 
 [project.optional-dependencies]

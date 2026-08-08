@@ -34,10 +34,10 @@ from livekit.agents import (
     ConversationItemAddedEvent,
     UserInputTranscribedEvent,
     UserTranscriptionTimeoutEvent,
-    inference,
     llm,
 )
 from livekit.agents.llm import ChatMessage
+from livekit.plugins import cartesia, deepgram
 
 from collector.agent import NegotiationAgent
 from collector.audit.events import Speaker
@@ -687,21 +687,34 @@ def test_malformed_metadata_refuses_the_call(metadata: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_audio_mode_wires_speech_through_livekit_inference(store: AuditStore) -> None:
+def test_audio_mode_wires_speech_through_the_provider_plugins(store: AuditStore) -> None:
     """The rest of this file runs `audio=False`, so nothing else exercises the
     speech pipeline at all. This pins the two models and — the part that would
     otherwise change silently — the voice the consumer hears, which the Cartesia
-    plugin used to pick from a library default."""
+    plugin picks from a library default when it is not told.
+
+    It also pins the route off LiveKit Inference. That path bills LLM, STT and
+    TTS against one pooled allowance, so emptying it took down speech in both
+    directions at once and left the agent generating turns it could neither say
+    nor hear an answer to (2026-08-08). Billing each provider separately is what
+    stops one exhausted pool from being the whole voice path's single point of
+    failure, and an accidental revert to `inference.STT`/`inference.TTS` would
+    restore that coupling silently.
+
+    The bare model ids are load-bearing for the same reason: `provider/model` is
+    LiveKit Inference routing syntax, and handing it to a plugin asks Deepgram
+    for a model named "deepgram/nova-3".
+    """
     negotiation_agent = NegotiationAgent(
         llm=MockLLMClient(), policy=POLICY, store=store, channel="voice"
     )
     agent = CollectorAgent(negotiation_agent, audio=True)
 
-    assert isinstance(agent.stt, inference.STT)
-    assert isinstance(agent.tts, inference.TTS)
-    assert (STT_MODEL, STT_LANGUAGE) == ("deepgram/nova-3", "en-US")
+    assert isinstance(agent.stt, deepgram.STT)
+    assert isinstance(agent.tts, cartesia.TTS)
+    assert (STT_MODEL, STT_LANGUAGE) == ("nova-3", "en-US")
     assert (TTS_MODEL, TTS_VOICE, TTS_LANGUAGE) == (
-        "cartesia/sonic-3",
+        "sonic-3",
         "f786b574-daa5-4673-aa0c-cbe3e8534c02",
         "en",
     )
@@ -1161,4 +1174,4 @@ def test_the_stt_is_built_with_the_keyterms(store: AuditStore) -> None:
     """The list is only worth anything if it reaches the recognizer. Guards
     against it being defined and then quietly not wired in."""
     source = inspect.getsource(CollectorAgent.__init__)
-    assert '"keyterm": STT_KEYTERMS' in source
+    assert "keyterm=STT_KEYTERMS" in source
