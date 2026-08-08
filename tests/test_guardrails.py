@@ -11,6 +11,7 @@ Three things are being proven here:
 Everything is offline and deterministic: no API keys, no clock, no network.
 """
 
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -81,9 +82,15 @@ def settlement_offer() -> Offer:
 
 @pytest.fixture
 def ready(policy: PolicyConfig) -> GuardrailState:
-    """Mid-call state: identity confirmed, both disclosures already fired."""
-    return GuardrailState(
-        authorized=authorized_for(policy),
+    """Mid-call state: identity confirmed, both disclosures already fired.
+
+    Built through ``opening`` rather than by hand because that is how
+    ``agent.py`` builds it, and it is what seeds the withheld policy figures.
+    A state assembled field-by-field declares nothing withheld, which would
+    quietly exempt everything in this file from that rule.
+    """
+    return replace(
+        GuardrailState.opening(policy),
         disclosures=DisclosureState(fired=frozenset(DisclosureId), agent_turns=1),
         identity_confirmed=True,
     )
@@ -1595,6 +1602,60 @@ class TestAcknowledgingCallerStatedAmounts:
         heard = check_inbound(ready, "I can do two hundred dollars.")
         later = check_inbound(heard.state, "Sorry, what were you saying?")
         assert check_outbound(later.state, "You mentioned two hundred dollars.").allowed
+
+    @pytest.mark.parametrize(
+        ("utterance", "candidate", "value"),
+        [
+            (
+                "Would you take eight hundred dollars to close this out?",
+                "The lowest I could go is eight hundred dollars.",
+                Decimal(800),
+            ),
+            (
+                "Would nine hundred dollars settle it?",
+                "I could settle this for nine hundred dollars.",
+                Decimal(900),
+            ),
+            (
+                "Is two hundred and fifty dollars a month the smallest you take?",
+                "The smallest payment I can take is two hundred and fifty dollars.",
+                Decimal(250),
+            ),
+        ],
+    )
+    def test_a_withheld_policy_figure_is_not_unlocked_by_the_consumer_naming_it(
+        self, ready: GuardrailState, utterance: str, candidate: str, value: Decimal
+    ) -> None:
+        """The echo may not hand back the thresholds the engine withholds.
+
+        ``authorized_for`` keeps the $250 minimum payment, the $800 settlement
+        floor and the $900 opening settlement out of the base set: "the $800
+        settlement floor is unsayable until an $800 settlement is on the
+        table, and refusing a proposal surfaces nothing at all." A consumer
+        can say any number, so a consumer guessing one of ours must not be
+        the thing that puts it in the agent's mouth — and the guard cannot
+        tell "eight hundred dollars, I hear you" from "eight hundred dollars
+        is the lowest I could go", so the collision is excluded outright
+        rather than echoed and hoped about.
+
+        No capability is lost: once the engine puts the figure in an offer it
+        is authorized through ``offers_made`` and needs no echo at all.
+        """
+        heard = check_inbound(ready, utterance)
+        assert value not in heard.state.acknowledged.money
+
+        result = check_outbound(heard.state, candidate)
+        assert NumericRuleId.UNAUTHORIZED_AMOUNT in rule_ids(result.violations)
+
+    def test_the_withheld_figure_is_sayable_once_the_engine_offers_it(
+        self, ready: GuardrailState, policy: PolicyConfig, settlement_offer: Offer
+    ) -> None:
+        """The gate stays temporal, not permanent. Excluding the collision from
+        the acknowledgment set must not survive the engine putting an $800
+        settlement on the table — that authorization was never the echo's."""
+        heard = check_inbound(ready, "Would you take eight hundred dollars to close this out?")
+        offered = heard.state.with_authorized(authorized_for(policy, offers=(settlement_offer,)))
+        assert check_outbound(offered, "Eight hundred dollars settles the account.").allowed
 
 
 class TestPostCallRing:

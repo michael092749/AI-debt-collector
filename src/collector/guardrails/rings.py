@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
@@ -39,6 +40,7 @@ from collector.guardrails.numeric import (
     check_numeric,
     consumer_stated_money,
     extract_figures,
+    withheld_policy_money,
 )
 from collector.guardrails.prohibited import (
     Severity,
@@ -488,6 +490,11 @@ class GuardrailState:
     # engine on every tool result and would otherwise wipe this on the next
     # tool call. See ``consumer_stated_money`` for how narrow it is.
     acknowledged: AuthorizedFigures = AuthorizedFigures()
+    # The policy thresholds the engine withholds, which no echo may hand back.
+    # Seeded from the policy in ``opening``, the only way ``agent.py`` builds
+    # this state; a state assembled without one simply declares nothing
+    # withheld, the same way it declares nothing authorized.
+    withheld_money: frozenset[Decimal] = frozenset()
     disclosures: DisclosureState = DisclosureState()
     identity_confirmed: bool = False
     substantive_discussed: bool = False
@@ -500,7 +507,10 @@ class GuardrailState:
     def opening(
         cls, policy: PolicyConfig, *, authorized: AuthorizedFigures | None = None
     ) -> GuardrailState:
-        return cls(authorized=authorized if authorized is not None else authorized_for(policy))
+        return cls(
+            authorized=authorized if authorized is not None else authorized_for(policy),
+            withheld_money=withheld_policy_money(policy),
+        )
 
     @property
     def escalated(self) -> bool:
@@ -621,7 +631,11 @@ def check_inbound(state: GuardrailState, utterance: str) -> InboundCheck:
     disclosures = state.disclosures.observe_consumer(utterance)
     turn_index = state.consumer_turns
     acknowledged = state.acknowledged.merged_with(
-        consumer_stated_money(utterance, ceiling=max(state.authorized.money, default=None))
+        consumer_stated_money(
+            utterance,
+            ceiling=max(state.authorized.money, default=None),
+            withheld=state.withheld_money,
+        )
     )
 
     escalation = state.escalation
