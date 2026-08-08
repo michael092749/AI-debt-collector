@@ -239,6 +239,48 @@ class TestConcessionsAreEarned:
             "an accepted proposal replaced the standing offer with harder terms"
         )
 
+    def test_a_split_the_consumer_named_is_not_replaced_by_the_standing_one(self) -> None:
+        """ "Can we do two payments of five hundred each?" — "Okay, I can do
+        that. Just to confirm, that's two hundred fifty dollars today and then
+        seven hundred fifty dollars in thirty days." (live call, 2026-08-08.)
+
+        The guard above reads a standing $250/$750 as easier than an accepted
+        $500/$500 — same tier, same money, smaller first payment — and concludes
+        the consumer agreed to our arrangement and mis-stated it. That reading
+        holds only for the split we assembled: there the consumer named a shape
+        and the $500s are ours. Here they said "five hundred" out loud, which is
+        a proposal of their own, and answering it with a schedule they did not
+        name is the agent agreeing to something nobody offered.
+        """
+        context = ToolContext.opening(POLICY)
+        context = execute(ToolCall(name="propose_offer"), context).context
+        context = execute(
+            ToolCall(name="validate_consumer_offer", arguments={"amount_each": "200"}),
+            context,
+        ).context
+        context = execute(
+            ToolCall(name="concede", arguments={"preferred_cadence": "monthly"}), context
+        ).context
+
+        standing = context.standing_offer
+        assert standing is not None
+        assert [i.amount for i in standing.installments] == [Money("250"), Money("750")]
+
+        result = execute(
+            ToolCall(
+                name="validate_consumer_offer",
+                arguments={"amount_each": "500", "payment_count": 2, "cadence": "monthly"},
+            ),
+            context,
+        )
+
+        assert result.payload["outcome"] == "accept"
+        assert result.offer is not None
+        assert [i.amount for i in result.offer.installments] == [Money("500"), Money("500")], (
+            "a per-payment figure the consumer named was replaced by the standing schedule"
+        )
+        assert "500" in result.payload["you_must_confirm"]
+
     def test_terms_better_than_the_standing_ones_are_taken_at_their_number(self) -> None:
         """The rule is "never take more than we *asked* for", not "never take
         more than we offered". A consumer who puts up $950 against a standing

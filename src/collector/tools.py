@@ -550,9 +550,19 @@ def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult
     # correct — $900 against a standing $800 settlement is $100 they offered,
     # and a $400/$600 offer answered with the whole $1,000 today is the best
     # outcome on the list, not something to talk back down into instalments.
+    #
+    # And only over a split we assembled. The mis-statement reading rests on the
+    # instalments being ours — "two payments" is a shape, and the $500s that
+    # come back from it are arithmetic on the balance, so there is nothing of
+    # the consumer's to overwrite. A per-payment figure they said out loud is a
+    # proposal of their own (``ConsumerProposal.amount_each``), and answering it
+    # with a schedule they never named agrees to something nobody offered:
+    # "two payments of five hundred each" was confirmed back as $250 today and
+    # $750 in thirty days (live call, 2026-08-08).
     standing = context.standing_offer
     if (
         accepted is not None
+        and proposal.amount_each is None
         and standing is not None
         and standing.tier is accepted.tier
         and standing.total == accepted.total
