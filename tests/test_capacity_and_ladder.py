@@ -243,8 +243,7 @@ class TestRepetitionDoesNotBuyTheLadder:
         tiers = [o.tier for o in offers]
 
         assert Tier.SETTLEMENT not in tiers, (
-            f"repeating ${self.LOWBALL['total']} reached a settlement: "
-            f"{[t.label for t in tiers]}"
+            f"repeating ${self.LOWBALL['total']} reached a settlement: {[t.label for t in tiers]}"
         )
 
     def test_the_maximum_discount_is_never_spoken_to_a_consumer_who_never_moved(
@@ -263,8 +262,7 @@ class TestRepetitionDoesNotBuyTheLadder:
         tiers = [o.tier for o in self._repeat_lowball(5)]
 
         assert len(set(tiers)) <= 2, (
-            f"one unchanged proposal bought {len(set(tiers)) - 1} steps: "
-            f"{[t.label for t in tiers]}"
+            f"one unchanged proposal bought {len(set(tiers)) - 1} steps: {[t.label for t in tiers]}"
         )
 
     def test_a_consumer_who_actually_moves_is_still_answered(self) -> None:
