@@ -27,8 +27,8 @@ from __future__ import annotations
 
 from collector.agent import NegotiationAgent
 from collector.decision_engine import _HARD_FLOORS, RationaleCode, validate_offer
-from collector.guardrails.disclosures import MINI_MIRANDA_TEXT
-from collector.guardrails.rings import CONNECTIVE_TEXT, PreCallContext
+from collector.guardrails.disclosures import MINI_MIRANDA_TEXT, fires_mini_miranda
+from collector.guardrails.rings import CONNECTIVE_TEXT, SAFE_FALLBACK_TEXT, PreCallContext
 from collector.llm.base import LLMResponse, Message, ToolCall
 from collector.money import Money
 from collector.offers import Cadence, ConsumerProposal, Tier
@@ -577,3 +577,42 @@ def test_the_read_back_is_never_bolted_onto_a_scripted_recovery() -> None:
     )
     # Still owed, not written off: the next real turn has to carry it.
     assert agent._accepted is not None
+
+
+def test_the_streaming_path_repairs_a_missing_mini_miranda_too() -> None:
+    """"Yes." answered with the scripted fallback, on the path that carries
+    calls (live, 2026-08-09).
+
+    ``8c41068`` put the canonical notice in front of a turn whose only fault is
+    that it lacks one — in ``_guard_and_speak``, which is ``turn()``. Voice
+    calls go through ``_guard_sentence``, which never had the repair, so
+    production kept spending two strikes and the fallback on exactly the turn
+    the fix was written for. Measured on the live route at the deployed commit:
+    4 of 6 openings fell back.
+
+    The model cannot be prompted out of this — the notice may not be quoted in
+    the prompt (``test_no_required_script_reads_as_a_prompt_leak``), so it
+    paraphrases, and "I'm calling about a debt you owe" does not contain the
+    literal "attempt to collect a debt" the detector requires.
+    """
+    paraphrased = (
+        "I'm calling about a debt you owe, and anything you tell me may be "
+        "used to collect it. You have a balance of one thousand dollars. "
+        "Can you clear it today?"
+    )
+    agent = _agent(
+        LLMResponse(text=_OPENING),
+        _tool("propose_offer", preferred_cadence="immediate"),
+        # It paraphrases again on every rewrite, which is what spends the
+        # strike budget and reaches the fallback.
+        LLMResponse(text=paraphrased),
+        LLMResponse(text=paraphrased),
+        LLMResponse(text=paraphrased),
+    )
+
+    heard = "".join(agent.stream_turn("Yes."))
+
+    assert SAFE_FALLBACK_TEXT not in heard, (
+        f"the turn after identity confirmation fell back: {heard!r}"
+    )
+    assert fires_mini_miranda(heard), f"no Mini-Miranda reached the consumer: {heard!r}"

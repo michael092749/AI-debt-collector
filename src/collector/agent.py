@@ -871,6 +871,27 @@ class NegotiationAgent:
             authorized=self.authorized,
             standing_tier=self._standing_tier,
         )
+
+        # The same repair ``_guard_and_speak`` has, on the path that carries
+        # calls. It was added to the text path only, so voice calls kept
+        # spending both strikes and the fallback on the turn right after
+        # identity confirmation — measured 4 of 6 openings on the live route.
+        #
+        # The model cannot be prompted out of it: the notice may not be quoted
+        # in the prompt, so it works from a description and paraphrases, and
+        # "I'm calling about a debt you owe" lacks the literal "attempt to
+        # collect a debt" the detector requires. Only when the missing notice
+        # is the whole objection — a sentence that also invents a figure is not
+        # one to rescue, and re-checking is what enforces that.
+        if not check.allowed and self._only_missing_notice(check):
+            candidate = f"{MINI_MIRANDA_TEXT} {candidate}"
+            check = check_outbound(
+                self.guard,
+                candidate,
+                authorized=self.authorized,
+                standing_tier=self._standing_tier,
+            )
+
         self.guard = check.state
         if check.allowed:
             self._consecutive_fallbacks = 0
