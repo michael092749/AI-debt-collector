@@ -279,7 +279,28 @@ def authorized_for(
     return authorized
 
 
-def consumer_stated_money(utterance: str, *, ceiling: Decimal | None = None) -> AuthorizedFigures:
+def withheld_policy_money(policy: PolicyConfig) -> frozenset[Decimal]:
+    """The money figures ``authorized_for`` deliberately keeps out of the base set.
+
+    The engine's private thresholds, in the amounts they would be spoken in:
+    the minimum payment, the settlement floor, and the figure the settlement
+    tier opens at. Each is unsayable until the engine has put it in an actual
+    ``Offer``, and each is a round number a consumer can arrive at by guessing.
+    Kept here rather than in ``policy.py`` because it is a guardrail question —
+    which figures the agent may not originate — not a negotiation limit.
+    """
+    return frozenset(
+        amount.amount
+        for amount in (policy.min_payment, policy.settlement_floor, policy.opening_settlement)
+    )
+
+
+def consumer_stated_money(
+    utterance: str,
+    *,
+    ceiling: Decimal | None = None,
+    withheld: frozenset[Decimal] = frozenset(),
+) -> AuthorizedFigures:
     """Money the *consumer* named, which the agent may repeat back to them.
 
     Echoing a figure the consumer just spoke aloud discloses nothing — they
@@ -303,6 +324,14 @@ def consumer_stated_money(utterance: str, *, ceiling: Decimal | None = None) -> 
       balance). Nothing the consumer says widens the guard past the account.
     * **Nothing suspicious.** A digit run against a letter is an evasion
       shape whoever typed it; it never widens anything.
+    * **Never a figure in ``withheld``** — the engine's private thresholds
+      (``withheld_policy_money``). A consumer can name any number, so "would
+      you take eight hundred dollars?" would otherwise be enough to put the
+      settlement floor in the agent's mouth, on that turn and every turn
+      after: exactly the disclosure ``authorized_for`` withholds until an
+      $800 settlement is on the table. Nothing is lost by excluding them,
+      because the moment the engine does offer one it is authorized through
+      the offer itself and needs no echo.
 
     Three things it still cannot do, and none of them are detectable from the
     text of a figure:
@@ -331,6 +360,7 @@ def consumer_stated_money(utterance: str, *, ceiling: Decimal | None = None) -> 
         and not figure.suspicious
         and _CURRENCY_MARKER_RE.search(figure.text) is not None
         and (ceiling is None or figure.value <= ceiling)
+        and figure.value not in withheld
     }
     return AuthorizedFigures(money=frozenset(values))
 
