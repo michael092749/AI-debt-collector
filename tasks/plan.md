@@ -94,6 +94,28 @@ for phrase variation across turns; nothing here varies.
 
 **Verify:** new tests in `tests/test_guardrails.py`; full suite green.
 
+**STATUS: not landed — needs a decision.** Implemented and reverted. A
+three-line `RECOVERY_LINES` rotation on a `fallbacks_spoken` counter works and
+its own tests pass, but it collides with a deliberate, tested contract in
+`TestRepeatedFallbacksEscalateToTheStandingOffer`
+(`tests/test_instrumentation.py`), which already carries a partial fix:
+
+- trip 1 asks the open question, trip 2 restates the standing offer
+  (`agent.py:1386`, `_consecutive_fallbacks`), trips 3+ return to the open
+  question — `lines[2:] == [SAFE_FALLBACK_TEXT, SAFE_FALLBACK_TEXT]` (:1708)
+  asserts that verbatim repeat directly.
+- `:1697` asserts "the count restarts, it does not accumulate" after a turn
+  that speaks, which contradicts a counter that never resets.
+
+Two questions to settle before rebuilding it:
+1. Should trips 3+ rotate, or keep repeating the open question?
+2. Should the rotation reset after a successful turn, or persist for the call?
+
+Published guidance is one-sided (never repeat a recovery prompt verbatim;
+taper and escalate within 2-3 strikes), which argues for rotate + persist —
+but that rewrites eight assertions in compliance-adjacent tests, so it is a
+decision to take deliberately rather than absorb into a green suite.
+
 ---
 
 ## Out of scope, found during research — flagged, not built
