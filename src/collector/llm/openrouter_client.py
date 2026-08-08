@@ -40,7 +40,13 @@ from collector.llm.openai_shape import (
 )
 
 BASE_URL = "https://openrouter.ai/api/v1"
-MODEL = "anthropic/claude-sonnet-5"
+# Pinned to a dated revision, not the ``~deepseek/deepseek-v4-flash-latest``
+# alias. The alias re-points to whatever ships next, which would change the
+# model answering live calls with no deploy and no test run behind it — and
+# every budget above this line (MAX_TOOL_ROUNDS, the regeneration strikes) is
+# tuned per-model. A route change here is a re-certification, so it has to be
+# something a commit can name.
+MODEL = "deepseek/deepseek-v4-flash-0731"
 
 # A spoken turn is one or two sentences. The cap is a backstop against a
 # runaway generation, not a style control — matches the Anthropic client.
