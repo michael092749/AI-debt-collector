@@ -26,6 +26,11 @@ class PolicyConfig:
     # Caps how long the agent may keep haggling. Past this the call closes out:
     # an unbounded negotiation is badgering however politely it is phrased.
     max_negotiation_rounds: int = 8
+    # Where the settlement tier *opens*, as against the most it may ever give
+    # up. Necessarily smaller than ``max_settlement_discount``: a tier whose
+    # first offer is already its floor has nothing left to concede, and the one
+    # number we least want to disclose is the first one we say.
+    opening_settlement_discount: Decimal = Decimal("0.10")
 
     @classmethod
     def default(cls) -> PolicyConfig:
@@ -56,6 +61,17 @@ class PolicyConfig:
     def settlement_floor(self) -> Money:
         """Most we may discount is 20% off, so the least we may accept is $800."""
         return self.original_balance * (Decimal(1) - self.max_settlement_discount)
+
+    @property
+    def opening_settlement(self) -> Money:
+        """The first settlement figure a consumer hears: $900, not the floor.
+
+        Clamped to the floor so a misconfiguration can only ever ask for *more*
+        than the floor, never authorize a deeper discount than
+        ``max_settlement_discount`` allows.
+        """
+        opening = self.original_balance * (Decimal(1) - self.opening_settlement_discount)
+        return max(opening, self.settlement_floor)
 
     @property
     def max_installments(self) -> int:

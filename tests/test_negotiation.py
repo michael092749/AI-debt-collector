@@ -168,7 +168,10 @@ class TestEngineIntegration:
         s = s.record_refusal().advance_ladder()
         later = build_counter(s, POLICY, capacity=s.signaled_capacity)
         assert later.tier is Tier.SETTLEMENT
-        assert later.total == Money("800.00"), "settlement unlocks the 20% discount"
+        assert later.total == Money("900.00"), (
+            "a settlement discounts, but opens above its floor rather than at it"
+        )
+        assert later.total > POLICY.settlement_floor
 
     def test_a_low_capacity_buys_no_discount_and_no_free_steps(self) -> None:
         """$300 leaves T2 out of reach — two payments cannot cover $1,000 — and

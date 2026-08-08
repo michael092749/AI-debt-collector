@@ -241,8 +241,8 @@ class TestConcessionsAreEarned:
 
     def test_terms_better_than_the_standing_ones_are_taken_at_their_number(self) -> None:
         """The rule is "never take more than we *asked* for", not "never take
-        more than we offered". A consumer who puts up $900 against a standing
-        $800 settlement is handing us $100, and it closes at $900."""
+        more than we offered". A consumer who puts up $950 against a standing
+        $900 settlement is handing us $50, and it closes at $950."""
         context = ToolContext.opening(POLICY)
         context = execute(ToolCall(name="propose_offer"), context).context
         context = _rule_on_something(context)
@@ -253,19 +253,19 @@ class TestConcessionsAreEarned:
         standing = context.standing_offer
         assert standing is not None
         assert standing.tier is Tier.SETTLEMENT
-        assert standing.total == Money("800.00")
+        assert standing.total == Money("900.00")
 
         result = execute(
             ToolCall(
                 name="validate_consumer_offer",
-                arguments={"total": "900", "payment_count": 2, "cadence": "monthly"},
+                arguments={"total": "950", "payment_count": 2, "cadence": "monthly"},
             ),
             context,
         )
 
         assert result.payload["outcome"] == "accept"
         assert result.offer is not None
-        assert result.offer.total == Money("900.00"), "gave back $100 they had offered"
+        assert result.offer.total == Money("950.00"), "gave back $50 they had offered"
 
     def test_the_ladder_is_walked_before_the_worst_outcome_is_reached(self) -> None:
         """The whole negotiation, at the tool layer, for the consumer who can

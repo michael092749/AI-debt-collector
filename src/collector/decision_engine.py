@@ -401,9 +401,25 @@ def effective_capacity(proposal: ConsumerProposal, state: NegotiationState) -> M
 # -- counter construction --------------------------------------------------
 
 
-def _tier_total(tier: Tier, policy: PolicyConfig) -> Money:
-    """Settlements are the only tier that discounts (A3)."""
-    return policy.settlement_floor if tier is Tier.SETTLEMENT else policy.original_balance
+def _tier_total(tier: Tier, policy: PolicyConfig, state: NegotiationState) -> Money:
+    """Settlements are the only tier that discounts (A3), and they open above
+    their floor.
+
+    Returning ``settlement_floor`` here meant the first settlement a consumer
+    ever heard *was* the maximum authorized discount: nothing left to concede
+    inside the tier, and the number we least wanted to disclose was the first
+    one we said. The tier opens at ``opening_settlement`` and reaches its floor
+    only once a settlement has been put up and not taken.
+
+    Derived from the rounds already on record rather than a counter of its own,
+    so it cannot drift out of step with what the consumer was actually offered.
+    """
+    if tier is not Tier.SETTLEMENT:
+        return policy.original_balance
+    settlement_refused = any(
+        r.counter is not None and r.counter.tier is Tier.SETTLEMENT for r in state.rounds
+    )
+    return policy.settlement_floor if settlement_refused else policy.opening_settlement
 
 
 def select_tier(state: NegotiationState, policy: PolicyConfig, capacity: Money | None) -> Tier:
@@ -482,7 +498,7 @@ def build_counter(
     """
     capacity = capacity if capacity is not None else state.signaled_capacity
     tier = tier if tier is not None else select_tier(state, policy, capacity)
-    total = _tier_total(tier, policy)
+    total = _tier_total(tier, policy, state)
     amounts: tuple[Money, ...]
 
     if tier is Tier.DOWNPAYMENT_PLUS_ONE:

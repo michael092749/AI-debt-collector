@@ -557,8 +557,15 @@ class TestSettlement:
         """
         from collector.decision_engine import build_counter
 
+        # At the floor specifically, which is where the $250 rule bites: an
+        # even split of the $900 opening settlement clears it without trying.
+        # A settlement already put up and not taken is what lowers the tier to
+        # its floor (``_tier_total``).
+        opening = build_counter(fresh, policy, tier=Tier.SETTLEMENT)
+        at_the_floor = fresh.record_round(None, opening, "PREFERRED_TIER_AVAILABLE")
+
         offer = build_counter(
-            fresh, policy, tier=Tier.SETTLEMENT, capacity=Money("300"), payments=3
+            at_the_floor, policy, tier=Tier.SETTLEMENT, capacity=Money("300"), payments=3
         )
         amounts = [i.amount for i in offer.installments]
         assert len(amounts) == 3
@@ -732,3 +739,66 @@ class TestALegalProposalIsNeverCounteredBelowItself:
         verdict = validate_offer(_propose("700", 1), state, policy)
 
         assert verdict.outcome != "accept"
+
+
+class TestSettlementOpensAboveItsFloor:
+    """The most we may ever give up must cost more than one refusal.
+
+    ``_tier_total`` returned ``settlement_floor`` for the settlement tier, so
+    the first settlement a consumer ever heard *was* the maximum authorized
+    discount. There was nothing left to concede inside the tier, and the number
+    we least wanted to disclose was the first one we said.
+
+    The floor is unchanged as a floor: ``max_settlement_discount`` still caps
+    every offer. What changes is where the tier opens.
+    """
+
+    def test_the_first_settlement_is_above_the_floor(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        from collector.decision_engine import build_counter
+
+        offer = build_counter(fresh.conceded_to(Tier.SETTLEMENT), policy)
+
+        assert offer.tier is Tier.SETTLEMENT
+        assert offer.total > policy.settlement_floor
+        assert offer.total <= policy.original_balance
+
+    def test_the_floor_is_still_reachable_as_a_later_concession(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """A consumer who refuses the opening settlement can still be met at
+        the floor — otherwise this trades one dead rung for another."""
+        from collector.decision_engine import build_counter
+
+        state = fresh.conceded_to(Tier.SETTLEMENT)
+        opening = build_counter(state, policy)
+        refused = state.record_round(None, opening, "PREFERRED_TIER_AVAILABLE")
+
+        assert build_counter(refused, policy).total == policy.settlement_floor
+
+    def test_no_settlement_ever_discounts_past_the_policy_ceiling(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        from collector.decision_engine import build_counter
+
+        state = fresh.conceded_to(Tier.SETTLEMENT)
+        for _ in range(6):
+            offer = build_counter(state, policy)
+            assert offer.total >= policy.settlement_floor, (
+                f"discounted past the ceiling: {offer.total}"
+            )
+            state = state.record_round(None, offer, "PREFERRED_TIER_AVAILABLE")
+
+    def test_the_in_tier_step_reads_as_a_concession(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """Otherwise the tool layer reports no movement and the step is wasted."""
+        from collector.decision_engine import build_counter
+        from collector.tools import _is_concession
+
+        state = fresh.conceded_to(Tier.SETTLEMENT)
+        opening = build_counter(state, policy)
+        refused = state.record_round(None, opening, "PREFERRED_TIER_AVAILABLE")
+
+        assert _is_concession(build_counter(refused, policy), opening)
