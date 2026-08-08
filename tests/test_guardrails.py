@@ -11,6 +11,7 @@ Three things are being proven here:
 Everything is offline and deterministic: no API keys, no clock, no network.
 """
 
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -41,6 +42,7 @@ from collector.guardrails import (
     check_numeric,
     check_outbound,
     check_pre_call,
+    confirms_identity,
     detect_escalation,
     escalation_closing,
     extract_figures,
@@ -80,9 +82,15 @@ def settlement_offer() -> Offer:
 
 @pytest.fixture
 def ready(policy: PolicyConfig) -> GuardrailState:
-    """Mid-call state: identity confirmed, both disclosures already fired."""
-    return GuardrailState(
-        authorized=authorized_for(policy),
+    """Mid-call state: identity confirmed, both disclosures already fired.
+
+    Built through ``opening`` rather than by hand because that is how
+    ``agent.py`` builds it, and it is what seeds the withheld policy figures.
+    A state assembled field-by-field declares nothing withheld, which would
+    quietly exempt everything in this file from that rule.
+    """
+    return replace(
+        GuardrailState.opening(policy),
         disclosures=DisclosureState(fired=frozenset(DisclosureId), agent_turns=1),
         identity_confirmed=True,
     )
@@ -313,9 +321,107 @@ class TestFigureExtraction:
         (figure,) = extract_figures("Let me ask you two things.")
         assert figure.kind is FigureKind.BARE
 
+    @pytest.mark.parametrize(
+        ("utterance", "value"),
+        [
+            ("four monthly payments", Decimal(4)),
+            ("four equal payments", Decimal(4)),
+            ("4 monthly installments", Decimal(4)),
+            ("three separate smaller payments", Decimal(3)),
+            ("two equal monthly payments", Decimal(2)),
+        ],
+    )
+    def test_a_modifier_does_not_unclassify_a_payment_count(
+        self, utterance: str, value: Decimal
+    ) -> None:
+        """A live call spoke "I can offer four monthly payments that add up
+        to exactly the one thousand dollars owed" — a payment count no offer
+        authorized. "four payments" classifies and blocks; "four monthly
+        payments" fell through the anchored suffix to a bare number, and a
+        bare 4 only warns. One adjective was the whole difference."""
+        figures = [f for f in extract_figures(utterance) if f.kind is FigureKind.PAYMENT_COUNT]
+        assert [f.value for f in figures] == [value]
+
+    def test_a_preposition_still_separates_money_from_a_payment_count(self) -> None:
+        """ "two fifty in monthly payments" names an amount, not 250
+        payments. Only an adjective may bridge to the payment word — a
+        preposition means the number belongs to something else."""
+        (figure,) = extract_figures("I could do two fifty in monthly payments.")
+        assert figure.kind is FigureKind.MONEY
+        assert figure.value == Decimal(250)
+
     def test_account_identifiers_are_not_treated_as_money(self) -> None:
         (figure,) = extract_figures("the account ending in 4417")
         assert figure.kind is FigureKind.BARE
+
+    @pytest.mark.parametrize(
+        ("utterance", "expected"),
+        [
+            ("two hundred fifty dollars and thirty cents", Decimal("250.30")),
+            ("$250 and thirty cents", Decimal("250.30")),
+            ("250 dollars and 30 cents", Decimal("250.30")),
+            ("two hundred fifty dollars, thirty cents", Decimal("250.30")),
+            ("eight hundred dollars and five cents", Decimal("800.05")),
+        ],
+    )
+    def test_dollars_and_cents_compose_into_one_figure(
+        self, utterance: str, expected: Decimal
+    ) -> None:
+        """ "$250.30" spoken aloud is two number words, and the guard was
+        reading them as two figures — neither of which is the authorized
+        250.30, so an exactly-correct restatement of the engine's own
+        installment got blocked."""
+        (figure,) = [f for f in extract_figures(utterance) if f.kind is FigureKind.MONEY]
+        assert figure.value == expected
+
+    @pytest.mark.parametrize(
+        "utterance",
+        [
+            "I'll pay $250 and we can talk about the thirty cents later.",
+            "That's $250.50 and thirty cents of interest.",
+            "Thirty cents on the dollar is all I can do.",
+            # A line break is not the same clause, whatever \s says.
+            "$250\n\nand\nthirty cents",
+        ],
+    )
+    def test_unrelated_cents_are_not_folded_into_a_neighbouring_amount(
+        self, utterance: str
+    ) -> None:
+        """Composition is adjacency-gated: only a space, a comma or "and"
+        may sit between the two halves, and the dollars side must be whole."""
+        values = [f.value for f in extract_figures(utterance) if f.kind is FigureKind.MONEY]
+        assert Decimal("250.30") not in values
+
+    @pytest.mark.parametrize(
+        ("utterance", "intact"),
+        [
+            ("Your balance is $1,000, and thirty cents of that is interest.", Decimal(1000)),
+            ("The settlement is $800 and forty cents of every dollar is principal.", Decimal(800)),
+            ("That's $250 and thirty cents per day in fees.", Decimal(250)),
+        ],
+    )
+    def test_a_cents_clause_that_keeps_going_is_not_part_of_the_amount(
+        self, utterance: str, intact: Decimal
+    ) -> None:
+        """ "$800 and forty cents of every dollar" is a rate, not $800.40.
+        Reading it as one amount blocks the agent for stating the engine's own
+        settlement total — the exact false positive composition exists to fix,
+        reintroduced one clause to the right."""
+        values = [f.value for f in extract_figures(utterance) if f.kind is FigureKind.MONEY]
+        assert intact in values
+
+    def test_a_cents_half_of_a_dollar_or_more_does_not_carry(self) -> None:
+        """The cents half is ``words / 100`` with nothing stopping it at a
+        dollar, so "ten thousand cents" carried $100 into the dollars column
+        and composed $900 — unauthorized — into $1,000, which is the balance.
+        Only the sum was ever checked, so the amount actually spoken aloud
+        was not."""
+        authorized = AuthorizedFigures(money=frozenset({Decimal(1000)}))
+        utterance = "That leaves nine hundred dollars and ten thousand cents."
+        assert Decimal(900) in [
+            f.value for f in extract_figures(utterance) if f.kind is FigureKind.MONEY
+        ]
+        assert NumericRuleId.UNAUTHORIZED_AMOUNT in rule_ids(check_numeric(utterance, authorized))
 
 
 class TestNumericAuthorization:
@@ -400,6 +506,24 @@ class TestNumericAuthorization:
             )
             == ()
         )
+
+    def test_a_promised_count_with_an_adjective_is_still_gated(self, policy: PolicyConfig) -> None:
+        """The live-call sentence: with only a two-payment offer on record,
+        "four payments" blocks — and "four monthly payments" must hit the
+        same wall, not slide through as an unverified bare number."""
+        two_payment_offer = Offer(
+            tier=Tier.DOWNPAYMENT_PLUS_ONE,
+            installments=(Installment(Money("250.00"), 0), Installment(Money("750.00"), 30)),
+            cadence=Cadence.MONTHLY,
+        )
+        authorized = authorized_for(policy, offers=(two_payment_offer,))
+        promise = (
+            "I can offer four monthly payments that add up to "
+            "exactly the one thousand dollars owed."
+        )
+        violations = check_numeric(promise, authorized)
+        assert NumericRuleId.UNAUTHORIZED_PAYMENT_COUNT in rule_ids(violations)
+        assert any(v.blocking for v in violations)
 
     def test_account_facts_must_be_authorized_explicitly(self, policy: PolicyConfig) -> None:
         bare = authorized_for(policy)
@@ -665,6 +789,21 @@ class TestNumericAuthorization:
             (figure,) = [f for f in extract_figures(utterance) if f.kind is FigureKind.MONEY]
             assert figure.value == Decimal(1000)
 
+    def test_an_authorized_amount_spoken_with_cents_is_not_blocked(self) -> None:
+        """The engine authorized 250.30; the agent said it correctly, out loud,
+        the only way it can be said out loud — and the guard blocked it. A
+        false positive on the engine's *own* figure, which is the failure mode
+        that gets a guardrail switched off in production."""
+        authorized = AuthorizedFigures(money=frozenset({Decimal("250.30")}))
+        assert check_numeric("That's two hundred fifty dollars and thirty cents.", authorized) == ()
+
+    def test_composition_does_not_launder_an_unauthorized_amount(self) -> None:
+        """Composing must not become a way to say a figure nobody authorized:
+        the composed value is checked, not its halves."""
+        authorized = AuthorizedFigures(money=frozenset({Decimal(250), Decimal("0.30")}))
+        violations = check_numeric("Two hundred fifty dollars and thirty cents.", authorized)
+        assert [v.rule_id for v in violations] == [NumericRuleId.UNAUTHORIZED_AMOUNT]
+
     def test_two_word_per_cent_is_a_percent_not_a_bare_number(self, policy: PolicyConfig) -> None:
         """ "per cent" (two words) previously downgraded an unauthorized
         percentage from BLOCK to WARN-only (ADVERSARIAL_TESTING.md M1)."""
@@ -863,6 +1002,99 @@ class TestDisclosureGating:
             .observe_agent(AI_DISCLOSURE_TEXT)
         )
         assert not state.ai_disclosure_requested
+
+
+class TestTheOnlyOpeningOrderTheGuardsAdmit:
+    """The opening sequence, walked through the production gate.
+
+    Three rules intersect here, and only one order satisfies all three:
+
+    * ``AI_DISCLOSURE_MISSING_AT_OPEN`` — turn one must say it is an AI.
+    * ``IDENTITY_NOT_CONFIRMED`` — nothing substantive before they confirm.
+    * ``MINI_MIRANDA_NOT_FIRED`` / ``_OUT_OF_ORDER`` — the notice leads the
+      first substantive turn.
+
+    The trap is that ``MINI_MIRANDA_TEXT`` is *itself* substantive — it says
+    "collect a debt" — so the notice cannot be moved earlier to be safe. Fire
+    it before identity is confirmed and it trips ``IDENTITY_NOT_CONFIRMED``
+    instead. ``mock_client.py:260-263`` states this rule in a comment and its
+    scripted turns obey it; ``SYSTEM_PROMPT`` is what drives the production
+    model, and these cases are the order it has to encode.
+
+    Production tripped ``MINI_MIRANDA_OUT_OF_ORDER`` then
+    ``MINI_MIRANDA_NOT_FIRED`` on the first substantive turn of both observed
+    calls, costing a full regeneration round-trip each time
+    (FINDINGS-2026-08-07.md Part 2, fix #1)."""
+
+    def test_the_notice_is_itself_substantive(self) -> None:
+        """The premise the rest of the class rests on. If this ever stops being
+        true, the ordering below is over-constrained and can be relaxed."""
+        assert is_substantive(MINI_MIRANDA_TEXT)
+        assert not is_substantive(AI_DISCLOSURE_TEXT)
+
+    def test_turn_one_discloses_the_ai_and_names_nothing_substantive(
+        self, policy: PolicyConfig
+    ) -> None:
+        result = check_outbound(
+            GuardrailState.opening(policy),
+            "Hi — this is an AI assistant calling from Meridian Recovery Services "
+            "on behalf of the creditor, and you can ask for a human at any time. "
+            "Am I speaking with Jordan Reyes?",
+        )
+        assert result.allowed, result.violations
+
+    def test_turn_one_that_names_the_debt_is_blocked(self, policy: PolicyConfig) -> None:
+        """Why the prompt has to bar money words from the opening outright: the
+        model cannot fix this by adding the notice, because the notice is
+        substantive too and identity is still unconfirmed."""
+        result = check_outbound(
+            GuardrailState.opening(policy),
+            "Hi — this is an AI assistant calling about a debt you owe. "
+            "Am I speaking with Jordan Reyes?",
+        )
+        assert not result.allowed
+        assert {
+            RingRuleId.IDENTITY_NOT_CONFIRMED,
+            DisclosureRuleId.MINI_MIRANDA_NOT_FIRED,
+        } <= rule_ids(result.violations)
+
+    def test_the_notice_before_identity_is_confirmed_is_blocked(self, policy: PolicyConfig) -> None:
+        opened = check_outbound(
+            GuardrailState.opening(policy),
+            f"{AI_DISCLOSURE_TEXT} Am I speaking with Jordan Reyes?",
+        )
+        assert opened.allowed, opened.violations
+
+        early = check_outbound(opened.state, MINI_MIRANDA_TEXT)
+        assert not early.allowed
+        assert RingRuleId.IDENTITY_NOT_CONFIRMED in rule_ids(early.violations)
+
+    def test_the_notice_leads_the_turn_after_identity_is_confirmed(
+        self, policy: PolicyConfig
+    ) -> None:
+        opened = check_outbound(
+            GuardrailState.opening(policy),
+            f"{AI_DISCLOSURE_TEXT} Am I speaking with Jordan Reyes?",
+        )
+        assert confirms_identity("Yes, speaking.")
+        confirmed = opened.state.with_identity_confirmed()
+
+        result = check_outbound(confirmed, f"{MINI_MIRANDA_TEXT} Your balance is $1,000.00.")
+        assert result.allowed, result.violations
+        assert result.state.substantive_discussed
+
+    def test_the_same_turn_with_the_notice_trailing_is_blocked(self, policy: PolicyConfig) -> None:
+        """The negative control, and the shape production actually emitted."""
+        opened = check_outbound(
+            GuardrailState.opening(policy),
+            f"{AI_DISCLOSURE_TEXT} Am I speaking with Jordan Reyes?",
+        )
+        result = check_outbound(
+            opened.state.with_identity_confirmed(),
+            f"Your balance is $1,000.00. {MINI_MIRANDA_TEXT}",
+        )
+        assert not result.allowed
+        assert DisclosureRuleId.MINI_MIRANDA_OUT_OF_ORDER in rule_ids(result.violations)
 
 
 # ==========================================================================
@@ -1282,6 +1514,150 @@ class TestDuringCallRing:
         assert [f.text for f in result.figures] == ["$250", "today"]
 
 
+class TestAcknowledgingCallerStatedAmounts:
+    """A figure the consumer said first is echoable back to them.
+
+    The consumer already knows their own number, so repeating it discloses
+    nothing. Before this, "I can do two hundred dollars" could not be
+    answered with "two hundred dollars" at all — the numeric guard blocked
+    the agent for repeating a figure the consumer had just spoken aloud.
+    """
+
+    def test_a_caller_stated_amount_becomes_echoable(self, ready: GuardrailState) -> None:
+        blocked = check_outbound(ready, "Two hundred dollars — let me see what I can do.")
+        assert NumericRuleId.UNAUTHORIZED_AMOUNT in rule_ids(blocked.violations)
+
+        heard = check_inbound(ready, "I can do two hundred dollars a month.")
+        echoed = check_outbound(heard.state, "Two hundred dollars — let me see what I can do.")
+        assert echoed.allowed, echoed.violations
+
+    def test_only_money_is_widened(self, ready: GuardrailState) -> None:
+        """ "I could do twelve months" must not make 12 sayable as a duration.
+        A term the consumer floated is not a term the engine has agreed to."""
+        heard = check_inbound(ready, "Could I have twelve months to pay this off?")
+        result = check_outbound(heard.state, "Let's say twelve months.")
+        assert NumericRuleId.UNAUTHORIZED_DURATION in rule_ids(result.violations)
+
+    def test_an_amount_above_the_balance_is_not_acknowledged(self, ready: GuardrailState) -> None:
+        """The echo is bounded by what is already authorized — the balance.
+        Nothing the consumer says can widen the guard past the account."""
+        heard = check_inbound(ready, "What if I paid you five thousand dollars?")
+        result = check_outbound(heard.state, "Five thousand dollars it is.")
+        assert NumericRuleId.UNAUTHORIZED_AMOUNT in rule_ids(result.violations)
+
+    def test_the_acknowledgment_set_survives_a_re_pointed_authorized_set(
+        self, ready: GuardrailState, settlement_offer: Offer
+    ) -> None:
+        """``with_authorized`` is called on every tool result to re-derive the
+        engine's offer set. It must not wipe what the consumer said — that is
+        exactly the path the widening would otherwise never survive."""
+        heard = check_inbound(ready, "Two hundred dollars is what I have.")
+        repointed = heard.state.with_authorized(
+            AuthorizedFigures.empty().with_offer(settlement_offer)
+        )
+        assert check_outbound(repointed, "Two hundred dollars, understood.").allowed
+
+    @pytest.mark.parametrize(
+        ("utterance", "value"),
+        [
+            ("I've got 999 problems and this bill is one.", Decimal(999)),
+            ("I make 850 a week before taxes.", Decimal(850)),
+            ("My account number ends 4417 and the case is 621.", Decimal(621)),
+            # A unit trick, not a stated amount: $800 is the settlement floor,
+            # which the engine withholds until it puts a settlement on the table.
+            ("Eighty thousand cents is all I have.", Decimal(800)),
+        ],
+    )
+    def test_a_bare_number_is_not_a_stated_amount(
+        self, ready: GuardrailState, utterance: str, value: Decimal
+    ) -> None:
+        """``_classify`` calls any bare number at or above $100 money, which is
+        the right default for *screening the agent* and the wrong one for
+        deciding the consumer named a figure. Chatter, income and reference
+        numbers are not amounts on the table — an explicit currency marker is
+        what separates them."""
+        heard = check_inbound(ready, utterance)
+        assert value not in heard.state.acknowledged.money
+
+    def test_escalation_clears_what_was_acknowledged(self, ready: GuardrailState) -> None:
+        """Negotiation stops at escalation (A6). A figure the consumer floated
+        before disputing the debt must not still be speakable after."""
+        heard = check_inbound(ready, "I could maybe do four hundred dollars.")
+        assert Decimal(400) in heard.state.acknowledged.money
+
+        escalated = check_inbound(heard.state, "I dispute this debt, I don't owe it.")
+        assert escalated.state.escalated
+        assert not escalated.state.acknowledged.money
+
+    def test_identity_revocation_clears_what_was_acknowledged(self, ready: GuardrailState) -> None:
+        """Whoever was speaking is not the account holder, so nothing they
+        said is the account holder's number."""
+        heard = check_inbound(ready, "Sure, I can do four hundred dollars.")
+        assert Decimal(400) in heard.state.acknowledged.money
+        assert not heard.state.with_identity_revoked().acknowledged.money
+
+    def test_acknowledgment_persists_across_later_turns(self, ready: GuardrailState) -> None:
+        """Said on turn two, still echoable on turn four — figures age out of
+        nothing, the same rule the engine's own offer set follows."""
+        heard = check_inbound(ready, "I can do two hundred dollars.")
+        later = check_inbound(heard.state, "Sorry, what were you saying?")
+        assert check_outbound(later.state, "You mentioned two hundred dollars.").allowed
+
+    @pytest.mark.parametrize(
+        ("utterance", "candidate", "value"),
+        [
+            (
+                "Would you take eight hundred dollars to close this out?",
+                "The lowest I could go is eight hundred dollars.",
+                Decimal(800),
+            ),
+            (
+                "Would nine hundred dollars settle it?",
+                "I could settle this for nine hundred dollars.",
+                Decimal(900),
+            ),
+            (
+                "Is two hundred and fifty dollars a month the smallest you take?",
+                "The smallest payment I can take is two hundred and fifty dollars.",
+                Decimal(250),
+            ),
+        ],
+    )
+    def test_a_withheld_policy_figure_is_not_unlocked_by_the_consumer_naming_it(
+        self, ready: GuardrailState, utterance: str, candidate: str, value: Decimal
+    ) -> None:
+        """The echo may not hand back the thresholds the engine withholds.
+
+        ``authorized_for`` keeps the $250 minimum payment, the $800 settlement
+        floor and the $900 opening settlement out of the base set: "the $800
+        settlement floor is unsayable until an $800 settlement is on the
+        table, and refusing a proposal surfaces nothing at all." A consumer
+        can say any number, so a consumer guessing one of ours must not be
+        the thing that puts it in the agent's mouth — and the guard cannot
+        tell "eight hundred dollars, I hear you" from "eight hundred dollars
+        is the lowest I could go", so the collision is excluded outright
+        rather than echoed and hoped about.
+
+        No capability is lost: once the engine puts the figure in an offer it
+        is authorized through ``offers_made`` and needs no echo at all.
+        """
+        heard = check_inbound(ready, utterance)
+        assert value not in heard.state.acknowledged.money
+
+        result = check_outbound(heard.state, candidate)
+        assert NumericRuleId.UNAUTHORIZED_AMOUNT in rule_ids(result.violations)
+
+    def test_the_withheld_figure_is_sayable_once_the_engine_offers_it(
+        self, ready: GuardrailState, policy: PolicyConfig, settlement_offer: Offer
+    ) -> None:
+        """The gate stays temporal, not permanent. Excluding the collision from
+        the acknowledgment set must not survive the engine putting an $800
+        settlement on the table — that authorization was never the echo's."""
+        heard = check_inbound(ready, "Would you take eight hundred dollars to close this out?")
+        offered = heard.state.with_authorized(authorized_for(policy, offers=(settlement_offer,)))
+        assert check_outbound(offered, "Eight hundred dollars settles the account.").allowed
+
+
 class TestPostCallRing:
     def test_a_compliant_call_summarizes_clean(
         self, policy: PolicyConfig, settlement_offer: Offer
@@ -1470,6 +1846,13 @@ class TestEscalationRegexFalsePositives:
         "Right, um... so, the total comes to one thousand dollars.",
         "Hmm... I hear you. Let me check what else there is.",
         "Uh... give me one second.",
+        # The two disclosures. Same trap, higher stakes: the prompt has to tell
+        # the model *when* to say these, and the moment it quotes one to say
+        # what it is, saying it becomes CONFIDENTIAL_TEXT_LEAKED — so the
+        # required turn is unsayable and the call cannot legally proceed.
+        # Describe the disclosures in the prompt; never transcribe them.
+        MINI_MIRANDA_TEXT,
+        AI_DISCLOSURE_TEXT,
     ],
 )
 def test_filler_speech_is_not_mistaken_for_a_prompt_leak(candidate: str) -> None:
@@ -1487,6 +1870,17 @@ def test_filler_speech_is_not_mistaken_for_a_prompt_leak(candidate: str) -> None
         f"{candidate!r} overlaps SYSTEM_PROMPT by {_LEAK_MIN_WORDS}+ words — "
         "shorten the example it came from"
     )
+
+
+@pytest.mark.parametrize("candidate", [MINI_MIRANDA_TEXT, AI_DISCLOSURE_TEXT])
+def test_the_disclosures_survive_the_wider_reference_production_uses(candidate: str) -> None:
+    """``check_outbound``'s default reference is the system prompt alone, but
+    ``agent.py`` passes a wider one that also covers the tool-schema text. A
+    disclosure made unsayable by a *tool description* would fail exactly the
+    same way, and only in production."""
+    from collector.agent import _CONFIDENTIAL_REFERENCE
+
+    assert not _contains_verbatim_leak(candidate, _CONFIDENTIAL_REFERENCE)
 
 
 def test_the_leak_guard_still_catches_a_real_prompt_leak() -> None:

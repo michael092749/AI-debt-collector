@@ -35,6 +35,7 @@ class DisclosureRuleId(StrEnum):
 
     MINI_MIRANDA_NOT_FIRED = "MINI_MIRANDA_NOT_FIRED"
     MINI_MIRANDA_OUT_OF_ORDER = "MINI_MIRANDA_OUT_OF_ORDER"
+    MINI_MIRANDA_REDUNDANT = "MINI_MIRANDA_REDUNDANT"
     AI_DISCLOSURE_MISSING_AT_OPEN = "AI_DISCLOSURE_MISSING_AT_OPEN"
     AI_DISCLOSURE_REQUEST_IGNORED = "AI_DISCLOSURE_REQUEST_IGNORED"
 
@@ -44,10 +45,17 @@ MINI_MIRANDA_TEXT = (
     "This is an attempt to collect a debt, and any information obtained "
     "will be used for that purpose."
 )
-AI_DISCLOSURE_TEXT = (
-    "Before we go further: I'm an AI assistant calling on behalf of the creditor, "
-    "and you can ask for a human at any time."
-)
+# Split in two so the opening can be one breath. What the rule requires is that
+# the caller says it is not a person, and ``fires_ai_disclosure`` is what tests
+# for that; the offer of a human is a second promise riding along behind it.
+# Carrying both in the opening cost a sentence the consumer had no way to act on.
+AI_DISCLOSURE_TEXT = "I'm an automated assistant calling on behalf of the creditor."
+# Held back until it is relevant — the consumer asks, objects, or sounds
+# confused about what they are talking to. Whenever code speaks the disclosure
+# unprompted, it speaks both: see ``AI_DISCLOSURE_WITH_HUMAN``.
+HUMAN_AVAILABLE_TEXT = "You can ask to speak with a person at any time."
+# The full disclosure, for the paths where the question has actually been asked.
+AI_DISCLOSURE_WITH_HUMAN = f"{AI_DISCLOSURE_TEXT} {HUMAN_AVAILABLE_TEXT}"
 
 _MINI_MIRANDA_ATTEMPT_RE = re.compile(r"attempt\s+to\s+collect\s+a\s+debt", re.IGNORECASE)
 _MINI_MIRANDA_PURPOSE_RE = re.compile(
@@ -281,6 +289,25 @@ class DisclosureState:
                     "the consumer asked whether they are speaking to a human; answer it",
                 )
             )
+
+        # The latch, read on the way *out*. ``may_discuss_debt`` was consumed
+        # only as a permission — the check below complains when the notice is
+        # absent and said nothing when it was redundant — so a second delivery
+        # went to the consumer with the guard's full approval. A live call on
+        # 2026-08-07 said it on two consecutive agent turns for exactly that
+        # reason. Blocking routes the turn through regeneration, which is what
+        # makes this a control rather than a prompt line the model may outweigh.
+        if self.may_discuss_debt:
+            repeat_at = fires_mini_miranda(candidate)
+            if repeat_at is not None:
+                violations.append(
+                    _violation(
+                        DisclosureRuleId.MINI_MIRANDA_REDUNDANT,
+                        candidate,
+                        (repeat_at, len(candidate)),
+                        "the Mini-Miranda is already on record; say it once and do not repeat it",
+                    )
+                )
 
         span = substantive_span(candidate)
         if span is not None and not self.may_discuss_debt:

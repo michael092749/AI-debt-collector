@@ -30,6 +30,7 @@ from collector.decision_engine import (
     effective_capacity,
     validate_offer,
 )
+from collector.guardrails.confirmation import confirmation_line
 from collector.llm.base import ToolCall
 from collector.money import Money
 from collector.negotiation import CallOutcome, NegotiationState
@@ -249,24 +250,41 @@ TOOL_SCHEMAS: tuple[ToolSchema, ...] = (
                 name="total",
                 kind=ParamKind.MONEY,
                 description=(
-                    "Total they offered to pay, as a decimal string, e.g. '500.00'. "
-                    "Omit it when they proposed only a structure and no sum — "
-                    "'weekly for a year' — and the full balance is assumed."
+                    "The one overall sum they offered to pay, as a decimal string, "
+                    "e.g. '850.00'. Only for a sum they named as the whole amount. "
+                    "If they sized the payments instead — 'two payments of five "
+                    "hundred' — pass amount_each and leave this out; never multiply "
+                    "it out yourself. Omit both when they proposed only a structure "
+                    "and no figure — 'weekly for a year' — and the full balance is "
+                    "assumed."
+                ),
+            ),
+            Param(
+                name="amount_each",
+                kind=ParamKind.MONEY,
+                description=(
+                    "What they offered per payment, as a decimal string, when they "
+                    "named the size of each payment rather than an overall sum. "
+                    "Relay their figure verbatim; the engine does the multiplying. "
+                    "Never pass both this and total."
                 ),
             ),
             Param(
                 name="payment_count",
                 kind=ParamKind.COUNT,
-                description="How many payments to split it into. 1 for a lump sum.",
-                required=True,
+                description=(
+                    "How many payments they said to split it into. 1 for a lump "
+                    "sum. Omit when they did not say — a bare figure like 'three "
+                    "hundred dollars' names no count, and inventing one is what "
+                    "turned $150 into a refusal for overpaying."
+                ),
                 minimum=1,
                 maximum=MAX_PROPOSED_PAYMENTS,
             ),
             Param(
                 name="cadence",
                 kind=ParamKind.CADENCE,
-                description="How often they proposed to pay.",
-                required=True,
+                description="How often they proposed to pay, if they said.",
             ),
             Param(
                 name="signaled_capacity",
@@ -374,6 +392,104 @@ def _error(name: str, context: ToolContext, detail: str, **extra: Any) -> ToolRe
     return ToolResult(name=name, payload={"ok": False, "error": detail, **extra}, context=context)
 
 
+def _proposed_cadence(args: JsonDict, payment_count: int) -> Cadence:
+    """The rhythm they named, or the one their shape implies where they named none.
+
+    ``cadence`` is no longer required: a consumer answering "what can you
+    manage?" with "a hundred and fifty dollars" named no rhythm, and a model
+    forced to supply one supplies a guess.
+    """
+    cadence = args.get("cadence")
+    if isinstance(cadence, Cadence):
+        return cadence
+    return Cadence.MONTHLY if payment_count > 1 else Cadence.IMMEDIATE
+
+
+def _schedule_for(each: Money, balance: Money) -> tuple[Money, int]:
+    """The plan a per-payment figure describes: that much at a time until clear.
+
+    The payment count that arrives beside a per-payment figure is the model's,
+    not the consumer's — they said "a hundred and fifty dollars", not "seven
+    payments" — so multiplying the two assembled a total nobody proposed and
+    the engine then ruled on it. $150 x 7 is $1,050, which trips the
+    over-collection ceiling, and the consumer was told their $150 would collect
+    more than they owed (live call, 2026-08-07). Worse, the answer moved with
+    the invented number: one utterance of "$300" produced three rationales and
+    two outcomes depending on the count the model happened to pick.
+
+    Deriving the count from the balance makes the verdict a function of the one
+    figure the consumer actually said. A schedule that overshoots the balance is
+    a plan whose last payment is trimmed, not an illegal proposal, so the total
+    is the balance and never more.
+    """
+    if each.amount <= 0:
+        return each, 1
+    # ceil division in cents; Money is quantized, so these are whole numbers.
+    covered = -(-int(balance.amount * 100) // int(each.amount * 100))
+    return balance, max(1, covered)
+
+
+def _consumer_proposal(args: JsonDict, policy: PolicyConfig) -> ConsumerProposal:
+    """What the consumer proposed, out of whichever way the model relayed it.
+
+    Three channels, in descending order of how directly the consumer authored
+    the number: a total they named, a per-payment figure they named, and
+    nothing at all — in which case the balance stands and only the structure is
+    in question. Only the first is a total the consumer uttered, and only that
+    one may be ruled on as one (``ConsumerProposal.total_stated``).
+
+    A capacity with no sum beside it belongs to the second channel: "I can only
+    do three hundred" sizes the payments, it does not offer $300 for the debt.
+    Read as a total it made the engine accept the full balance today on behalf
+    of a consumer who had just said they could not manage it — an agreement the
+    engine authored, so nothing above the engine could have caught it.
+    """
+    stated_total: Money | None = args.get("total")
+    signaled: Money | None = args.get("signaled_capacity")
+    each: Money | None = args.get("amount_each")
+    if each is None and stated_total is None:
+        each = signaled
+
+    if stated_total is not None:
+        # Membership, not truthiness. "They proposed $0" and "they named no sum
+        # at all" are different negotiation states — the first is a lowball to
+        # rule on, the second means the balance stands — and a falsy-zero would
+        # silently merge them.
+        count: int = args.get("payment_count", 1)
+        return ConsumerProposal(
+            total=stated_total,
+            payment_count=count,
+            cadence=_proposed_cadence(args, count),
+            signaled_capacity=signaled,
+        )
+
+    if each is not None:
+        total, count = _schedule_for(each, policy.original_balance)
+        cadence = _proposed_cadence(args, count)
+        if count > 1 and cadence is Cadence.IMMEDIATE:
+            # They named the rhythm for the lump sum the model assumed. A
+            # multi-payment schedule cannot be immediate: it would fall due in
+            # its entirety today.
+            cadence = Cadence.MONTHLY
+        return ConsumerProposal(
+            total=total,
+            payment_count=count,
+            cadence=cadence,
+            signaled_capacity=signaled,
+            amount_each=each,
+            total_stated=False,
+        )
+
+    count = args.get("payment_count", 1)
+    return ConsumerProposal(
+        total=policy.original_balance,
+        payment_count=count,
+        cadence=_proposed_cadence(args, count),
+        signaled_capacity=signaled,
+        total_stated=False,
+    )
+
+
 def _cadence_arg(args: JsonDict, default: Cadence = Cadence.MONTHLY) -> Cadence:
     """``preferred_cadence`` is a hint, so its absence is not an error.
 
@@ -400,16 +516,19 @@ def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult
             "this call has run its course; close it out with end_call rather than "
             "evaluating another proposal",
         )
-    proposal = ConsumerProposal(
-        # Membership, not truthiness. "They proposed $0" and "they named no sum
-        # at all" are different negotiation states — the first is a lowball to
-        # rule on, the second means the balance stands and only the structure
-        # is in question — and a falsy-zero would silently merge them.
-        total=args.get("total", context.policy.original_balance),
-        payment_count=args["payment_count"],
-        cadence=args["cadence"],
-        signaled_capacity=args.get("signaled_capacity"),
-    )
+    # Two ways to name the money, because that is how it arrives: "eight
+    # fifty all in" is a total, "two payments of five hundred" is a size of
+    # each. The model relays whichever was said verbatim — it is forbidden
+    # arithmetic — so the multiplication happens here. Both at once is a
+    # contradiction to send back, not a guess to make.
+    if "amount_each" in args and "total" in args:
+        return _error(
+            name,
+            context,
+            "total and amount_each together are ambiguous: pass the one figure "
+            "the consumer actually said, and let the engine do the rest",
+        )
+    proposal = _consumer_proposal(args, context.policy)
 
     verdict = validate_offer(proposal, context.state, context.policy)
 
@@ -444,11 +563,29 @@ def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult
     # Whatever they just proposed tells us what they think they can manage, and
     # every later counter and concession is built against that read.
     state = context.state.with_capacity(effective_capacity(proposal, context.state))
-    state = state.record_round(proposal, on_table, verdict.rationale_code)
     if verdict.outcome != "accept":
         # They named terms we cannot meet; that is a refusal of ours in all but
         # wording, and it is what makes a later concession legitimate.
         state = state.record_refusal()
+        # And a refusal has to buy something. Recording one without ever moving
+        # the ladder was the whole of the effect: `advance_ladder` was reachable
+        # only through `concede`, so a consumer could put the same terms up
+        # eight times, be refused eight times, and hear pay-in-full every time —
+        # the tiers below it existed on paper only.
+        #
+        # Held-to terms are the trigger, not any refusal. Someone who repeats an
+        # arrangement we have already answered has heard our counter and said no
+        # to it, which is a refusal in all but wording and earns exactly one step
+        # (A7) — the same reading `_held_to` takes of a repeat in the engine.
+        # A consumer naming *new* terms is still negotiating, and the model's
+        # own `concede` is what answers that; stepping there too would spend two
+        # tiers on one exchange.
+        standing = context.standing_offer
+        if standing is not None and _first_repeat_of(context.state, proposal):
+            state, stepped, moved = _step_down(state, context.policy, standing, proposal.cadence)
+            if moved:
+                on_table = stepped
+    state = state.record_round(proposal, on_table, verdict.rationale_code)
 
     payload: JsonDict = {
         "ok": True,
@@ -458,6 +595,7 @@ def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult
         "conditions": [to_jsonable(c) for c in verdict.conditions],
         "offer_on_the_table": _offer_payload(on_table),
         "you_may_say": _sayable(on_table),
+        "you_must_confirm": _confirmation(on_table),
     }
     return ToolResult(
         name=name,
@@ -486,6 +624,7 @@ def _propose_offer(args: JsonDict, context: ToolContext) -> ToolResult:
             "ok": True,
             "offer_on_the_table": _offer_payload(offer),
             "you_may_say": _sayable(offer),
+            "you_must_confirm": _confirmation(offer),
         },
         context=context._with(state),
         offer=offer,
@@ -555,42 +694,18 @@ def _concede(args: JsonDict, context: ToolContext) -> ToolResult:
             "not, ask them what they can manage before conceding",
             may_concede=True,
         )
-    cadence = _cadence_arg(args)
-
-    # Step until the terms actually improve for the consumer. Two ways a step
-    # can fail to be a concession: the offer comes back identical (capacity had
-    # already pushed the engine past that tier), or it comes back *worse* — the
-    # tier order runs settlement before payment plan, so descending from an
-    # $800 settlement to a full-balance plan raises the ask. Neither is
-    # something to present as giving ground.
     standing = context.standing_offer
-    stepped = context.state.advance_ladder()
-    offer = build_counter(stepped, context.policy, preferred_cadence=cadence)
-    while (
-        not _is_concession(offer, standing)
-        and stepped.can_concede
-        and stepped.ladder_floor is not _LAST_TIER
-    ):
-        stepped = stepped.advance_ladder()
-        offer = build_counter(stepped, context.policy, preferred_cadence=cadence)
-
-    moved = _is_concession(offer, standing)
+    state, offer, moved = _step_down(context.state, context.policy, standing, _cadence_arg(args))
     # Nothing better was available, so the offer on the table is the one that
     # was already there. Reporting the candidate instead would have the agent
     # read back terms it is not authorized to agree to — and confirm_agreement
     # would then close on the standing offer, not the one just described.
     on_table = offer if moved else standing
-    # When the step wasn't a concession, ``stepped`` still carries a spent
-    # refusal and a moved ladder floor from advance_ladder() — committing it
-    # anyway would consume the consumer's refusal for zero benefit. Keep the
-    # pristine input state instead, so the refusal is still on record for a
-    # concession that actually helps them (ADVERSARIAL_TESTING.md L1). The
-    # round itself must still be recorded either way: a non-concession is
+    # The round is recorded whether or not the ladder moved: a non-concession is
     # still an exchange, and once the ladder is bottomed out every further
-    # refusal would otherwise never advance the round count, leaving the
-    # round cap unreachable and the call unable to close (badgering with no
-    # backstop).
-    state = (stepped if moved else context.state).record_round(None, on_table, None)
+    # refusal would otherwise never advance the round count, leaving the round
+    # cap unreachable and the call unable to close (badgering with no backstop).
+    state = state.record_round(None, on_table, None)
     return ToolResult(
         name=name,
         payload={
@@ -598,6 +713,7 @@ def _concede(args: JsonDict, context: ToolContext) -> ToolResult:
             "moved": moved,
             "offer_on_the_table": _offer_payload(on_table),
             "you_may_say": _sayable(on_table),
+            "you_must_confirm": _confirmation(on_table),
         },
         context=context._with(state),
         offer=on_table,
@@ -608,17 +724,95 @@ def _concede(args: JsonDict, context: ToolContext) -> ToolResult:
 _LAST_TIER = Tier.PAYMENT_PLAN
 
 
+def _first_repeat_of(state: NegotiationState, proposal: ConsumerProposal) -> bool:
+    """Are these exact terms being put to us again, for the first time?
+
+    Rounds are recorded *after* this is consulted, so the count is of earlier
+    utterances only: nothing on a first hearing, one on the first repeat, more
+    after that.
+
+    Answering every repeat alike is what made the ladder a free elevator. A
+    consumer who says "a hundred dollars" four times was walked from pay-in-full
+    to the bottom of the ladder without ever moving, and the settlement floor --
+    the most we are authorized to discount -- was spoken on the third utterance
+    of the same number.
+
+    One repeat still buys its step: they heard the counter and said no to it,
+    which is a refusal in all but wording and earns exactly one (A7). The second
+    identical repeat says nothing the first did not, and a concession ladder
+    that steps per turn rather than per counterparty move is the standard shape
+    a held position is designed to exploit. Refusals still accumulate either
+    way, so ``concede`` still has something to spend when the model judges the
+    negotiation has genuinely moved.
+    """
+    return sum(1 for r in state.rounds if r.proposal == proposal) == 1
+
+
+def _step_down(
+    state: NegotiationState,
+    policy: PolicyConfig,
+    standing: Offer | None,
+    cadence: Cadence,
+) -> tuple[NegotiationState, Offer, bool]:
+    """Walk the ladder down until the terms actually improve for the consumer.
+
+    Shared by ``concede`` and by the refusal recorded inside
+    ``validate_consumer_offer``, so both inherit the same two safeguards rather
+    than one of them getting a second, subtly different ladder walk.
+
+    Two ways a step can fail to be a concession: the offer comes back identical
+    (capacity had already pushed the engine past that tier), or it comes back
+    worse. The loop steps past both while there is ladder left.
+
+    When no step improved on what was already up, the *input* state is returned.
+    ``advance_ladder`` spends a refusal and moves the floor, and committing that
+    would consume the consumer's refusal for zero benefit; kept pristine, it is
+    still on record for a concession that actually helps them
+    (ADVERSARIAL_TESTING.md L1).
+    """
+    stepped = state.advance_ladder()
+    offer = build_counter(stepped, policy, preferred_cadence=cadence)
+    while (
+        not _is_concession(offer, standing)
+        and stepped.can_concede
+        and stepped.ladder_floor is not _LAST_TIER
+    ):
+        stepped = stepped.advance_ladder()
+        offer = build_counter(stepped, policy, preferred_cadence=cadence)
+
+    moved = _is_concession(offer, standing)
+    return (stepped if moved else state), offer, moved
+
+
 def _is_concession(offer: Offer, standing: Offer | None) -> bool:
     """Is ``offer`` genuinely easier for the consumer than what they refused?
 
-    Easier means less money, or the same money in smaller pieces. Anything else
-    is a lateral move at best, and the consumer hears it as one.
+    On the same rung, easier means less money, or the same money in smaller
+    pieces.
+
+    Across rungs the raw total is the wrong measure, and comparing it was why
+    the bottom of the ladder was dead code: a settlement is $800 and a payment
+    plan is the full $1,000, so stepping from one to the other never read as
+    giving ground and ``concede`` returned ``moved: False`` for ever. But the
+    brief ranks a payment plan *below* a settlement precisely because it costs
+    more and is still worth holding back — it is easier to fund, in smaller
+    pieces and over more time. So a step down the preference order is the
+    concession, provided it lands somewhere genuinely easier: less to produce at
+    one time, or less money overall.
+
+    Kept honest at the edges. A step that improves neither is lateral or worse
+    and reports no movement, and a step back *up* the order is never a
+    concession however cheap it looks (A4).
     """
     if standing is None:
         return True
-    if offer.total != standing.total:
-        return offer.total < standing.total
-    return offer.smallest_payment < standing.smallest_payment
+    if offer.tier is standing.tier:
+        if offer.total != standing.total:
+            return offer.total < standing.total
+        return offer.smallest_payment < standing.smallest_payment
+    if offer.tier < standing.tier:
+        return False
+    return offer.largest_payment < standing.largest_payment or offer.total < standing.total
 
 
 def _confirm_agreement(args: JsonDict, context: ToolContext) -> ToolResult:
@@ -643,6 +837,12 @@ def _confirm_agreement(args: JsonDict, context: ToolContext) -> ToolResult:
                     "you_may_say": _sayable(agreed),
                 },
                 context=context,
+                # The terms being closed on, carried so the ruling that
+                # authorized them reaches the `decisions` table. Without it the
+                # agent loop's `result.proposal is not None` gate drops the
+                # write, and a call that *agreed* could leave `decisions`
+                # empty — the one query an auditor is most likely to run.
+                proposal=_as_proposal(agreed),
                 verdict=verdict,
                 offer=agreed,
                 agreed_offer=agreed,
@@ -683,6 +883,9 @@ def _confirm_agreement(args: JsonDict, context: ToolContext) -> ToolResult:
             "you_may_say": _sayable(offer),
         },
         context=context._with(state),
+        # See the replay branch above: the agreed terms are the proposal the
+        # engine just ruled on, and the decision record is the deliverable.
+        proposal=_as_proposal(offer),
         verdict=verdict,
         offer=offer,
         agreed_offer=offer,
@@ -759,6 +962,10 @@ def _offer_payload(offer: Offer | None) -> JsonDict | None:
         return None
     return {
         "tier": offer.tier.label,
+        # The only name for this arrangement the agent may say out loud. The
+        # label above is an internal identifier and is not sayable; handed only
+        # that, the model invented a name and picked another tier's.
+        "call_it": offer.tier.spoken_name,
         "total": str(offer.total.amount),
         "payment_count": offer.payment_count,
         "cadence": offer.cadence.value,
@@ -768,6 +975,17 @@ def _offer_payload(offer: Offer | None) -> JsonDict | None:
         ],
         "duration_days": offer.duration_days,
     }
+
+
+def _confirmation(offer: Offer | None) -> str | None:
+    """The line that has to be said before these terms can be agreed to.
+
+    Handed over with the offer rather than only at the point of refusal, so the
+    model reads it while it is deciding what to say — the gate in ``agent.py``
+    is then a backstop for the turn that skipped it, not the first the model
+    hears of the requirement.
+    """
+    return None if offer is None else confirmation_line(offer)
 
 
 def _sayable(offer: Offer | None) -> list[str]:

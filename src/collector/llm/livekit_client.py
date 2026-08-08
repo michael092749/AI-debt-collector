@@ -14,8 +14,8 @@ the OpenRouter route:
    mid-negotiation because a token aged out would be indistinguishable to the
    consumer from the agent hanging up.
 2. **No reasoning/thinking parameter is sent.** `reasoning_effort` maps to
-   thinking budgets of 1024 tokens and up on this gateway. `NegotiationAgent.turn()`
-   can stack up to seven sequential round trips into one spoken reply, so the
+   thinking budgets of 1024 tokens and up on this gateway. One spoken reply can
+   stack five sequential round trips (`stream_turn`) or seven (`turn`), so the
    right budget on a phone call is none, not a small one.
 3. **Zero data retention by default.** Prompts and outputs pass through the
    gateway without being logged, stored, or trained on. That matters here for
@@ -24,113 +24,43 @@ the OpenRouter route:
    the consumer said.
 
 The gateway is reached over plain HTTP rather than through the SDK's
-`inference.LLM` deliberately: that class is async, and `NegotiationAgent.turn()`
-is synchronous and already dispatched to a worker thread by `voice_app.py`.
+`inference.LLM` deliberately: that class is async, and the turn loop is
+synchronous — `voice_app.py` already drives it from a worker thread.
 Going through the raw endpoint also keeps `text_app.py` — which has no LiveKit
 job context and no event loop — able to use this route unchanged.
 
-The model is Gemini 3.6 Flash — the newest full Flash on the gateway, and GA
-rather than `-preview`. ("Gemini 3.1 Flash", asked for originally, does not
-exist there: 3.1 ships only as `flash-lite` and `pro-preview`.)
-
-⚠️ **This route is now the default, and it is still uncertified.** It has not
-been run against `tests/evals/` or the adversarial pass. `MAX_TOOL_ROUNDS` and
-the strike budget were tuned against Claude, and the outbound guard already
-trips on roughly three turns in eight *with* the model they were tuned for.
-That was an acceptable footnote while this was opt-in; as the default it is a
-shipped risk carried by every live call, and the per-call usage recorded below
-is what makes it observable rather than merely hoped about.
+Model default is Gemini 3 Flash, which is `-preview` on the gateway. See the
+note in the README: this route is opt-in and has not been certified
+against `tests/evals/` or the adversarial pass.
 """
 
 from __future__ import annotations
 
 import datetime
 import os
-from dataclasses import replace
-from decimal import Decimal
-from typing import Any
+import time
+from collections.abc import Iterator
+from typing import Any, cast
 
-from collector.llm.base import LLMResponse, Message
+from collector.llm.base import LLMResponse, Message, StreamEvent
 from collector.llm.openai_shape import (
-    MAX_RETRIES,
-    TIMEOUT_SECONDS,
-    chat_completion,
     load_env,
+    to_llm_response,
     to_openai_messages,
+    to_stream_events,
     tool_definitions,
 )
 
 BASE_URL = "https://agent-gateway.livekit.cloud/v1"
-MODEL = "google/gemini-3.6-flash"
+MODEL = "google/gemini-3-flash-preview"
 
 # A spoken turn is one or two sentences. The cap is a backstop against a
 # runaway generation, not a style control — matches the other two clients.
 MAX_TOKENS = 1024
 
-# LiveKit Inference's published rates, USD per million tokens, as of 2026-08,
-# keyed by the gateway's own namespaced model id. Three figures per model:
-# input, output, cached input. A model absent from this table — or one whose
-# cached rate LiveKit does not publish, on a call that actually read from cache
-# — is reported with no cost rather than a guessed one.
-#
-# Note the cached rate is an absolute price here, not the multiple of the input
-# rate that `anthropic_client` derives. Gemini 3.6 Flash and 3.5 Flash Lite
-# publish no cached figure at all; `None` says so rather than inventing one.
-PRICES: dict[str, tuple[Decimal, Decimal, Decimal | None]] = {
-    "google/gemini-2.5-flash": (Decimal("0.30"), Decimal("2.50"), Decimal("0.03")),
-    "google/gemini-2.5-flash-lite": (Decimal("0.10"), Decimal("0.40"), Decimal("0.01")),
-    "google/gemini-2.5-pro": (Decimal("2.50"), Decimal("15.00"), Decimal("0.25")),
-    "google/gemini-3-flash-preview": (Decimal("0.50"), Decimal("3.00"), Decimal("0.05")),
-    "google/gemini-3.1-flash-lite": (Decimal("0.25"), Decimal("1.50"), Decimal("0.025")),
-    "google/gemini-3.1-pro-preview": (Decimal("4.00"), Decimal("18.00"), Decimal("0.40")),
-    "google/gemini-3.5-flash": (Decimal("1.50"), Decimal("9.00"), Decimal("0.15")),
-    "google/gemini-3.5-flash-lite": (Decimal("0.30"), Decimal("2.50"), None),
-    "google/gemini-3.6-flash": (Decimal("1.50"), Decimal("7.50"), None),
-}
-
-_PER_MILLION = Decimal(1_000_000)
-
 # Matches the SDK's own inference client. Long enough that no single request
 # can age out mid-flight, short enough to be worth re-minting per turn.
 TOKEN_TTL = datetime.timedelta(minutes=10)
-
-
-def estimate_cost(
-    model: str,
-    *,
-    input_tokens: int,
-    output_tokens: int,
-    cache_read_tokens: int = 0,
-    cache_write_tokens: int = 0,
-) -> Decimal | None:
-    """USD for one call, or ``None`` when this table cannot price it honestly.
-
-    Decimal throughout, like every other figure in this system: a float here
-    would be a rounding error in a cost report rather than in a payment
-    schedule, but the rule is the rule.
-
-    Cached prompt tokens are a *subset* of ``prompt_tokens`` in the OpenAI
-    shape, not an addition to it as they are on Anthropic's — so they are
-    subtracted out and rebilled at the cached rate, never added on top. The
-    clamp is defensive: a provider quirk must not be able to bill a negative.
-    """
-    rates = PRICES.get(model)
-    if rates is None:
-        return None
-    input_rate, output_rate, cached_rate = rates
-    if cache_write_tokens:
-        # LiveKit publishes no cache-*write* rate for any model, so a call that
-        # wrote to cache has a component this table cannot price.
-        return None
-    if cache_read_tokens and cached_rate is None:
-        return None
-    billable_input = max(input_tokens - cache_read_tokens, 0)
-    billed = (
-        input_rate * billable_input
-        + output_rate * output_tokens
-        + (cached_rate or 0) * cache_read_tokens
-    )
-    return billed / _PER_MILLION
 
 
 def _access_token(api_key: str, api_secret: str) -> str:
@@ -157,8 +87,6 @@ class LiveKitInferenceClient:
         max_tokens: int = MAX_TOKENS,
         api_key: str | None = None,
         api_secret: str | None = None,
-        timeout: float = TIMEOUT_SECONDS,
-        max_retries: int = MAX_RETRIES,
     ) -> None:
         from openai import OpenAI
 
@@ -173,15 +101,7 @@ class LiveKitInferenceClient:
             )
         self._api_key = key
         self._api_secret = secret
-        # Timeout and retries on the client, not hand-rolled around the call:
-        # the SDK already backs off on the retryable statuses (408/409/429/5xx)
-        # and reads ``retry-after``, and duplicating that is how the two drift.
-        self._client = OpenAI(
-            base_url=BASE_URL,
-            api_key=_access_token(key, secret),
-            timeout=timeout,
-            max_retries=max_retries,
-        )
+        self._client = OpenAI(base_url=BASE_URL, api_key=_access_token(key, secret))
         self._model = model
         self._max_tokens = max_tokens
         self._tools: list[Any] = tool_definitions()
@@ -190,45 +110,44 @@ class LiveKitInferenceClient:
         # Re-minted per turn rather than per client: signing is local and
         # costs nothing, and a call outliving TOKEN_TTL is ordinary.
         self._client.api_key = _access_token(self._api_key, self._api_secret)
-        response = chat_completion(
-            self._client,
+        conversation = to_openai_messages(messages)
+        response = self._client.chat.completions.create(
             model=self._model,
-            messages=to_openai_messages(messages),
-            tools=self._tools,
             max_tokens=self._max_tokens,
+            messages=cast(Any, conversation),
+            tools=self._tools,
         )
-        return _priced(response, self._model)
+        return to_llm_response(response.choices[0].message)
 
+    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        """The same turn, emitted as it is written.
 
-def _priced(response: LLMResponse, requested_model: str) -> LLMResponse:
-    """Fill in ``cost_usd`` from the gateway's own rate card.
+        Without this, ``stream_response`` treats the route as non-streaming and
+        hands ``stream_turn`` the finished paragraph as a single delta: the
+        per-sentence guard still runs, but it runs on everything at once and the
+        voice path waits for the whole turn before any audio. So the streaming
+        transport buys this route nothing until the route can stream — which is
+        the only reason a faster model here would be a latency win rather than
+        just a different model.
 
-    Applied here rather than in ``openai_shape`` because the rates are LiveKit
-    Inference's: the same model id billed through another gateway is another
-    number, and a shared price table would quietly report one route's prices
-    for the other's traffic.
+        Same request as ``respond`` plus ``stream=True``, deliberately: a route
+        whose streaming and non-streaming paths ask for different things is a
+        route where the guardrail behaviour certified on one is not the
+        behaviour running on the other.
 
-    Priced against the model that was *asked for*, not the one the response
-    echoes back. Gateways resolve a request to a dated or provider-qualified
-    build (``…-002``, and the like), and that string is not a key in ``PRICES``
-    — pricing off it would miss the table on every call and report ``None``.
-    ``None`` is also the honest "no published rate" signal, so the two would be
-    indistinguishable and the fault invisible. ``usage.model`` still carries
-    whatever came back, which is what the audit trail wants.
-    """
-    usage = response.usage
-    if usage is None:
-        return response
-    return replace(
-        response,
-        usage=replace(
-            usage,
-            cost_usd=estimate_cost(
-                requested_model,
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens,
-                cache_read_tokens=usage.cache_read_tokens,
-                cache_write_tokens=usage.cache_write_tokens,
-            ),
-        ),
-    )
+        **Still uncertified.** Streaming does not change what the README says
+        about this route — ``MAX_TOOL_ROUNDS`` and the strike budget were tuned
+        against Claude, and ``tests/evals/`` plus the adversarial pass have to
+        be re-run before it carries a real call.
+        """
+        self._client.api_key = _access_token(self._api_key, self._api_secret)
+        conversation = to_openai_messages(messages)
+        started = time.monotonic()
+        chunks = self._client.chat.completions.create(
+            model=self._model,
+            max_tokens=self._max_tokens,
+            messages=cast(Any, conversation),
+            tools=self._tools,
+            stream=True,
+        )
+        yield from to_stream_events(chunks, model=self._model, started=started)

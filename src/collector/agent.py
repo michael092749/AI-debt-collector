@@ -23,8 +23,9 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Generator, Iterator
-from dataclasses import dataclass, field, replace
+from collections.abc import Generator, Iterator, Sequence
+from dataclasses import dataclass, field
+from enum import StrEnum
 
 from collector.audit.events import (
     CallEnded,
@@ -42,13 +43,16 @@ from collector.audit.events import (
 )
 from collector.audit.store import AuditStore
 from collector.decision_engine import Verdict
+from collector.guardrails.confirmation import agreed_line, confirmation_line, repeats_back
 from collector.guardrails.disclosures import (
-    AI_DISCLOSURE_TEXT,
+    AI_DISCLOSURE_WITH_HUMAN,
+    DisclosureRuleId,
     confirms_identity,
     denies_identity,
 )
-from collector.guardrails.numeric import AuthorizedFigures, authorized_for
+from collector.guardrails.numeric import AuthorizedFigures, authorized_for, extract_figures
 from collector.guardrails.rings import (
+    CONNECTIVE_TEXT,
     MAX_REGENERATION_STRIKES,
     CallSummary,
     EscalationRecord,
@@ -76,7 +80,7 @@ from collector.llm.base import (
     system_prompt,
 )
 from collector.negotiation import CallOutcome
-from collector.offers import Offer
+from collector.offers import Offer, Tier
 from collector.policy import PolicyConfig
 from collector.tools import TOOL_SCHEMAS, ToolContext, ToolResult, execute
 from collector.tracing import CallTrace
@@ -120,6 +124,13 @@ def _sanitize_consumer_text(text: str) -> str:
 _IDENTITY_GATED_TOOLS = frozenset(
     {"validate_consumer_offer", "propose_offer", "record_refusal", "concede", "confirm_agreement"}
 )
+
+# The one tool that writes an obligation. It is gated a second time, on having
+# read the terms back: identity says *who* is agreeing, the repeat-back says
+# they know *what* to. Same shape as the identity gate and for the same reason
+# — refuse before the engine runs, so no verdict is computed and no agreement
+# is durably logged off a confirmation the consumer never actually heard.
+_COMMITMENT_TOOL = "confirm_agreement"
 
 # A sentence ends at terminal punctuation followed by whitespace. The trailing
 # whitespace is what keeps "$250.00 a month" in one piece: a decimal point has a
@@ -201,6 +212,72 @@ def _split_sentences(buffer: str) -> tuple[list[str], str]:
     return sentences, buffer[cursor:].lstrip()
 
 
+class _Outcome(StrEnum):
+    """What a streamed round leaves the turn to do next."""
+
+    CONTINUE = "continue"
+    REGENERATE = "regenerate"
+    CONNECTIVE = "connective"
+    FALLBACK = "fallback"
+
+
+# How a blocked round reads on the compliance record. The streaming path
+# recorded every block as ``BLOCKED``, which said the consumer heard nothing
+# and disagreed with the text path about the one case they share — a turn
+# handed to the scripted fallback, which ``turn()`` has always called
+# ``SAFE_FALLBACK``. Anything counting scripted lines off the trail therefore
+# undercounted the voice path to zero.
+_ACTION_FOR: dict[_Outcome, GuardrailAction] = {
+    _Outcome.REGENERATE: GuardrailAction.REGENERATED,
+    _Outcome.CONNECTIVE: GuardrailAction.CONNECTIVE,
+    _Outcome.FALLBACK: GuardrailAction.SAFE_FALLBACK,
+    # A round that was blocked and still says CONTINUE cannot happen — the
+    # predicate returns it only when nothing blocked — but a dict lookup
+    # should not be the thing that discovers that.
+    _Outcome.CONTINUE: GuardrailAction.BLOCKED,
+}
+
+
+# Disclosure complaints a *longer* chunk can still cure, and the only ones
+# ``_owes_a_disclosure`` may hold a chunk back for. Compared by value, not
+# membership in a set of enum members: a ``Violation`` carries its rule id as a
+# plain str.
+#
+# ``MINI_MIRANDA_REDUNDANT`` is deliberately absent. Every other rule here says
+# the turn has not finished saying something it owes, which the next sentence
+# can answer; that one says the opposite — the notice is already on record —
+# and no amount of further text makes a second delivery acceptable. Holding on
+# it would withhold the chunk to the end of the round and swallow the whole
+# turn instead of blocking one sentence and letting the model rewrite it.
+_CURABLE_BY_MORE_TEXT: tuple[str, ...] = (
+    DisclosureRuleId.MINI_MIRANDA_NOT_FIRED,
+    DisclosureRuleId.MINI_MIRANDA_OUT_OF_ORDER,
+    DisclosureRuleId.AI_DISCLOSURE_MISSING_AT_OPEN,
+    DisclosureRuleId.AI_DISCLOSURE_REQUEST_IGNORED,
+)
+
+
+def _stands_on_its_own(spoken_text: str) -> bool:
+    """Did the spoken prefix say something a connective can close?
+
+    A figure means concrete terms reached the consumer's ear, and every
+    sentence in the prefix already cleared the outbound guard, so any figure
+    present is authorized by construction. A keyword match alone — "offer",
+    "payments" — is not enough: it is how an announcement of content that
+    never arrived gets closed as though the content had been said.
+
+    A completed Mini-Miranda used to count here too, and that was the same
+    mistake one line further on. The connective is "Does that work for you?",
+    a request for assent; a legal notice is a disclosure, not a proposition,
+    so there is nothing in it to agree to and the question refers to nothing.
+    A live call on 2026-08-07 ended exactly that way after the balance
+    sentence behind the notice was blocked. A turn holding only the notice
+    takes the scripted fallback instead, which at least asks the consumer
+    something they can answer.
+    """
+    return bool(extract_figures(spoken_text))
+
+
 @dataclass
 class _Round:
     """What one streamed round produced, beside the sentences it yielded.
@@ -212,16 +289,58 @@ class _Round:
 
     response: LLMResponse | None = None
     blocked: str | None = None
+    # Why it was blocked, in the guard's own words, for the model to read.
+    note: str | None = None
+    # The guard's strike budget is spent; a rewrite is no longer on offer.
+    exhausted: bool = False
 
     @property
     def failed(self) -> bool:
         return self.response is not None and self.response.error is not None
 
-    def needs_fallback(self, spoken: list[str]) -> bool:
-        """A blocked sentence always falls back; a failed call only if the
-        round said nothing, since a scripted line after real speech reads as a
-        non-sequitur rather than a recovery."""
-        return self.blocked is not None or (self.failed and not spoken)
+    def outcome(self, spoken: list[str], *, may_rewrite: bool) -> _Outcome:
+        """What the turn does next, given what it has already put on the wire.
+
+        ``spoken`` is the whole turn's speech, not this round's: once any
+        sentence is audio, every later block in the same turn is judged
+        against the fact that the consumer has heard something.
+
+        ``may_rewrite`` is the caller's promise that a round is actually
+        available to do the rewrite in. Without it this returns
+        ``REGENERATE`` on the loop's last iteration, the turn falls out to
+        the scripted line, and the audit record claims a rewrite that never
+        ran.
+        """
+        if self.blocked is not None:
+            # Nothing spoken means nothing contradicted, so the turn can be
+            # rewritten the way the text path rewrites it. This is the case
+            # the old always-abort rule handled worst: a scripted
+            # non-sequitur spent on a turn that had every chance of clearing
+            # on the second attempt.
+            if may_rewrite and not spoken and not self.exhausted:
+                return _Outcome.REGENERATE
+            # Something is already in the consumer's ear that stands on its
+            # own. The scripted fallback restarts the conversation, which
+            # after a laid-out offer talks over the proposal instead of
+            # recovering from anything; a connective closes the thought and
+            # leaves it.
+            #
+            # Standing on its own, not merely substantive-sounding: a live
+            # call spoke "Here's what I'm able to offer." — the keyword
+            # "offer" reads as substantive, but the sentence only points
+            # forward at terms the guard then blocked, and closing it with
+            # "Does that work for you?" asks about an offer that was never
+            # made. What a connective can close is a figure the consumer
+            # actually heard, or a disclosure that completes by itself.
+            if _stands_on_its_own(" ".join(spoken)):
+                return _Outcome.CONNECTIVE
+            return _Outcome.FALLBACK
+        # A failed call only falls back if the round said nothing, since a
+        # scripted line after real speech reads as a non-sequitur rather
+        # than a recovery.
+        if self.failed and not spoken:
+            return _Outcome.FALLBACK
+        return _Outcome.CONTINUE
 
 
 @dataclass(frozen=True)
@@ -265,6 +384,19 @@ class NegotiationAgent:
     store: AuditStore | None = None
     channel: str = "text"
 
+    @property
+    def _standing_tier(self) -> Tier | None:
+        """The tier of the offer currently on the table, for the naming guard.
+
+        Read fresh at every gate rather than cached: the offer changes inside a
+        turn (a concession mid-round), and a stale tier would either wave a real
+        mislabel through or block the correct name for the offer just authored.
+        ``None`` before anything is on the table, which the guard reads as
+        "nothing to misname yet".
+        """
+        standing = self.tools.standing_offer
+        return standing.tier if standing is not None else None
+
     def __post_init__(self) -> None:
         self.tools = ToolContext.opening(self.policy)
         self.authorized: AuthorizedFigures = authorized_for(self.policy)
@@ -273,11 +405,19 @@ class NegotiationAgent:
             system_prompt(consumer_name=self.consumer_name, account_ref=self.account_ref)
         ]
         self.turns: list[AgentTurn] = []
+        # Everything actually spoken, in order. ``self.turns`` cannot stand in:
+        # it is appended on the way out of ``turn()``, and the commitment gate
+        # is consulted during a tool round, before that append happens.
+        self.spoken: list[str] = []
         self.verdicts: list[Verdict] = []
         self.agreed_offer: Offer | None = None
         self.last_consumer_utterance: str = ""
         self.ended = False
         self._turn_index = 0
+        # Scripted lines spoken back-to-back with nothing the model wrote in
+        # between. Reset by any sentence that clears the guard, so this counts
+        # an agent going in circles rather than a call's fallbacks in total.
+        self._consecutive_fallbacks = 0
         # Inert unless a process called ``configure_tracing()``; see tracing.py.
         self.trace = CallTrace()
 
@@ -367,13 +507,22 @@ class NegotiationAgent:
         the consumer's ear while the rest is still being written. That is the
         entire sub-500ms first-audio budget.
 
-        One rule differs, and it is not negotiable. ``turn()`` can regenerate a
-        blocked turn because nothing was spoken yet and the contract holds —
-        "blocked, so the consumer did not hear it". Mid-stream that contract is
-        already false: earlier sentences are audio. So a block here **aborts the
-        stream and speaks the scripted fallback**. Retrying would mean
-        contradicting something the consumer just heard, which is worse than the
-        sentence that was blocked.
+        One rule differs, and what it turns on is whether anything is already
+        audio. ``turn()`` can regenerate a blocked turn because nothing was
+        spoken yet and the contract holds — "blocked, so the consumer did not
+        hear it". Here that contract survives exactly as long as the turn has
+        stayed silent:
+
+        * **Block before a single sentence went to TTS** — nothing is
+          contradicted, so the turn is rewritten, on the guard's own strike
+          budget, the same way ``turn()`` rewrites it.
+        * **Block after real speech** — retrying would mean contradicting
+          something the consumer just heard, which is worse than the sentence
+          that was blocked. The stream aborts.
+
+        The earlier rule aborted in both cases. That was right about the second
+        and wrong about the first, where it spent a scripted non-sequitur on a
+        turn that had every chance of clearing on the second attempt.
 
         The turn is appended to ``self.turns`` however the iterator ends,
         including when the caller stops listening. Barge-in is the ordinary
@@ -410,24 +559,65 @@ class NegotiationAgent:
         blocked: list[str] = []
         results: list[ToolResult] = []
         transcribed = 0
+        # The round whose block the model still has to be told about. Flushed
+        # at the end of the turn rather than the moment it happens, so the
+        # note trails the speech it is about: message order is what the next
+        # round reads, and a note filed ahead of the sentences that *were*
+        # spoken reads as though those were the problem.
+        pending_note: _Round | None = None
         # Set when a tool closed the call. One more round is still owed: the
         # consumer has to hear the arrangement read back, and a turn that ends
         # the call in silence is a dead line, not a goodbye.
         closing = False
+        # Cleared only by a *failure* that produced no speech. That one case
+        # belongs to the transport: it is the only party that knows whether a
+        # scripted apology reached TTS, and ``record_fallback_speech`` appends
+        # the turn when it did — appending here too would count one exchange
+        # twice in ``CallEnded.turn_count``. ``turn()`` behaves the same way,
+        # by never reaching its own append when ``_act()`` raises. A caller
+        # that merely stops listening is *not* this case; see the docstring.
+        record_turn = True
+
+        # Two budgets, deliberately not one. Folding the rewrite allowance
+        # into the round count spends it on turns that never blocked — every
+        # clean turn would buy extra model round-trips and extra tool batches
+        # before giving up, which on a voice line is latency the cap exists
+        # to prevent. A rewrite hands its round back instead, so the
+        # allowance is drawn on only when a rewrite actually happens.
+        rounds_left = MAX_TOOL_ROUNDS + 1
+        rewrites_left = MAX_REGENERATION_STRIKES
 
         try:
-            for _ in range(MAX_TOOL_ROUNDS + 1):
+            while rounds_left > 0:
+                rounds_left -= 1
+                may_rewrite = rewrites_left > 0
                 round_ = _Round()
-                for sentence in self._stream_round(round_):
+                for sentence in self._stream_round(round_, spoken, may_rewrite=may_rewrite):
                     spoken.append(sentence)
                     yield sentence
 
                 if round_.blocked is not None:
                     blocked.append(round_.blocked)
-                if round_.needs_fallback(spoken):
-                    fallback = self._stream_fallback()
-                    spoken.append(fallback)
-                    yield fallback
+                    pending_note = round_
+
+                outcome = round_.outcome(spoken, may_rewrite=may_rewrite)
+                if outcome is _Outcome.REGENERATE:
+                    # Nothing is on the wire, so nothing is contradicted by
+                    # trying again — but the retry has to be told what it may
+                    # not say, or it writes the blocked sentence a second time.
+                    rewrites_left -= 1
+                    rounds_left += 1  # the rewrite is not a tool round
+                    self._note_block(round_)
+                    pending_note = None
+                    continue
+                if outcome in (_Outcome.CONNECTIVE, _Outcome.FALLBACK):
+                    closer = (
+                        self._stream_connective()
+                        if outcome is _Outcome.CONNECTIVE
+                        else self._stream_fallback()
+                    )
+                    spoken.append(closer)
+                    yield closer
                     break
 
                 response = round_.response
@@ -449,17 +639,26 @@ class NegotiationAgent:
                 fallback = self._stream_fallback()
                 spoken.append(fallback)
                 yield fallback
+        except BaseException as exc:
+            record_turn = bool(spoken) or isinstance(exc, GeneratorExit)
+            raise
         finally:
-            self._transcribe(spoken, transcribed)
-            self.turns.append(
-                AgentTurn(
-                    consumer=consumer_utterance,
-                    spoken=" ".join(spoken) or None,
-                    tool_results=tuple(results),
-                    blocked=tuple(blocked),
-                    ended=self.ended,
+            if record_turn:
+                self._transcribe(spoken, transcribed)
+                # With the transcript, not before it and not without it: the
+                # note names a blocked sentence relative to what was spoken,
+                # and a turn the transport owns has neither.
+                if pending_note is not None:
+                    self._note_block(pending_note)
+                self.turns.append(
+                    AgentTurn(
+                        consumer=consumer_utterance,
+                        spoken=" ".join(spoken) or None,
+                        tool_results=tuple(results),
+                        blocked=tuple(blocked),
+                        ended=self.ended,
+                    )
                 )
-            )
 
     def _transcribe(self, spoken: list[str], already: int) -> int:
         """Put what has been spoken since ``already`` into the transcript.
@@ -474,12 +673,19 @@ class NegotiationAgent:
             self.messages.append(Message(role="agent", content=" ".join(spoken[already:])))
         return len(spoken)
 
-    def _stream_round(self, round_: _Round) -> Iterator[str]:
+    def _stream_round(
+        self, round_: _Round, spoken: Sequence[str], *, may_rewrite: bool
+    ) -> Iterator[str]:
         """One streamed round, yielding each chunk that clears the guard.
 
-        Stops at the first blocked chunk — the abort the streaming contract
-        requires. What the round produced besides speech (the assembled
-        response, the blocked text) lands on ``round_``.
+        Stops at the first blocked chunk. What the round produced besides
+        speech (the assembled response, the blocked text and why) lands on
+        ``round_``, and the caller decides from there whether the turn is
+        rewritten or abandoned.
+
+        ``spoken`` is what the *turn* has already put on the wire, read at the
+        moment a chunk is blocked rather than at the start of the round —
+        a round can speak one sentence cleanly and block the next.
         """
         buffer = ""
         # Complete sentences withheld from TTS because a disclosure rule is
@@ -497,9 +703,10 @@ class NegotiationAgent:
                             if self._owes_a_disclosure(held):
                                 continue
                             candidate, held = held, ""
-                            allowed = self._guard_sentence(candidate)
+                            allowed = self._guard_sentence(
+                                candidate, round_, spoken, may_rewrite=may_rewrite
+                            )
                             if allowed is None:
-                                round_.blocked = candidate
                                 return
                             yield allowed
                     case StreamCompleted():
@@ -513,10 +720,8 @@ class NegotiationAgent:
             # the whole chunk gets judged on that.
             tail = f"{held} {buffer.strip()}".strip() if held else buffer.strip()
             if tail:
-                allowed = self._guard_sentence(tail)
-                if allowed is None:
-                    round_.blocked = tail
-                else:
+                allowed = self._guard_sentence(tail, round_, spoken, may_rewrite=may_rewrite)
+                if allowed is not None:
                     yield allowed
         finally:
             if round_.response is None:
@@ -537,6 +742,33 @@ class NegotiationAgent:
                     )
                 )
 
+    def _note_block(self, round_: _Round) -> None:
+        """Tell the model what the guard stopped, and why.
+
+        The text path has always done this (``_guard_and_speak``) and its next
+        generation is informed by it. The streaming path aborted silently: the
+        message history after a block looked exactly as it did before, so
+        nothing discouraged the model from reaching for the same blocked
+        phrasing on the next turn — and it did, repeatedly.
+
+        Worded for the streaming contract rather than reusing the text path's
+        line, which promises the consumer heard nothing. Mid-stream that is
+        only true of the blocked sentence itself.
+        """
+        if round_.note is None or round_.blocked is None:
+            return
+        self.messages.append(
+            Message(
+                role="system",
+                content=(
+                    "The guard stopped this before it was synthesized, so the consumer "
+                    f'did not hear it: "{round_.blocked.strip()}" — {round_.note}. '
+                    "Do not say that again in any wording, and do not restate any "
+                    "figure the engine has not returned."
+                ),
+            )
+        )
+
     def _owes_a_disclosure(self, candidate: str) -> bool:
         """Does a disclosure rule complain about ``candidate`` being unfinished?
 
@@ -555,33 +787,71 @@ class NegotiationAgent:
         rule still fires the moment a sentence completes, and a chunk still
         owing when the round ends is guarded whole and blocked there, which is
         where the fallback belongs.
-        """
-        return bool(self.guard.disclosures.check_agent_turn(candidate))
 
-    def _guard_sentence(self, sentence: str) -> str | None:
+        Only the complaints in ``_CURABLE_BY_MORE_TEXT``, though. Reading *any*
+        disclosure complaint as "not finished saying it" was right for every
+        rule that existed when this was written and is exactly wrong for
+        ``MINI_MIRANDA_REDUNDANT``, which fires because the notice is already
+        on record: a chunk held for that is never released, so the whole turn
+        is silently swallowed instead of one sentence being blocked and
+        rewritten.
+        """
+        return any(
+            violation.rule_id in _CURABLE_BY_MORE_TEXT
+            for violation in self.guard.disclosures.check_agent_turn(candidate)
+        )
+
+    def _guard_sentence(
+        self, sentence: str, round_: _Round, spoken: Sequence[str], *, may_rewrite: bool = False
+    ) -> str | None:
         """The pre-TTS gate for one sentence. ``None`` means do not speak it.
 
-        Records the trip as ``BLOCKED`` rather than ``REGENERATED``: on the
-        streaming path there is no retry, and an audit log that says
-        "regenerated" about a turn that was abandoned is a false record.
+        A block lands on ``round_`` — the text that was stopped and the guard's
+        own account of why — because the caller is what decides between
+        aborting and retrying, and both need the reason.
+
+        The trip is recorded as whichever of the two actually follows. That is
+        decidable here only because the caller passes ``may_rewrite``: a turn
+        is rewritten when nothing has been spoken, the strike budget is
+        unspent, *and a round remains to do it in*. The third was missing, so
+        a block on the loop's last iteration recorded "regenerated" and then
+        fell out to the scripted line. An audit log that says "regenerated"
+        about a turn that was abandoned — or "blocked" about one that was
+        rewritten — is a false record of what the guard did.
+
+        ``may_rewrite`` defaults to the conservative side: a caller that does
+        not say gets "blocked", never a claimed rewrite.
         """
         candidate = sentence.strip()
         if not candidate:
+            round_.blocked = sentence
             return None
 
-        check = check_outbound(self.guard, candidate, authorized=self.authorized)
+        check = check_outbound(
+            self.guard,
+            candidate,
+            authorized=self.authorized,
+            standing_tier=self._standing_tier,
+        )
         self.guard = check.state
         if check.allowed:
-            self._record(
-                TurnRecorded(
-                    call_id=self.call_id,
-                    turn_index=self._turn_index,
-                    speaker=Speaker.AGENT,
-                    text=candidate,
-                )
-            )
+            self._consecutive_fallbacks = 0
+            # Through ``_record_audio`` rather than writing ``TurnRecorded``
+            # here: it is the one place a line counts as having reached TTS,
+            # and the commitment gate reads what it collects. Recording the
+            # event inline instead left every streamed sentence out of
+            # ``spoken``, so the voice path could never satisfy the gate.
+            self._record_audio(candidate)
             return candidate
 
+        round_.blocked = sentence
+        round_.note = check.regeneration_note()
+        round_.exhausted = check.fallback_text is not None
+        # Asked of the same function the caller will ask, rather than
+        # re-derived from the same inputs: two copies of this rule drift, and
+        # the drift is only ever visible in the compliance record, where it is
+        # least likely to be noticed and most expensive to have been wrong.
+        action = _ACTION_FOR[round_.outcome(list(spoken), may_rewrite=may_rewrite)]
         for violation in check.blocking_violations:
             self._record(
                 GuardrailTripped(
@@ -589,7 +859,7 @@ class NegotiationAgent:
                     turn_index=self._turn_index,
                     ring=GuardrailRing.DURING_CALL,
                     rule_id=violation.rule_id,
-                    action=GuardrailAction.BLOCKED,
+                    action=action,
                     detail=violation.detail,
                     blocked_text=candidate,
                 )
@@ -766,8 +1036,7 @@ class NegotiationAgent:
         which on a cloud deployment is a container-local file destroyed when
         the replica cycles; the log drain is the only surface that survives a
         finished job. Without these fields, per-call cost and cache
-        effectiveness are unmeasurable in production — which is what stalled
-        the prompt-caching and thinking-cost questions.
+        effectiveness are unmeasurable in production.
 
         ``cost_usd`` is deliberately *not* here. It is a ``Decimal``, and the
         framework's JSON encoder falls back to ``str()`` for types it cannot
@@ -822,6 +1091,27 @@ class NegotiationAgent:
                 )
             )
 
+    def _unconfirmed_terms(self) -> Offer | None:
+        """The standing offer, if it has not yet been read back to the consumer.
+
+        ``None`` means the commitment gate has nothing to say — either because
+        the terms were confirmed, or because this is not a case the gate owns:
+
+        * no offer on the table — ``tools.py`` has a better error for that, and
+          shadowing it with a repeat-back complaint would send the model off
+          rehearsing terms that do not exist;
+        * the call already closed — a dropped call replays its last tool call
+          (``tools.py`` module docstring), and the repeat-back that preceded
+          the original agreement is not on this object's ``spoken`` list.
+          Re-gating a replay would turn a recorded agreement into a refusal.
+        """
+        offer = self.tools.standing_offer
+        if offer is None or self.tools.state.is_terminal:
+            return None
+        if any(repeats_back(said, offer) for said in self.spoken):
+            return None
+        return offer
+
     def _run_tool(self, call: ToolCall) -> ToolResult:
         started = time.monotonic()
         if call.name in _IDENTITY_GATED_TOOLS and not self.guard.identity_confirmed:
@@ -837,6 +1127,20 @@ class NegotiationAgent:
                         "the consumer's identity is not confirmed yet; ask who "
                         "you're speaking with before discussing any terms"
                     ),
+                },
+                context=self.tools,
+            )
+        elif call.name == _COMMITMENT_TOOL and (unconfirmed := self._unconfirmed_terms()):
+            result = ToolResult(
+                name=call.name,
+                payload={
+                    "ok": False,
+                    "error": (
+                        "you have not read these terms back yet; say the "
+                        "confirmation line and let the consumer answer before "
+                        "confirming the agreement"
+                    ),
+                    "you_must_confirm": confirmation_line(unconfirmed),
                 },
                 context=self.tools,
             )
@@ -930,11 +1234,13 @@ class NegotiationAgent:
                 self.guard,
                 candidate,
                 authorized=self.authorized,
+                standing_tier=self._standing_tier,
                 confidential_reference=_CONFIDENTIAL_REFERENCE,
             )
             self.guard = check.state
 
             if check.allowed:
+                self._consecutive_fallbacks = 0
                 self._record_spoken(candidate)
                 return candidate, tuple(blocked)
 
@@ -983,6 +1289,69 @@ class NegotiationAgent:
 
         return None, tuple(blocked)
 
+    def _standing_offer_line(self) -> str | None:
+        """The offer on the table, rendered from the engine's own numbers.
+
+        Reached only after the fallback has already been spoken once: asking
+        "what would work for you?" a second time, with no model sentence in
+        between, is the agent going in circles in front of a consumer who is
+        waiting on terms it has already produced. Saying the terms is more
+        use than asking the question again.
+
+        Three gates, and they are not belt-and-braces — ``_speak_verbatim``
+        bypasses ``check_outbound`` entirely, so this line reaches TTS
+        unchecked and has to be safe by construction:
+
+        * **An offer must exist.** Nothing on the table, nothing to restate.
+        * **Identity must be confirmed**, and it is revocable mid-call
+          (``with_identity_revoked``). A code-authored line full of dollar
+          figures would otherwise be the way around the identity ring.
+        * **No escalation.** ``fallback_for`` returns the closing line once
+          the consumer has escalated, and reading them terms instead is
+          negotiating past the point where negotiation stops (A6).
+
+        The rendered line is then put through the guard anyway and dropped if
+        it does not clear. Every figure in it came from ``offers_made``, which
+        is what ``authorized_for`` derives the authorized set from, so it
+        should always clear — and "should" is not the standard for something
+        that bypasses the gate.
+        """
+        offer = self.tools.standing_offer
+        if offer is None or not self.guard.identity_confirmed or self.guard.escalated:
+            return None
+
+        parts = [
+            f"{installment.amount} today"
+            if installment.due_day_offset == 0
+            else f"{installment.amount} in {installment.due_day_offset} days"
+            for installment in offer.installments
+        ]
+        schedule = parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} and then {parts[-1]}"
+        line = f"To be clear about what's on the table: {schedule}."
+
+        if not check_outbound(self.guard, line, authorized=self.authorized).allowed:
+            return None
+        return line
+
+    def _agreed_close_line(self) -> str | None:
+        """The agreement restated, when a scripted line must close the call.
+
+        Same three gates as ``_standing_offer_line`` and for the same reason:
+        this line is spoken via ``_speak_verbatim`` and has to be safe by
+        construction. The offer comes from the negotiation's own record of
+        what was agreed, so its figures are authorized — and the render is
+        still put through the guard and dropped if it does not clear.
+        """
+        if self.tools.state.outcome is not CallOutcome.AGREED:
+            return None
+        offer = self.tools.state.agreed_offer
+        if offer is None or not self.guard.identity_confirmed or self.guard.escalated:
+            return None
+        line = agreed_line(offer)
+        if not check_outbound(self.guard, line, authorized=self.authorized).allowed:
+            return None
+        return line
+
     def _fallback_line(self) -> str:
         """The scripted line to speak when a generated one cannot be.
 
@@ -991,23 +1360,69 @@ class NegotiationAgent:
         turn got blocked, so the line that replaces the turn is the answer they
         actually hear, and the rule wants it answered on request rather than
         deferred to a turn that will be blocked for the same reason.
+
+        A second consecutive trip reaches for the standing offer instead of
+        asking the same open question twice — see ``_standing_offer_line``,
+        which declines when there is nothing safe to say.
         """
         line = fallback_for(self.guard)
         if self.guard.disclosures.ai_disclosure_requested:
-            return f"{AI_DISCLOSURE_TEXT} {line}"
+            # The full disclosure, human offer included. This branch runs only
+            # because the consumer asked what they are talking to, which is
+            # exactly the moment the offer of a person is relevant — and it is
+            # code speaking because the model has already been blocked, so it
+            # is the wrong turn to be saying less than the whole thing.
+            return f"{AI_DISCLOSURE_WITH_HUMAN} {line}"
+        # Once the consumer has accepted, "what would work for you?" is not a
+        # recovery — it reopens a negotiation that no longer exists, over the
+        # very deal the consumer just said yes to. A live call closed exactly
+        # that way. The scripted line for a closed agreement is the agreement.
+        if (closed := self._agreed_close_line()) is not None:
+            return closed
+        # Exactly the second trip. Reading the consumer identical terms on
+        # every trip from the second onward is the same circling this exists
+        # to break, in a different line. Ranked below the disclosure: an
+        # unanswered "am I talking to a machine?" outranks restating terms.
+        if self._consecutive_fallbacks == 1 and (restated := self._standing_offer_line()):
+            return restated
         return line
 
     def _speak_fallback(self) -> str:
         """The scripted line, spoken on the text path — transcript and all."""
         line = self._fallback_line()
+        self._consecutive_fallbacks += 1
         self._observe_scripted(line)
         self._speak_verbatim(line)
         return line
+
+    def _stream_connective(self) -> str:
+        """Close a turn that was cut off *after* it had already said something.
+
+        ``SAFE_FALLBACK_TEXT`` restarts the conversation — "let me keep this
+        simple, what would work for you?" That is a recovery when the consumer
+        heard nothing. Spoken over an offer the agent has just finished laying
+        out, it is a non-sequitur that asks a question the turn already
+        answered, and the offer needs no rescuing: it was spoken, it cleared
+        the guard, it stands.
+
+        Two cases still want the fallback, because it carries something the
+        connective does not. An escalation makes ``fallback_for`` return the
+        closing line, which is the compliance obligation and not something a
+        question inviting more negotiation may displace; and a pending
+        AI-disclosure request is answered by ``_fallback_line``, which a
+        connective would silently drop.
+        """
+        if self.guard.escalated or self.guard.disclosures.ai_disclosure_requested:
+            return self._stream_fallback()
+        self._observe_scripted(CONNECTIVE_TEXT)
+        self._record_audio(CONNECTIVE_TEXT)
+        return CONNECTIVE_TEXT
 
     def _stream_fallback(self) -> str:
         """The same line on the streaming path, where the transcript entry for
         the round this closes belongs to ``_transcribe``, not to each line."""
         line = self._fallback_line()
+        self._consecutive_fallbacks += 1
         self._observe_scripted(line)
         self._record_audio(line)
         return line
@@ -1046,28 +1461,10 @@ class NegotiationAgent:
         sentence, and every errored turn missing from ``turn_count``. This
         closes both. It is the transport's to call precisely because only the
         transport knows the line actually reached TTS.
-
-        ``stream_turn()`` differs in one way: its ``finally`` appends the
-        turn even when it raises — spoken ``None``, because nothing was. When
-        that silent record of the same exchange is the last thing on the
-        list, the apology completes it rather than appending a second: one
-        exchange, one turn, whichever path the transport failed down. Silent
-        turns arise only from an aborted or failed ``stream_turn()`` — both
-        text- and stream-path completions always speak, fallback included —
-        so the guard cannot swallow a legitimate earlier turn.
         """
         self._speak_verbatim(text)
-        last = self.turns[-1] if self.turns else None
-        if (
-            last is not None
-            and last.spoken is None
-            and last.consumer == self.last_consumer_utterance
-        ):
-            turn = replace(last, spoken=text)
-            self.turns[-1] = turn
-        else:
-            turn = AgentTurn(consumer=self.last_consumer_utterance, spoken=text)
-            self.turns.append(turn)
+        turn = AgentTurn(consumer=self.last_consumer_utterance, spoken=text)
+        self.turns.append(turn)
         return turn
 
     def _record_spoken(self, text: str) -> None:
@@ -1080,7 +1477,15 @@ class NegotiationAgent:
         The streaming path writes one assistant message per round rather than
         one per line, so it needs the audit half of ``_record_spoken`` on its
         own; the transcript half is ``_transcribe``'s.
+
+        This is also where ``spoken`` grows, and it has to be here rather than
+        in ``_record_spoken``: reaching TTS is what the commitment gate asks
+        about, and the streaming path reaches TTS without going through
+        ``_record_spoken`` at all. Tracking it one level up would have made the
+        gate refuse every agreement on the voice path — the only path that
+        carries real calls.
         """
+        self.spoken.append(text)
         self._record(
             TurnRecorded(
                 call_id=self.call_id,

@@ -363,7 +363,9 @@ class CallTrace:
     ) -> None:
         # Back-dated so the span covers the work rather than the instant it was
         # recorded: the waterfall is the reason to have a trace at all when a
-        # single voice turn can stack seven model round trips. ``latency_ms``
+        # single turn can stack several model round trips — five on the voice
+        # path's ``stream_turn``, seven on ``turn()``, which also regenerates
+        # behind the outbound guard. ``latency_ms``
         # also goes on as a plain attribute, because the timestamps are derived
         # and the measured number should be readable as itself.
         end = time.time_ns()

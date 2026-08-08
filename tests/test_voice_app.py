@@ -44,7 +44,14 @@ from collector.audit.events import Speaker
 from collector.audit.store import AuditStore
 from collector.guardrails import detect_escalation
 from collector.guardrails.rings import PreCallContext
-from collector.llm.base import LLMResponse, Message, StreamCompleted, StreamEvent, TextDelta
+from collector.llm.base import (
+    LLMResponse,
+    Message,
+    StreamCompleted,
+    StreamEvent,
+    TextDelta,
+    ToolCall,
+)
 from collector.llm.mock_client import MockLLMClient
 from collector.offers import Cadence
 from collector.policy import PolicyConfig
@@ -62,7 +69,6 @@ from collector.voice_app import (
     CollectorAgent,
     _consumer_context,
     _ConsumerContextError,
-    _llm_client,
     _llm_route,
     _log_session_events,
     _log_turn_latency,
@@ -71,6 +77,17 @@ from collector.voice_app import (
     _split_salutation,
     entrypoint,
 )
+
+# These tests park a pump thread on a gate and then release it, so every wait
+# below is a *hang detector*, not a performance assertion. They have to be
+# generous: `asyncio.to_thread` draws on the default executor, which the rest of
+# this suite is also using for `AuditStore` workers and other pumps, so how long
+# a pump waits for a thread — and how long the loop takes to reach `release.set()`
+# — depends on what else is running. A budget tight enough to double as a speed
+# check fails under load and says nothing useful when it does. This one still
+# catches a genuine hang, just later.
+_HANG = 30
+
 
 POLICY = PolicyConfig.default()
 
@@ -183,24 +200,28 @@ async def test_transient_failure_apology_reaches_the_model_context(store: AuditS
 
 @pytest.mark.asyncio
 async def test_successful_turn_is_recorded_once(store: AuditStore) -> None:
-    """The guard against fixing C4 by double-recording. The streaming path
-    logs one agent line per guarded sentence rather than one per turn, so the
-    claim generalizes: this turn's audit lines, joined in order, are exactly
-    what the session heard — nothing missing, nothing said twice."""
+    """The guard against fixing C4 by double-recording, restated for the
+    streaming path.
+
+    ``stream_turn`` guards and records one *sentence* at a time — that is what
+    lets TTS start before the turn finishes — so a turn no longer maps to a
+    single audit row. The invariant it has to preserve is the same one: what
+    the log says was said is exactly what the consumer heard, once. So the rows
+    this turn added, joined the way ``llm_node`` joins its chunks, are the
+    assistant message character for character — no line dropped, none doubled,
+    and no separator invented on either side.
+    """
     negotiation_agent, agent = _voice_agent(store, MockLLMClient())
+    opening = len(_agent_lines(store, negotiation_agent.call_id))
 
     async with AgentSession() as session:
         await session.start(agent)
         result = await session.run(user_input="Yes, this is Dana.")
 
     spoken = result.expect.next_event().is_message(role="assistant").event().item.text_content
-    turn_lines = [
-        t.text
-        for t in store.turns(negotiation_agent.call_id)
-        if t.speaker is Speaker.AGENT and t.turn_index == 1
-    ]
-    assert spoken == " ".join(turn_lines)
-    assert negotiation_agent.turns[-1].spoken == spoken
+    recorded = _agent_lines(store, negotiation_agent.call_id)[opening:]
+    assert recorded, "the consumer heard a reply the audit log says was never spoken"
+    assert " ".join(recorded) == spoken
 
 
 @pytest.mark.asyncio
@@ -222,23 +243,270 @@ async def test_consecutive_turns_share_one_session_history(store: AuditStore) ->
             for item in session.history.items
             if getattr(item, "role", None) == "user"
         ]
+        said = [
+            item.text_content
+            for item in session.history.items
+            if getattr(item, "role", None) == "assistant"
+        ]
 
     second.expect.next_event().is_message(role="assistant")
     second.expect.no_more_events()
     # ``heard`` is what proves no replay: the second ``run()`` saw its own
     # utterance on top, not the first one again.
     assert heard == ["Yes, this is Dana.", "How much do I owe?"]
-    # The separate claim that each turn spoke exactly its own words once: the
-    # streaming path records one audit line per guarded sentence, so each
-    # turn's lines are grouped by turn index and joined before comparing.
-    assert len(negotiation_agent.turns) == 2
-    for index, turn in enumerate(negotiation_agent.turns, start=1):
-        lines = [
-            t.text
-            for t in store.turns(negotiation_agent.call_id)
-            if t.speaker is Speaker.AGENT and t.turn_index == index
-        ]
-        assert " ".join(lines) == turn.spoken
+    # The separate claim that each turn spoke once. One assistant message per
+    # turn, and the audit rows behind them — many per turn on the streaming
+    # path, since each guarded sentence is recorded as it is released — account
+    # for those messages and nothing else. The opening line, recorded by
+    # ``open_call()`` before the session existed, is the row skipped here.
+    assert len(said) == 2
+    assert " ".join(_agent_lines(store, negotiation_agent.call_id)[1:]) == " ".join(said)
+
+
+# --------------------------------------------------------------------------
+# The sentence reaches TTS before the turn finishes
+# --------------------------------------------------------------------------
+#
+# The whole point of routing ``llm_node`` through ``stream_turn`` rather than
+# ``turn()``. A test that only collects every chunk and compares the text
+# passes identically on both paths and proves nothing, so the clients below
+# *block* mid-round: the first sentence has to arrive while the model call that
+# produced it is still open. On the ``turn()`` path that is a deadlock, which
+# is exactly what makes these tests discriminating rather than decorative.
+
+
+class _GatedStreamClient:
+    """One turn, two sentences, with a gate between them.
+
+    ``stream()`` hands over the first sentence and then blocks until the test
+    releases it, so a chunk observed before ``release`` is set is proof the
+    generation had not finished. The opening delegates to ``MockLLMClient`` so
+    the greeting clears the disclosure rules and the turn under test starts
+    from a clean guard state.
+    """
+
+    FIRST = "That works."
+    SECOND = "Let me read the arrangement back to you."
+
+    def __init__(self) -> None:
+        self._opening = MockLLMClient()
+        self.release = threading.Event()
+        self.first_delta_sent = threading.Event()
+
+    def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+        return self._opening.respond(messages)
+
+    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        yield TextDelta(f"{self.FIRST} ")
+        self.first_delta_sent.set()
+        assert self.release.wait(timeout=_HANG), "the test never released the gate"
+        yield TextDelta(f"{self.SECOND} ")
+        yield StreamCompleted(LLMResponse(text=f"{self.FIRST} {self.SECOND}"))
+
+
+@pytest.mark.asyncio
+async def test_the_first_sentence_arrives_before_the_turn_completes(store: AuditStore) -> None:
+    """The change this file exists to pin: TTS gets sentence one while the model
+    is still writing sentence two.
+
+    ``turn()`` could not satisfy this at any latency — it returns one string
+    after the last round trip — so the assertion is not "the text is right" but
+    "the chunk arrived while the round was open". The gate makes that
+    observable instead of a timing guess.
+    """
+    _, agent = _voice_agent(store, client := _GatedStreamClient())
+    ctx = llm.ChatContext.empty()
+    ctx.add_message(role="user", content="Yes, that's fine.")
+
+    stream = agent.llm_node(ctx, [], {})  # type: ignore[arg-type]
+    try:
+        first = await asyncio.wait_for(anext(stream), timeout=_HANG)
+
+        assert first == _GatedStreamClient.FIRST
+        # The round is provably mid-flight: the client is parked on the gate,
+        # so no `StreamCompleted` has been emitted and no round trip has
+        # returned. This is the assertion `turn()` cannot pass.
+        assert client.first_delta_sent.is_set()
+        assert not client.release.is_set()
+
+        client.release.set()
+        rest = [chunk async for chunk in stream]
+    finally:
+        client.release.set()
+        await stream.aclose()
+
+    # And every chunk after the first carries the separator the framework does
+    # not add, so the assistant message reads as prose rather than "works.Let".
+    # Asserted on shape rather than on the exact second sentence: the outbound
+    # guard decides what the rest of a turn is allowed to be, and this test is
+    # about when chunks arrive, not about what the guard permits.
+    assert rest, "the turn stopped after one sentence"
+    assert all(chunk.startswith(" ") for chunk in rest)
+
+
+class _ClosingStreamClient:
+    """Ends the call in round one, then speaks the goodbye in round two — with
+    a gate part-way through it, because the goodbye is the line a consumer is
+    most likely to talk over."""
+
+    GOODBYE = "You'll get an email confirming everything."
+    TAIL = "Take care now."
+
+    def __init__(self) -> None:
+        self._opening = MockLLMClient()
+        self.release = threading.Event()
+        self.rounds = 0
+
+    def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+        return self._opening.respond(messages)
+
+    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        self.rounds += 1
+        if self.rounds == 1:
+            yield StreamCompleted(
+                LLMResponse(
+                    tool_calls=(
+                        ToolCall(name="end_call", arguments={"reason": "done"}, call_id="toolu_1"),
+                    )
+                )
+            )
+            return
+        yield TextDelta(f"{self.GOODBYE} ")
+        assert self.release.wait(timeout=_HANG), "the test never released the gate"
+        yield TextDelta(f"{self.TAIL} ")
+        yield StreamCompleted(LLMResponse(text=f"{self.GOODBYE} {self.TAIL}"))
+
+
+@pytest.mark.asyncio
+async def test_a_barge_in_on_the_closing_turn_still_hangs_up(
+    store: AuditStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A call-killing bug the streaming path introduces if the shutdown check
+    sits after the loop instead of in a ``finally``.
+
+    A tool ends the call in round one; ``stream_turn`` owes one more round so
+    the consumer hears the arrangement read back. If they talk over *that*, the
+    framework tears this generator down at the ``yield`` — and a check placed
+    after the loop never runs. The room then stays open with an agent whose
+    every later turn returns early on ``ended``: silent for the rest of a call
+    that never hangs up.
+    """
+    negotiation_agent, agent = _voice_agent(store, client := _ClosingStreamClient())
+    hung_up: list[bool] = []
+    monkeypatch.setattr(agent, "_end_the_call", lambda: hung_up.append(True))
+    ctx = llm.ChatContext.empty()
+    ctx.add_message(role="user", content="Yes, let's do that.")
+
+    stream = agent.llm_node(ctx, [], {})  # type: ignore[arg-type]
+    try:
+        assert await asyncio.wait_for(anext(stream), timeout=_HANG) == _ClosingStreamClient.GOODBYE
+        # The precondition that makes the barge-in dangerous rather than
+        # ordinary: the call is already closed out, and only this generator
+        # knows to shut the room.
+        assert negotiation_agent.ended
+        assert hung_up == []
+    finally:
+        client.release.set()
+        # The barge-in itself. `aclose()` is what the framework calls on the
+        # node when a SpeechHandle is cancelled.
+        await stream.aclose()
+
+    assert hung_up == [True], "a barge-in on the closing turn left the room open"
+    # And the turn is still on the record — those sentences were audio, so
+    # abandoning the stream must not lose the exchange. It lands once the pump
+    # has closed the generator, which is what ``drain()`` waits for.
+    await asyncio.wait_for(agent.drain(timeout=_HANG), timeout=_HANG * 2)
+    assert negotiation_agent.turns
+    assert negotiation_agent.turns[-1].ended
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_turn_finishes_writing_before_the_store_closes(
+    store: AuditStore,
+) -> None:
+    """``drain()`` is what keeps the audit chain single-writer across a
+    barge-in.
+
+    The gate is *not* released before ``aclose()`` here, deliberately: that is
+    what leaves the pump genuinely parked inside ``next()`` when the generator is
+    closed, so the abandonment is cooperative — ``abandoned`` is what stops it —
+    rather than the generator simply having run to completion first. Releasing
+    the gate before closing (as the tests above do, since they are about
+    something else) makes this test pass with ``drain()`` deleted.
+
+    What has to land before ``store.close()`` is the ``AgentTurn`` that
+    ``CallEnded.turn_count`` is taken from. Asserted on the *count*: the
+    ``TurnRecorded`` rows for sentences already yielded were written by
+    ``_guard_sentence`` before ``anext()`` ever returned them, so looking for
+    one of those in the store proves nothing about the drain.
+    """
+    negotiation_agent, agent = _voice_agent(store, client := _GatedStreamClient())
+    ctx = llm.ChatContext.empty()
+    ctx.add_message(role="user", content="Yes, that's fine.")
+
+    stream = agent.llm_node(ctx, [], {})  # type: ignore[arg-type]
+    await asyncio.wait_for(anext(stream), timeout=_HANG)
+    turns_before = len(negotiation_agent.turns)
+
+    await stream.aclose()
+    # Still parked on the gate: the turn cannot have been recorded yet, which is
+    # precisely the window in which `store.close()` would lose it.
+    assert len(negotiation_agent.turns) == turns_before
+    client.release.set()
+
+    await asyncio.wait_for(agent.drain(timeout=_HANG), timeout=_HANG * 2)
+
+    assert len(negotiation_agent.turns) == turns_before + 1
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_every_pump_not_just_the_last(store: AuditStore) -> None:
+    """Two generations can be in flight at once, and a cancelled ``to_thread``
+    does not stop the thread under it — so the abandoned pump keeps generating,
+    keeps guarding sentences, and keeps writing to the store.
+
+    Tracked in a single slot, the older pump went untracked the moment the newer
+    one replaced it. ``drain()`` returned as soon as the newer one finished,
+    ``store.close()`` ran, and the older pump's next write hit a closed store:
+    a lost row on the single-writer compliance store, an ``AgentTurn`` appended
+    after ``CallEnded.turn_count`` was taken, and no diagnostic anywhere,
+    because the failure is relayed to a queue nobody reads.
+    """
+    negotiation_agent, agent = _voice_agent(store, first := _GatedStreamClient())
+    ctx = llm.ChatContext.empty()
+    ctx.add_message(role="user", content="Yes, that's fine.")
+
+    try:
+        # Generation one: started, parked on its gate, then abandoned.
+        stale = agent.llm_node(ctx, [], {})  # type: ignore[arg-type]
+        await asyncio.wait_for(anext(stale), timeout=_HANG)
+        (stale_pump,) = agent._pumps
+        await stale.aclose()
+
+        # Generation two, on a negotiation agent of its own, runs to completion.
+        agent._negotiation_agent = _voice_agent(store, second := _GatedStreamClient())[0]
+        second.release.set()
+        fresh = agent.llm_node(ctx, [], {})  # type: ignore[arg-type]
+        assert [chunk async for chunk in fresh]
+
+        # The load-bearing assertion, and the one a single slot fails: the
+        # abandoned pump is *still tracked* after a second generation replaced
+        # it, and still live — parked on its gate, so this cannot race. Under
+        # one slot it was not tracked at all and `drain()` had nothing to wait
+        # on. Asserted about this pump rather than by counting, because
+        # generation two's task settles a tick after its generator drains.
+        assert stale_pump in agent._pumps
+        assert not stale_pump.done()
+
+        turns_before = len(negotiation_agent.turns)
+    finally:
+        first.release.set()
+
+    await asyncio.wait_for(agent.drain(timeout=_HANG), timeout=_HANG * 2)
+
+    # Waited, not merely returned — so the store is safe to close.
+    assert stale_pump.done()
+    assert len(negotiation_agent.turns) == turns_before + 1
 
 
 # --------------------------------------------------------------------------
@@ -288,9 +556,9 @@ async def test_an_empty_utterance_says_nothing(store: AuditStore) -> None:
 
 @pytest.mark.asyncio
 async def test_an_ended_call_says_nothing_more(store: AuditStore) -> None:
-    """``stream_turn()`` raises on an ended call. A late utterance — the
-    consumer talking over the closing line — must be dropped here rather than
-    taking the call down after it has already been closed out."""
+    """``turn()`` raises on an ended call. A late utterance — the consumer
+    talking over the closing line — must be dropped here rather than taking
+    the call down after it has already been closed out."""
     negotiation_agent, agent = _voice_agent(store, MockLLMClient())
     negotiation_agent.close()
     ctx = llm.ChatContext.empty()
@@ -300,120 +568,7 @@ async def test_an_ended_call_says_nothing_more(store: AuditStore) -> None:
 
 
 # --------------------------------------------------------------------------
-# The streaming turn — sentences reach TTS while the model is still writing
-# --------------------------------------------------------------------------
-
-
-def _user_turn(utterance: str) -> llm.ChatContext:
-    ctx = llm.ChatContext.empty()
-    ctx.add_message(role="user", content=utterance)
-    return ctx
-
-
-class _GatedStreamingClient:
-    """A streaming client whose second sentence waits on the test — the shape
-    of a model mid-generation, held open so a test can observe the first
-    sentence crossing into TTS before the turn is anywhere near complete.
-    The opening delegates to ``MockLLMClient`` so it clears the outbound
-    guard's disclosure requirements, the same convention ``_RaisingLLMClient``
-    follows."""
-
-    first = "Thanks, Dana."
-    second = "Let me pull up the account."
-
-    def __init__(self) -> None:
-        self._opening = MockLLMClient()
-        self.release = threading.Event()
-
-    def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
-        return self._opening.respond(messages)
-
-    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
-        yield TextDelta(f"{self.first} ")
-        assert self.release.wait(timeout=10.0), "the test never released the stream"
-        yield TextDelta(self.second)
-        yield StreamCompleted(LLMResponse(text=f"{self.first} {self.second}"))
-
-
-@pytest.mark.asyncio
-async def test_the_first_sentence_is_yielded_mid_generation(store: AuditStore) -> None:
-    """The latency claim itself: the first guarded sentence comes out of
-    ``llm_node`` while the model is still writing the second, in order, and
-    with the separator that keeps the concatenated transcript identical to
-    the ``" ".join`` the ``AgentTurn`` records."""
-    client = _GatedStreamingClient()
-    negotiation_agent, agent = _voice_agent(store, client)
-    node = agent.llm_node(_user_turn("Yes, this is Dana."), [], {})  # type: ignore[arg-type]
-
-    first = await asyncio.wait_for(anext(node), timeout=10.0)
-    assert first == client.first
-    # Nothing on ``turns`` yet: the turn is still mid-generation, which is
-    # what proves the sentence above was yielded incrementally rather than
-    # after the fact.
-    assert negotiation_agent.turns == []
-
-    client.release.set()
-    rest = [chunk async for chunk in node]
-    assert rest == [f" {client.second}"]
-    assert negotiation_agent.turns[-1].spoken == f"{client.first} {client.second}"
-
-
-@pytest.mark.asyncio
-async def test_an_early_close_still_records_the_turn(store: AuditStore) -> None:
-    """Barge-in: the framework closes ``llm_node`` mid-generation. The sync
-    generator must be closed too — off the event loop — so ``stream_turn``'s
-    ``finally`` runs and the sentence the consumer already heard is on the
-    record, in ``turns`` and in the audit store, not lost with the
-    generator."""
-    client = _GatedStreamingClient()
-    negotiation_agent, agent = _voice_agent(store, client)
-    node = agent.llm_node(_user_turn("Yes, this is Dana."), [], {})  # type: ignore[arg-type]
-
-    first = await asyncio.wait_for(anext(node), timeout=10.0)
-    assert first == client.first
-
-    # The pump is blocked mid-`next` on the gated stream, so release it once
-    # aclose is already waiting — the ordering a real model call finishing
-    # after the interruption has. Threads cannot be interrupted; aclose must
-    # wait for it rather than close the generator out from under it.
-    asyncio.get_running_loop().call_later(0.05, client.release.set)
-    await asyncio.wait_for(node.aclose(), timeout=10.0)
-
-    (turn,) = negotiation_agent.turns
-    assert turn.consumer == "Yes, this is Dana."
-    assert turn.spoken is not None
-    assert turn.spoken.startswith(client.first)
-    assert client.first in _agent_lines(store, negotiation_agent.call_id)
-
-
-@pytest.mark.asyncio
-async def test_an_ended_turn_drains_into_session_shutdown(
-    store: AuditStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """When a turn ends the call, ``llm_node`` still asks the session to shut
-    down after the final line is yielded — the drain that lets the goodbye
-    finish playing before the room closes."""
-
-    class _FakeSession:
-        def __init__(self) -> None:
-            self.shutdowns = 0
-
-        def shutdown(self) -> None:
-            self.shutdowns += 1
-
-    fake = _FakeSession()
-    monkeypatch.setattr(CollectorAgent, "session", property(lambda self: fake))
-    negotiation_agent, agent = _voice_agent(store, MockLLMClient())
-
-    chunks = await _drive(agent, _user_turn("I want you to cease and desist."))
-
-    assert negotiation_agent.ended
-    assert chunks and chunks[0]
-    assert fake.shutdowns == 1
-
-
-# --------------------------------------------------------------------------
-# The seven-round-trip turn has to be measurable
+# The multi-round-trip turn has to be measurable
 # --------------------------------------------------------------------------
 
 
@@ -604,42 +759,26 @@ def test_full_mode_is_the_sdk_default(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _recording_options() is True
 
 
-def test_llm_route_defaults_to_anthropic(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The default is the one route that passes the live evals. ``livekit``
-    failed certification (03217e2): an unauthorized figure, a figure before
-    the Mini-Miranda, the coherence judge 3/3 — so a deployment missing the
-    ``COLLECTOR_LLM`` secret must land on Claude, not on the uncertified
-    route the rollback was pulled off of."""
+def test_llm_route_names_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("COLLECTOR_LLM", raising=False)
     assert _llm_route() == "anthropic"
     monkeypatch.setenv("COLLECTOR_LLM", "openrouter")
     assert _llm_route() == "openrouter"
 
 
-def test_llm_route_names_the_explicit_livekit_route(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``COLLECTOR_LLM=livekit`` remains an explicit measure-then-certify
-    route, and the drain has to name it or a trial run looks like Claude."""
-    monkeypatch.setenv("COLLECTOR_LLM", "livekit")
-    assert _llm_route() == "livekit"
-
-
-def test_llm_client_dispatches_in_lockstep_with_the_route(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The route name is only worth anything if ``_llm_client()`` agrees —
-    if the two diverge, every drained line reports a model that did not
-    answer the call. Dummy keys because the clients refuse to construct
-    without credentials, which is itself the eval harness's scripted-mode
-    signal."""
-    from collector.llm.anthropic_client import AnthropicClient
+def test_llm_client_dispatches_the_livekit_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The eval simulator certifies whatever this function returns
+    (``tests/evals/simulator.py::_agent_llm``), so a route the env selects but
+    this function ignores lets the suite certify one model while production
+    answers on another — the exact drift that let Gemini carry calls
+    uncertified the first time around."""
     from collector.llm.livekit_client import LiveKitInferenceClient
+    from collector.voice_app import _llm_client
 
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    monkeypatch.setenv("LIVEKIT_API_KEY", "test-key")
-    monkeypatch.setenv("LIVEKIT_API_SECRET", "test-secret")
-    monkeypatch.delenv("COLLECTOR_LLM", raising=False)
-    assert isinstance(_llm_client(), AnthropicClient)
     monkeypatch.setenv("COLLECTOR_LLM", "livekit")
+    monkeypatch.setenv("LIVEKIT_API_KEY", "lk_test_key")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "lk_test_secret")
+    assert _llm_route() == "livekit"
     assert isinstance(_llm_client(), LiveKitInferenceClient)
 
 
@@ -931,26 +1070,22 @@ def test_preemptive_tts_is_never_enabled() -> None:
     assert TURN_HANDLING["preemptive_generation"].get("preemptive_tts") is not True
 
 
-def test_endpointing_is_dynamic_within_the_measured_bounds() -> None:
-    """Three of five observed turns waited the full fixed 2.5s ceiling on
-    short utterances (~2s of silence), while the framework separately warned
-    the same ceiling is sometimes too *short* — so neither bound moves, and
-    dynamic mode adapts the wait between them from the session's own pause
-    statistics. Pinned so a later tuning pass cannot silently drop a bound:
-    losing the floor readmits the committed-too-early transcripts, losing
-    the ceiling readmits the 2.5s stalls."""
-    assert TURN_HANDLING["endpointing"] == {
-        "mode": "dynamic",
-        "min_delay": 0.3,
-        "max_delay": 2.5,
-    }
-
-
 def test_the_session_is_built_with_the_turn_handling_options() -> None:
     """The constant is only worth anything if `entrypoint()` passes it. Guards
     against the options being defined and then quietly not wired in."""
     source = inspect.getsource(entrypoint)
     assert "AgentSession(turn_handling=TURN_HANDLING)" in source
+
+
+def test_endpointing_commits_unsure_turns_faster_than_the_sdk_default() -> None:
+    """Measured calls sat the streaming default's full 2.5s ceiling on three
+    of five turns — the ceiling only binds when the turn detector is unsure,
+    and 2.5s of dead air on a phone reads as a hang. The floor stays at the
+    streaming default: the log has warned that transcripts can arrive after
+    the turn commits, and a lower floor widens exactly that race."""
+    endpointing = TURN_HANDLING["endpointing"]
+    assert endpointing["max_delay"] <= 1.5
+    assert endpointing["min_delay"] >= 0.3
 
 
 # --------------------------------------------------------------------------

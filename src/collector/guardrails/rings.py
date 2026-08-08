@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
@@ -37,7 +38,9 @@ from collector.guardrails.numeric import (
     Figure,
     authorized_for,
     check_numeric,
+    consumer_stated_money,
     extract_figures,
+    withheld_policy_money,
 )
 from collector.guardrails.prohibited import (
     Severity,
@@ -45,7 +48,9 @@ from collector.guardrails.prohibited import (
     is_negated,
     scan_prohibited,
 )
+from collector.guardrails.tiers import scan_tier_names
 from collector.llm.base import SYSTEM_PROMPT
+from collector.offers import Tier
 from collector.policy import PolicyConfig
 
 Speaker = Literal["consumer", "agent", "system"]
@@ -57,6 +62,14 @@ MAX_REGENERATION_STRIKES = 2
 SAFE_FALLBACK_TEXT = (
     "I'd rather not misstate anything, so let me keep this simple. What would work for you?"
 )
+
+# What to say when a block lands *after* real speech. The fallback above
+# restarts the conversation — reasonable when the consumer heard nothing, a
+# non-sequitur when the agent has just finished laying out an offer. This
+# closes the thought instead and leaves what was already said standing.
+# Deliberately says nothing: no figure, nothing substantive, and no term the
+# negotiation ring would read as bargaining after an escalation.
+CONNECTIVE_TEXT = "Does that work for you?"
 
 
 class GuardrailRing(StrEnum):
@@ -472,6 +485,16 @@ class GuardrailState:
     """Everything the rings remember. Frozen; each check returns its successor."""
 
     authorized: AuthorizedFigures
+    # Money the consumer named, which the agent may echo back. Kept apart from
+    # ``authorized`` because ``with_authorized`` re-derives that set from the
+    # engine on every tool result and would otherwise wipe this on the next
+    # tool call. See ``consumer_stated_money`` for how narrow it is.
+    acknowledged: AuthorizedFigures = AuthorizedFigures()
+    # The policy thresholds the engine withholds, which no echo may hand back.
+    # Seeded from the policy in ``opening``, the only way ``agent.py`` builds
+    # this state; a state assembled without one simply declares nothing
+    # withheld, the same way it declares nothing authorized.
+    withheld_money: frozenset[Decimal] = frozenset()
     disclosures: DisclosureState = DisclosureState()
     identity_confirmed: bool = False
     substantive_discussed: bool = False
@@ -484,7 +507,10 @@ class GuardrailState:
     def opening(
         cls, policy: PolicyConfig, *, authorized: AuthorizedFigures | None = None
     ) -> GuardrailState:
-        return cls(authorized=authorized if authorized is not None else authorized_for(policy))
+        return cls(
+            authorized=authorized if authorized is not None else authorized_for(policy),
+            withheld_money=withheld_policy_money(policy),
+        )
 
     @property
     def escalated(self) -> bool:
@@ -504,8 +530,12 @@ class GuardrailState:
     def with_identity_revoked(self) -> GuardrailState:
         """A later explicit denial undoes an earlier confirmation. Not a
         latch: substantive content must not keep flowing to someone who has
-        since said they are not the account holder (ADVERSARIAL_TESTING.md C1)."""
-        return replace(self, identity_confirmed=False)
+        since said they are not the account holder (ADVERSARIAL_TESTING.md C1).
+
+        Takes the acknowledgment set with it: whoever was speaking is not the
+        account holder, so nothing they named is the account holder's number.
+        """
+        return replace(self, identity_confirmed=False, acknowledged=AuthorizedFigures())
 
     def _record(self, event: GuardrailEvent) -> GuardrailState:
         return replace(self, events=(*self.events, event))
@@ -600,6 +630,13 @@ def check_inbound(state: GuardrailState, utterance: str) -> InboundCheck:
     signals = detect_escalation(utterance)
     disclosures = state.disclosures.observe_consumer(utterance)
     turn_index = state.consumer_turns
+    acknowledged = state.acknowledged.merged_with(
+        consumer_stated_money(
+            utterance,
+            ceiling=max(state.authorized.money, default=None),
+            withheld=state.withheld_money,
+        )
+    )
 
     escalation = state.escalation
     if escalation is None and signals:
@@ -612,6 +649,12 @@ def check_inbound(state: GuardrailState, utterance: str) -> InboundCheck:
             closing_line=escalation_closing(trigger),
         )
 
+    # Negotiation stops at escalation (A6), so the vocabulary it ran on goes
+    # with it: a figure the consumer floated before disputing the debt must
+    # not still be speakable afterwards.
+    if escalation is not None:
+        acknowledged = AuthorizedFigures()
+
     event = GuardrailEvent(
         ring=GuardrailRing.DURING_CALL,
         speaker="consumer",
@@ -622,6 +665,7 @@ def check_inbound(state: GuardrailState, utterance: str) -> InboundCheck:
     )
     new_state = replace(
         state,
+        acknowledged=acknowledged,
         disclosures=disclosures,
         escalation=escalation,
         consumer_turns=state.consumer_turns + 1,
@@ -674,6 +718,7 @@ def check_outbound(
     candidate: str,
     *,
     authorized: AuthorizedFigures | None = None,
+    standing_tier: Tier | None = None,
     confidential_reference: str = SYSTEM_PROMPT,
 ) -> OutboundCheck:
     """The pre-TTS gate. Nothing reaches the consumer's ear without passing here.
@@ -685,11 +730,22 @@ def check_outbound(
     ``tools.py`` (the four-module guardrail package would otherwise become
     a cycle: ``tools`` -> ``audit.events`` -> ``rings``).
     """
-    figure_set = authorized if authorized is not None else state.authorized
+    # Merged here rather than left to the caller: both real paths pass
+    # ``authorized=`` explicitly, so an acknowledgment folded into the state
+    # alone would be bypassed everywhere it matters.
+    figure_set = (authorized if authorized is not None else state.authorized).merged_with(
+        state.acknowledged
+    )
     violations: list[Violation] = []
     violations.extend(scan_prohibited(candidate))
     violations.extend(check_numeric(candidate, figure_set))
     violations.extend(state.disclosures.check_agent_turn(candidate))
+    # The companion to the numeric guard. That one settles which *figures* may
+    # be said; this settles what the arrangement they make up may be called.
+    # Both are needed: every amount in "I can offer a payment plan for the one
+    # thousand dollars" was engine-authored and passed the numeric guard, while
+    # the offer on the table was a downpayment plus one (live call, 2026-08-07).
+    violations.extend(scan_tier_names(candidate, standing_tier))
     if _contains_verbatim_leak(candidate, confidential_reference):
         violations.append(
             _ring_violation(

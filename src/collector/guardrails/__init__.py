@@ -12,8 +12,15 @@ lands in the audit log.
     )
 """
 
+from collector.guardrails.confirmation import (
+    ConfirmationRuleId,
+    confirmation_line,
+    repeats_back,
+)
 from collector.guardrails.disclosures import (
     AI_DISCLOSURE_TEXT,
+    AI_DISCLOSURE_WITH_HUMAN,
+    HUMAN_AVAILABLE_TEXT,
     MINI_MIRANDA_TEXT,
     DisclosureId,
     DisclosureRuleId,
@@ -42,6 +49,7 @@ from collector.guardrails.prohibited import (
     scan_prohibited,
 )
 from collector.guardrails.rings import (
+    CONNECTIVE_TEXT,
     MAX_REGENERATION_STRIKES,
     SAFE_FALLBACK_TEXT,
     CallSummary,
@@ -66,11 +74,15 @@ from collector.guardrails.rings import (
 
 __all__ = [
     "AI_DISCLOSURE_TEXT",
+    "AI_DISCLOSURE_WITH_HUMAN",
+    "CONNECTIVE_TEXT",
+    "HUMAN_AVAILABLE_TEXT",
     "MAX_REGENERATION_STRIKES",
     "MINI_MIRANDA_TEXT",
     "SAFE_FALLBACK_TEXT",
     "AuthorizedFigures",
     "CallSummary",
+    "ConfirmationRuleId",
     "DisclosureId",
     "DisclosureRuleId",
     "DisclosureState",
@@ -97,6 +109,7 @@ __all__ = [
     "check_numeric",
     "check_outbound",
     "check_pre_call",
+    "confirmation_line",
     "detect_escalation",
     "escalation_closing",
     "extract_figures",
@@ -106,6 +119,7 @@ __all__ = [
     "fires_mini_miranda",
     "is_prohibited",
     "is_substantive",
+    "repeats_back",
     "requests_ai_disclosure",
     "scan_prohibited",
 ]

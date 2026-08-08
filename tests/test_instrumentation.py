@@ -25,9 +25,11 @@ from pathlib import Path
 
 import pytest
 
-from collector.agent import NegotiationAgent, _split_sentences
+from collector.agent import MAX_TOOL_ROUNDS, NegotiationAgent, _split_sentences
 from collector.audit.events import (
     EventType,
+    GuardrailAction,
+    GuardrailTripped,
     ModelCalled,
     Speaker,
     ToolInvoked,
@@ -42,7 +44,13 @@ from collector.guardrails.disclosures import (
     DisclosureId,
     fires_ai_disclosure,
 )
-from collector.guardrails.rings import SAFE_FALLBACK_TEXT, PreCallContext
+from collector.guardrails.rings import (
+    CONNECTIVE_TEXT,
+    MAX_REGENERATION_STRIKES,
+    SAFE_FALLBACK_TEXT,
+    PreCallContext,
+    check_outbound,
+)
 from collector.llm.base import (
     LLMClient,
     LLMResponse,
@@ -107,12 +115,20 @@ class TestArgumentSchema:
 
         assert properties["payment_count"] == {
             "type": "integer",
-            "description": "How many payments to split it into. 1 for a lump sum.",
+            "description": (
+                "How many payments they said to split it into. 1 for a lump sum. "
+                "Omit when they did not say — a bare figure like 'three hundred "
+                "dollars' names no count, and inventing one is what turned $150 "
+                "into a refusal for overpaying."
+            ),
             "minimum": 1,
             "maximum": MAX_PROPOSED_PAYMENTS,
         }
         assert properties["cadence"]["enum"] == [c.value for c in Cadence]
-        assert set(schema.input_schema["required"]) == {"payment_count", "cadence"}
+        # Nothing is required. Every field on this tool describes something the
+        # consumer may or may not have said, and a required field is one the
+        # model must invent when they did not say it.
+        assert schema.input_schema["required"] == []
 
     def test_arguments_reach_the_handler_already_typed(self) -> None:
         parsed = next(s for s in TOOL_SCHEMAS if s.name == "validate_consumer_offer").parse(
@@ -136,8 +152,11 @@ class TestArgumentSchema:
     @pytest.mark.parametrize(
         ("arguments", "expected"),
         [
-            ({"payment_count": 2}, "cadence is required"),
-            ({"cadence": "monthly"}, "payment_count is required"),
+            # payment_count and cadence are deliberately optional: a consumer who
+            # names a bare figure ("three hundred dollars") states neither, and
+            # requiring them forced the model to invent a count — which is what
+            # turned $150 into a refusal for collecting more than was owed.
+            # Omitting them is legal; naming them badly still is not.
             ({"payment_count": 0, "cadence": "monthly"}, "at least 1"),
             (
                 {"payment_count": MAX_PROPOSED_PAYMENTS + 1, "cadence": "monthly"},
@@ -776,11 +795,21 @@ class _SplitMiniMiranda(_Streamer):
 
 
 class _ThreatensAfterDisclosing(_Streamer):
-    """Clears the disclosure, then threatens. The block lands mid-stream, so
-    the round aborts before ``StreamCompleted`` ever arrives."""
+    """Clears the disclosure, says something substantive, then threatens. The
+    block lands mid-stream, so the round aborts before ``StreamCompleted``
+    ever arrives.
+
+    The balance line is load-bearing, not scenery: the connective closes a
+    *proposition*, and the notice is not one. A turn whose only surviving
+    content was the Mini-Miranda used to earn "Does that work for you?",
+    which asked the consumer to assent to a legal disclosure (live call,
+    2026-08-07). The balance is engine-authorized from the opening, so this
+    turn says something that genuinely stands.
+    """
 
     lines = (
         MINI_MIRANDA_TEXT,
+        "There is a balance of one thousand dollars on your account.",
         "Pay today or we will garnish your wages.",
         "So what will it be?",
     )
@@ -792,6 +821,7 @@ class _InventsADueDate(_Streamer):
 
     lines = (
         MINI_MIRANDA_TEXT,
+        "There is a balance of one thousand dollars on your account.",
         "Your first payment is due Jan. 15.",
         "Does that work?",
     )
@@ -827,6 +857,7 @@ class _AlwaysAnotherTool:
 
     def __init__(self) -> None:
         self.opened = False
+        self.rounds = 0
 
     def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
         if not self.opened:
@@ -835,6 +866,7 @@ class _AlwaysAnotherTool:
         return LLMResponse(tool_calls=(ToolCall(name="record_refusal"),))
 
     def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        self.rounds += 1
         yield StreamCompleted(LLMResponse(tool_calls=(ToolCall(name="record_refusal"),)))
 
 
@@ -950,28 +982,43 @@ class TestStreamingTurn:
         assert agent.ended
         assert closing, "a turn that ends the call in silence is a dead line"
 
-    def test_a_blocked_sentence_aborts_to_the_fallback_rather_than_regenerating(self) -> None:
+    def test_a_blocked_sentence_aborts_rather_than_regenerating_once_audio_exists(
+        self,
+    ) -> None:
         """The text path can retry because nothing was spoken. Here the earlier
         sentences are already audio, so a retry would contradict what the
-        consumer just heard."""
+        consumer just heard.
+
+        The turn closes on the connective rather than the scripted fallback —
+        see ``TestABlockAfterRealSpeechClosesTheThought``. What this test is
+        about is that the stream *aborts*: the blocked sentence never goes out
+        and neither does anything the model wrote after it.
+        """
 
         class ThreateningStreamer:
+            attempts = 0
+
             def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
                 # Used only for the opening line, which stream_turn does not drive.
                 return LLMResponse(text=_GREETING)
 
             def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+                type(self).attempts += 1
                 yield TextDelta("Am I speaking with the account holder? ")
                 yield TextDelta("Pay today or we will garnish your wages. ")
                 yield TextDelta("So what will it be? ")
                 yield StreamCompleted(LLMResponse(text="..."))
 
-        agent = _agent(llm=ThreateningStreamer())
+        llm = ThreateningStreamer()
+        agent = _agent(llm=llm)
         agent.open_call()
         spoken = list(agent.stream_turn("Yes, this is Dana."))
 
+        assert llm.attempts == 1, "the model was asked again after speech was already out"
         assert "Am I speaking with the account holder?" in spoken
         assert not any("garnish" in s for s in spoken)
+        # Nothing substantive was said, so the closer is the fallback rather
+        # than the connective — see ``TestABlockAfterRealSpeechClosesTheThought``.
         assert spoken[-1] == SAFE_FALLBACK_TEXT
         assert not any("So what will it be?" in s for s in spoken), "the stream aborts, not skips"
         assert agent.turns[-1].blocked
@@ -1080,17 +1127,22 @@ class TestStreamingTurn:
         tool_at = [i for i, m in enumerate(second) if m.role == "tool"]
         assert tool_at and tool_at[-1] > spoke_at[-1], "spoken first, then the engine's answer"
 
-    def test_the_scripted_fallback_is_written_to_the_transcript_once(self) -> None:
-        """``_speak_verbatim`` put the fallback into ``self.messages`` and the
-        end-of-turn join put it there again — two consecutive assistant
-        messages carrying the same line."""
+    def test_the_scripted_closing_line_is_written_to_the_transcript_once(self) -> None:
+        """``_speak_verbatim`` put the scripted line into ``self.messages`` and
+        the end-of-turn join put it there again — two consecutive assistant
+        messages carrying the same line.
+
+        This turn speaks before it is blocked, so the line that closes it is
+        the connective; the duplication it guards against is a property of
+        every code-authored line, whichever one applies.
+        """
         agent = _agent(llm=_ThreatensAfterDisclosing())
         agent.open_call()
         before = sum(1 for m in agent.messages if m.role == "agent")
         list(agent.stream_turn("Yes, this is Dana."))
         written = [m.content for m in agent.messages if m.role == "agent"][before:]
 
-        assert sum(m.count(SAFE_FALLBACK_TEXT) for m in written) == 1
+        assert sum(m.count(CONNECTIVE_TEXT) for m in written) == 1
         assert len(written) == 1, "one assistant message for the turn, not one per line"
 
     def test_an_aborted_round_still_records_its_model_call(self, tmp_path: Path) -> None:
@@ -1103,7 +1155,7 @@ class TestStreamingTurn:
             spoken = list(agent.stream_turn("Yes, this is Dana."))
             calls = store.model_calls(agent.call_id)
 
-        assert spoken[-1] == SAFE_FALLBACK_TEXT, "the round did abort"
+        assert spoken[-1] == CONNECTIVE_TEXT, "the round did abort"
         assert calls, "an aborted round still spent a model call"
         assert any(c.stop_reason == "aborted" for c in calls)
         assert all(c.latency_ms >= 0 for c in calls)
@@ -1119,7 +1171,584 @@ class TestStreamingTurn:
 
         assert not any("Jan" in s for s in spoken), "an unauthorized date reached TTS"
         assert not any("15" in s for s in spoken)
+        assert spoken[-1] == CONNECTIVE_TEXT
+
+
+def _notes(agent: NegotiationAgent) -> list[str]:
+    """The guard's notes back to the model — every system message except the
+    system prompt itself, which is always ``messages[0]``."""
+    return [m.content for m in agent.messages[1:] if m.role == "system"]
+
+
+class _ThreateningStreamer:
+    """Speaks one clean sentence, then one the prohibited-language ring blocks."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+        return LLMResponse(text=_GREETING)
+
+    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        self.attempts += 1
+        yield TextDelta("Am I speaking with the account holder? ")
+        yield TextDelta("Pay today or we will garnish your wages. ")
+        yield StreamCompleted(LLMResponse(text="..."))
+
+
+class _ToolsForeverThenThreatens:
+    """Asks for one more tool every round until the budget is nearly gone,
+    then blocks — putting the block on the loop's last available iteration."""
+
+    def __init__(self, tool_rounds: int) -> None:
+        self.tool_rounds = tool_rounds
+        self.attempts = 0
+
+    def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+        return LLMResponse(text=_GREETING)
+
+    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        self.attempts += 1
+        if self.attempts <= self.tool_rounds:
+            yield StreamCompleted(LLMResponse(tool_calls=(ToolCall(name="record_refusal"),)))
+            return
+        yield TextDelta("Pay today or we will garnish your wages. ")
+        yield StreamCompleted(LLMResponse(text="..."))
+
+
+class TestABlockedStreamTellsTheModelWhy:
+    """The text path names the violation back to the model and the next
+    generation is informed by it (``_guard_and_speak``). The streaming path
+    threw that away: it aborted, spoke a scripted line, and left the message
+    history looking exactly as it did before — so the model's next turn had
+    no reason not to reach for the same blocked phrasing again.
+    """
+
+    def test_the_violation_reason_reaches_the_message_history(self) -> None:
+        agent = _agent(llm=_ThreateningStreamer())
+        agent.open_call()
+        list(agent.stream_turn("Yes, this is Dana."))
+
+        notes = _notes(agent)
+        assert notes, "the model was told nothing about why it was cut off"
+        assert "THREAT" in notes[-1]
+        assert "garnish" in notes[-1], "name the phrasing that was blocked"
+
+    def test_the_note_follows_what_was_actually_spoken(self) -> None:
+        """History order is what the next round reads. A note about a blocked
+        sentence filed *before* the sentences that were spoken reads as though
+        the spoken ones were the problem."""
+        agent = _agent(llm=_ThreateningStreamer())
+        agent.open_call()
+        list(agent.stream_turn("Yes, this is Dana."))
+
+        spoke_at = max(i for i, m in enumerate(agent.messages) if "account holder" in m.content)
+        noted_at = max(i for i, m in enumerate(agent.messages) if m.role == "system")
+        assert spoke_at < noted_at, [m.role for m in agent.messages]
+
+    def test_a_clean_turn_leaves_no_note(self) -> None:
+        agent = _agent()
+        agent.open_call()
+        list(agent.stream_turn("Yes, this is Dana."))
+
+        assert not _notes(agent)
+
+
+class _BlocksThenComplies:
+    """Blocks on its first streamed attempt, then says something clean.
+
+    The block lands on the *first* sentence, so nothing has been spoken and
+    the streaming contract's reason for aborting — "a retry would contradict
+    what the consumer just heard" — does not apply.
+    """
+
+    def __init__(self, attempts_before_complying: int = 1) -> None:
+        self.attempts_before_complying = attempts_before_complying
+        self.attempts = 0
+        self.prompts: list[tuple[Message, ...]] = []
+
+    def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+        return LLMResponse(text=_GREETING)
+
+    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        self.attempts += 1
+        self.prompts.append(messages)
+        if self.attempts <= self.attempts_before_complying:
+            yield TextDelta("Pay today or we will garnish your wages. ")
+        else:
+            yield TextDelta("Thanks for confirming. ")
+            yield TextDelta("What would be manageable for you? ")
+        yield StreamCompleted(LLMResponse(text="..."))
+
+
+class TestTheRoundBudgetIsNotInflatedByTheRewriteAllowance:
+    def test_a_turn_that_never_blocks_gets_the_tool_budget_it_always_had(self) -> None:
+        """The rewrite allowance was added to the loop bound unconditionally,
+        so every turn — including one with no guard trip at all — bought two
+        extra model round-trips and two extra tool batches before giving up.
+        On a voice line that is latency and spend the budget exists to cap."""
+        llm = _AlwaysAnotherTool()
+        agent = _agent(llm=llm)
+        agent.open_call()
+        list(agent.stream_turn("Yes, this is Dana."))
+
+        assert llm.rounds == MAX_TOOL_ROUNDS + 1, llm.rounds
+
+
+class TestAZeroSpokenStreamBlockRegenerates:
+    """The streaming path aborted to the scripted fallback on *any* block.
+
+    The reason it gives is sound only when something has already been
+    spoken: a retry would then contradict live audio. When the block lands
+    before a single sentence has gone to TTS, nothing has been contradicted,
+    and the turn can be rewritten exactly the way the text path rewrites it.
+    Aborting there spent a scripted non-sequitur on a turn that had every
+    chance of clearing on the second attempt.
+    """
+
+    def test_a_block_before_any_speech_is_rewritten_not_abandoned(self) -> None:
+        llm = _BlocksThenComplies()
+        agent = _agent(llm=llm)
+        agent.open_call()
+        spoken = list(agent.stream_turn("Yes, this is Dana."))
+        joined = " ".join(spoken)
+
+        assert llm.attempts == 2, "the turn was never retried"
+        assert "Thanks for confirming." in joined
+        assert SAFE_FALLBACK_TEXT not in joined
+        assert not any("garnish" in s for s in spoken)
+        assert agent.turns[-1].blocked, "the block still belongs on the record"
+
+    def test_the_retry_is_told_why_before_it_runs(self) -> None:
+        """A rewrite asked with unchanged context reproduces the blocked
+        phrasing and burns the strike budget for nothing."""
+        llm = _BlocksThenComplies()
+        agent = _agent(llm=llm)
+        agent.open_call()
+        list(agent.stream_turn("Yes, this is Dana."))
+
+        assert len(llm.prompts) == 2, "no retry to inspect"
+        retry_prompt = " ".join(m.content for m in llm.prompts[1])
+        assert "THREAT" in retry_prompt, "the retry was asked blind"
+        assert "garnish" in retry_prompt, "and was not told which phrasing to drop"
+
+    def test_rewrites_are_capped_by_the_existing_strike_budget(self) -> None:
+        """A model that will not comply must still stop costing round-trips."""
+        llm = _BlocksThenComplies(attempts_before_complying=99)
+        agent = _agent(llm=llm)
+        agent.open_call()
+        spoken = list(agent.stream_turn("Yes, this is Dana."))
+
+        assert llm.attempts == MAX_REGENERATION_STRIKES
         assert spoken[-1] == SAFE_FALLBACK_TEXT
+
+    def test_a_block_after_real_speech_still_does_not_retry(self) -> None:
+        """The contract that survives: those sentences are already audio."""
+        llm = _ThreateningStreamer()
+        agent = _agent(llm=llm)
+        agent.open_call()
+        list(agent.stream_turn("Yes, this is Dana."))
+
+        assert llm.attempts == 1, "the model was asked again after speech was already out"
+        assert agent.turns[-1].spoken is not None
+        assert "Am I speaking with the account holder?" in agent.turns[-1].spoken
+
+    @pytest.mark.parametrize("tool_rounds", [MAX_TOOL_ROUNDS, MAX_TOOL_ROUNDS + 2])
+    def test_a_rewrite_is_never_recorded_when_no_round_remains_to_run_it(
+        self, tmp_path: Path, tool_rounds: int
+    ) -> None:
+        """The action was decided from "nothing spoken, strikes left" alone,
+        which ignores whether the loop has an iteration left to *do* the
+        rewrite in. A block on the last one recorded REGENERATED and then
+        fell straight out of the loop to the scripted line — an audit trail
+        claiming a rewrite that never happened.
+
+        The invariant, whatever the budget: a recorded rewrite means the
+        model really was asked to speak again. So a turn that reached the
+        guard only once cannot have rewritten anything.
+        """
+        llm = _ToolsForeverThenThreatens(tool_rounds=tool_rounds)
+        with AuditStore(tmp_path / f"budget{tool_rounds}.db", json_dir=tmp_path) as store:
+            agent = _agent(store, llm=llm)
+            agent.open_call()
+            list(agent.stream_turn("Yes, this is Dana."))
+            actions = [
+                event.action
+                for event in store.trace(agent.call_id)
+                if isinstance(event, GuardrailTripped)
+            ]
+
+        speaking_attempts = llm.attempts - tool_rounds
+        if GuardrailAction.REGENERATED in actions:
+            assert speaking_attempts >= 2, (
+                f"claimed a rewrite after {speaking_attempts} attempt(s) to speak"
+            )
+        assert agent.turns[-1].was_regenerated == bool(actions)
+
+    def test_the_audit_log_says_regenerated_only_when_it_regenerated(self, tmp_path: Path) -> None:
+        """An audit trail that says "blocked" about a turn that was rewritten,
+        or "regenerated" about one that was abandoned, is a false record of
+        what the guard did."""
+        with AuditStore(tmp_path / "retried.db", json_dir=tmp_path) as store:
+            agent = _agent(store, llm=_BlocksThenComplies())
+            agent.open_call()
+            list(agent.stream_turn("Yes, this is Dana."))
+            retried = [
+                event.action
+                for event in store.trace(agent.call_id)
+                if isinstance(event, GuardrailTripped)
+            ]
+
+        assert retried and all(a is GuardrailAction.REGENERATED for a in retried), retried
+
+        with AuditStore(tmp_path / "abandoned.db", json_dir=tmp_path) as store:
+            agent = _agent(store, llm=_ThreateningStreamer())
+            agent.open_call()
+            list(agent.stream_turn("Yes, this is Dana."))
+            abandoned = [
+                event.action
+                for event in store.trace(agent.call_id)
+                if isinstance(event, GuardrailTripped)
+            ]
+
+        # Nothing substantive was spoken, so the turn is handed to the
+        # scripted fallback and the trail says so — the text path's own word
+        # for the same situation. See TestTheTrailSaysHowAStreamedTurnClosed.
+        assert abandoned and all(a is GuardrailAction.SAFE_FALLBACK for a in abandoned), abandoned
+
+
+def _actions(store: AuditStore, agent: NegotiationAgent) -> list[GuardrailAction]:
+    return [
+        event.action for event in store.trace(agent.call_id) if isinstance(event, GuardrailTripped)
+    ]
+
+
+class TestTheTrailSaysHowAStreamedTurnClosed:
+    """A streamed turn now ends one of three ways — rewritten, closed on the
+    connective, or handed to the scripted fallback. The trail knew two
+    verbs, so it could not say which line the consumer actually heard, and
+    it disagreed with the text path about the one situation they share.
+    """
+
+    def test_a_streamed_fallback_is_recorded_the_way_the_text_path_records_it(
+        self, tmp_path: Path
+    ) -> None:
+        """Same situation, same word for it. Counting scripted lines off the
+        trail otherwise undercounts the voice path to zero."""
+        with AuditStore(tmp_path / "stream.db", json_dir=tmp_path) as store:
+            streamed = _agent(store, llm=_BlocksThenComplies(attempts_before_complying=99))
+            streamed.open_call()
+            spoken = list(streamed.stream_turn("Yes, this is Dana."))
+            streamed_actions = _actions(store, streamed)
+
+        with AuditStore(tmp_path / "text.db", json_dir=tmp_path) as store:
+            texted = _agent(store, llm=_AlwaysBlocked())
+            texted.open_call()
+            texted._perceive("Yes, this is Dana.")
+            texted.turn("What are my options?")
+            text_actions = _actions(store, texted)
+
+        assert spoken[-1] == SAFE_FALLBACK_TEXT
+        assert GuardrailAction.SAFE_FALLBACK in text_actions, "the text path's own word"
+        assert GuardrailAction.SAFE_FALLBACK in streamed_actions, streamed_actions
+
+    def test_a_connective_close_is_not_recorded_as_a_fallback(self, tmp_path: Path) -> None:
+        """The consumer heard the offer plus "Does that work for you?" in one
+        case and a scripted restart in the other. A reader of the trail has
+        to be able to tell those apart."""
+        with AuditStore(tmp_path / "connective.db", json_dir=tmp_path) as store:
+            agent = _agent(store, llm=_ThreatensAfterDisclosing())
+            agent.open_call()
+            spoken = list(agent.stream_turn("Yes, this is Dana."))
+            actions = _actions(store, agent)
+
+        assert spoken[-1] == CONNECTIVE_TEXT
+        assert actions and GuardrailAction.SAFE_FALLBACK not in actions, actions
+        assert GuardrailAction.CONNECTIVE in actions, actions
+
+
+class TestABlockAfterRealSpeechClosesTheThought:
+    """The scripted fallback restarts the conversation — "let me keep this
+    simple, what would work for you?" That is a recovery when the consumer
+    heard nothing. After the agent has just finished laying out an offer it
+    is a non-sequitur that talks over its own proposal, and the offer
+    already stands on its own. A short connective closes the thought and
+    leaves it standing.
+    """
+
+    def test_the_connective_replaces_the_fallback_after_substantive_speech(self) -> None:
+        agent = _agent(llm=_ThreatensAfterDisclosing())
+        agent.open_call()
+        spoken = list(agent.stream_turn("Yes, this is Dana."))
+
+        assert spoken[-1] == CONNECTIVE_TEXT
+        assert SAFE_FALLBACK_TEXT not in spoken
+        assert MINI_MIRANDA_TEXT in spoken, "the turn did say something that stands"
+        assert not any("garnish" in s for s in spoken), "the block still holds"
+
+    def test_a_turn_that_only_said_pleasantries_gets_the_fallback(self) -> None:
+        """ "Does that work for you?" asks about something. After "Thanks for
+        confirming." it is the same non-sequitur it was brought in to
+        replace, just shorter — there is no offer standing for it to refer
+        to. The gate is substantive speech, not any speech at all.
+        """
+
+        class _ThanksThenThreatens:
+            def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+                return LLMResponse(text=_GREETING)
+
+            def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+                yield TextDelta("Thanks for confirming. ")
+                yield TextDelta("Pay today or we will garnish your wages. ")
+                yield StreamCompleted(LLMResponse(text="..."))
+
+        agent = _agent(llm=_ThanksThenThreatens())
+        agent.open_call()
+        spoken = list(agent.stream_turn("Yes, this is Dana."))
+
+        assert "Thanks for confirming." in spoken
+        assert spoken[-1] == SAFE_FALLBACK_TEXT
+        assert CONNECTIVE_TEXT not in spoken
+
+    def test_a_turn_that_never_spoke_still_gets_the_fallback(self) -> None:
+        """Nothing to connect to, so there is nothing to close."""
+        agent = _agent(llm=_BlocksThenComplies(attempts_before_complying=99))
+        agent.open_call()
+        spoken = list(agent.stream_turn("Yes, this is Dana."))
+
+        assert spoken[-1] == SAFE_FALLBACK_TEXT
+
+    def test_a_pending_ai_disclosure_still_wins(self) -> None:
+        """The fallback carries the AI disclosure when the consumer has just
+        asked whether they are talking to a machine — that question is the
+        obligation, and a connective that closes the thought instead would
+        silently drop the answer.
+
+        Checked at the seam, like the escalation case and for a similar
+        reason: ``stream_turn`` cannot reach this branch either.
+        ``_owes_a_disclosure`` withholds every sentence while the request is
+        outstanding, so a turn with the flag set has no speech to close on
+        and takes the rewrite path instead. Driving it through
+        ``stream_turn`` produces a test that passes on the strength of that
+        detour while asserting nothing about this branch at all.
+        """
+        agent = _agent()
+        agent.open_call()
+        agent._perceive("Wait, am I talking to a machine?")
+        assert agent.guard.disclosures.ai_disclosure_requested
+
+        line = agent._stream_connective()
+        assert line != CONNECTIVE_TEXT
+        assert fires_ai_disclosure(line), line
+
+    def test_an_escalation_closing_line_is_never_replaced(self) -> None:
+        """Once the consumer has escalated, ``fallback_for`` returns the
+        closing line and that line is the compliance obligation — a
+        connective inviting more negotiation must not displace it.
+
+        Checked at the seam rather than through ``stream_turn``, which cannot
+        reach it: ``_perceive`` hands an escalated turn straight to
+        ``_escalate`` and ends the call before any generation runs.
+        """
+        agent = _agent()
+        agent.open_call()
+        agent._perceive("I've retained a lawyer for this.")
+
+        assert agent.guard.escalated
+        assert agent._stream_connective() != CONNECTIVE_TEXT
+
+    def test_an_announcement_with_no_terms_does_not_get_the_connective(self) -> None:
+        """A live call spoke exactly "Here's what I'm able to offer. Does
+        that work for you?" — an announcement of an offer that never
+        arrived, closed as though terms were standing. "offer" is a
+        substantive keyword, but nothing self-standing was said: no figure
+        reached the consumer's ear, and the sentence only points forward at
+        the content the guard then blocked. That prefix has nothing for a
+        connective to close; it takes the honest restart instead.
+        """
+
+        class _AnnouncesThenTripsTheGuard:
+            """Mini-Miranda in one turn, then a contentless announcement
+            followed by a blocked sentence — the live-call shape."""
+
+            def __init__(self) -> None:
+                self.streams = 0
+
+            def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+                return LLMResponse(text=_GREETING)
+
+            def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+                self.streams += 1
+                if self.streams == 1:
+                    yield TextDelta(f"{MINI_MIRANDA_TEXT} ")
+                    yield StreamCompleted(LLMResponse(text=MINI_MIRANDA_TEXT))
+                    return
+                yield TextDelta("Here's what I'm able to offer. ")
+                yield TextDelta("Pay today or we will garnish your wages. ")
+                yield StreamCompleted(LLMResponse(text="..."))
+
+        agent = _agent(llm=_AnnouncesThenTripsTheGuard())
+        agent.open_call()
+        assert MINI_MIRANDA_TEXT in list(agent.stream_turn("Yes, this is Dana."))
+        spoken = list(agent.stream_turn("What are my options?"))
+
+        assert "Here's what I'm able to offer." in spoken
+        assert CONNECTIVE_TEXT not in spoken, "nothing stood for it to close"
+        assert spoken[-1] == SAFE_FALLBACK_TEXT
+        assert not any("garnish" in s for s in spoken), "the block still holds"
+
+
+class _AlwaysBlocked:
+    """Never produces a sentence the guard will pass, on any turn."""
+
+    def __init__(self, opened: bool = False) -> None:
+        self.opened = opened
+
+    def respond(self, messages: tuple[Message, ...]) -> LLMResponse:
+        if not self.opened:
+            self.opened = True
+            return LLMResponse(text=_GREETING)
+        return LLMResponse(text="Pay today or we will garnish your wages.")
+
+    def stream(self, messages: tuple[Message, ...]) -> Iterator[StreamEvent]:
+        yield TextDelta("Pay today or we will garnish your wages. ")
+        yield StreamCompleted(LLMResponse(text="..."))
+
+
+class TestRepeatedFallbacksEscalateToTheStandingOffer:
+    """Two fallbacks in a row is the agent asking "what would work for you?"
+    twice while the consumer waits for terms it has already been given. The
+    second trip says something instead: the offer on the table, rendered by
+    code from the engine's own numbers.
+    """
+
+    def _agent_with_an_offer(self, llm: object) -> NegotiationAgent:
+        """Mid-call: identity confirmed, both disclosures made, an offer on
+        the table. The Mini-Miranda matters — nothing substantive clears the
+        guard before it, so a restatement of terms cannot precede it either."""
+        agent = _agent(llm=llm)
+        agent.open_call()
+        agent._perceive("Yes, this is Dana.")
+        agent._observe_scripted(MINI_MIRANDA_TEXT)
+        agent._run_tool(_call("propose_offer"))
+        return agent
+
+    def test_the_first_fallback_still_asks_the_open_question(self) -> None:
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        first = agent.turn("What are my options?")
+
+        assert first.spoken == SAFE_FALLBACK_TEXT
+
+    def test_the_second_consecutive_fallback_restates_the_offer(self) -> None:
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        agent.turn("What are my options?")
+        second = agent.turn("You still haven't told me anything.")
+
+        offer = agent.tools.standing_offer
+        assert offer is not None
+        assert second.spoken is not None
+        assert second.spoken != SAFE_FALLBACK_TEXT
+        for installment in offer.installments:
+            assert str(installment.amount) in second.spoken
+
+    def test_the_restatement_clears_the_guard_on_its_own_figures(self) -> None:
+        """It is spoken through ``_speak_verbatim``, which bypasses
+        ``check_outbound`` entirely — so a line that would *not* have cleared
+        is a line that reaches TTS unchecked. Every figure in it comes from
+        the engine's own offer, and that has to be true by test, not by
+        inspection.
+
+        The default offer is pay-in-full, whose only figure is the account
+        balance — and ``authorized_for`` puts the balance in the base set
+        before any offer exists. A line built from that clears against a
+        guard that has never seen an offer, so it cannot detect a broken
+        offer-to-authorized derivation. Concede first, so the figures are
+        the schedule's and nothing else.
+        """
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        # A capacity has to be on record first: concede refuses without one
+        # rather than let the engine guess (the $200 -> $750/$250 bug). The
+        # lowball is rejected, which itself puts a refusal on record.
+        agent._run_tool(
+            _call("validate_consumer_offer", total="300", payment_count=1, cadence="immediate")
+        )
+        agent._run_tool(_call("concede"))
+        agent.turn("What are my options?")
+        line = agent._fallback_line()
+        balance = str(POLICY.original_balance)
+
+        assert line != SAFE_FALLBACK_TEXT
+        assert balance not in line, f"only the balance is proven by this: {line}"
+        check = check_outbound(agent.guard, line, authorized=agent.authorized)
+        assert check.allowed, check.violations
+
+    def test_a_turn_that_speaks_resets_the_count(self) -> None:
+        """ "Consecutive" is the whole point — one fallback early in a call and
+        another ten turns later is not an agent going in circles."""
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        first = agent.turn("What are my options?")
+        agent.llm = MockLLMClient()
+        spoke = agent.turn("I could do five hundred dollars.")
+        agent.llm = _AlwaysBlocked(opened=True)
+        again = agent.turn("Sorry, say that again?")
+
+        assert first.spoken == SAFE_FALLBACK_TEXT
+        assert spoke.spoken not in (None, SAFE_FALLBACK_TEXT), "the middle turn has to speak"
+        assert again.spoken == SAFE_FALLBACK_TEXT, "the count restarts, it does not accumulate"
+
+    def test_the_restatement_is_said_once_not_on_every_trip_thereafter(self) -> None:
+        """Reading the consumer identical terms every turn from the second
+        onward is the same circling this was meant to break, in a different
+        line. It is the *second* trip that says the terms."""
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        lines = [agent.turn(f"Still nothing? ({i})").spoken for i in range(4)]
+
+        assert lines[0] == SAFE_FALLBACK_TEXT
+        assert lines[1] is not None and lines[1] != SAFE_FALLBACK_TEXT
+        assert lines[2:] == [SAFE_FALLBACK_TEXT, SAFE_FALLBACK_TEXT], lines
+
+    def test_the_restatement_reads_back_a_multi_payment_plan(self) -> None:
+        """Every other test offer is a single payment due today, so the join
+        and the "in N days" duration figures went unexercised — and a
+        duration the engine did not authorize is exactly what the guard
+        exists to catch."""
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        agent._run_tool(
+            _call(
+                "validate_consumer_offer",
+                payment_count=3,
+                cadence="monthly",
+                total="1000.00",
+            )
+        )
+        agent._run_tool(_call("concede"))
+        agent.turn("What are my options?")
+        line = agent._fallback_line()
+        offer = agent.tools.standing_offer
+
+        assert offer is not None and offer.payment_count > 1, offer
+        assert line != SAFE_FALLBACK_TEXT
+        assert " days" in line, line
+        assert check_outbound(agent.guard, line, authorized=agent.authorized).allowed
+
+    def test_no_offer_on_the_table_means_nothing_to_restate(self) -> None:
+        agent = _agent(llm=_AlwaysBlocked())
+        agent.open_call()
+        agent._perceive("Yes, this is Dana.")
+        agent.turn("What are my options?")
+        second = agent.turn("You still haven't told me anything.")
+
+        assert second.spoken == SAFE_FALLBACK_TEXT
+
+    def test_an_unidentified_consumer_is_never_read_the_terms(self) -> None:
+        """``_speak_verbatim`` bypasses the identity ring, and identity is
+        revocable mid-call. A code-authored line full of dollar figures must
+        gate on it explicitly or it becomes the way around it."""
+        agent = self._agent_with_an_offer(_AlwaysBlocked())
+        agent.turn("What are my options?")
+        agent.guard = agent.guard.with_identity_revoked()
+
+        assert agent._fallback_line() == SAFE_FALLBACK_TEXT
 
 
 class TestTurnScopedDisclosuresOnTheStreamingPath:

@@ -26,7 +26,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import StrEnum
 
@@ -279,6 +279,92 @@ def authorized_for(
     return authorized
 
 
+def withheld_policy_money(policy: PolicyConfig) -> frozenset[Decimal]:
+    """The money figures ``authorized_for`` deliberately keeps out of the base set.
+
+    The engine's private thresholds, in the amounts they would be spoken in:
+    the minimum payment, the settlement floor, and the figure the settlement
+    tier opens at. Each is unsayable until the engine has put it in an actual
+    ``Offer``, and each is a round number a consumer can arrive at by guessing.
+    Kept here rather than in ``policy.py`` because it is a guardrail question —
+    which figures the agent may not originate — not a negotiation limit.
+    """
+    return frozenset(
+        amount.amount
+        for amount in (policy.min_payment, policy.settlement_floor, policy.opening_settlement)
+    )
+
+
+def consumer_stated_money(
+    utterance: str,
+    *,
+    ceiling: Decimal | None = None,
+    withheld: frozenset[Decimal] = frozenset(),
+) -> AuthorizedFigures:
+    """Money the *consumer* named, which the agent may repeat back to them.
+
+    Echoing a figure the consumer just spoke aloud discloses nothing — they
+    are the one who said it. Without this the agent could not acknowledge
+    "I can do two hundred dollars" with the number in it at all, and every
+    attempt cost a regeneration round-trip.
+
+    Deliberately narrow, because this is a hole in a *provenance* guard whose
+    whole contract is that the engine authored every figure:
+
+    * **Money only.** "I could do twelve months" must not make 12 sayable as
+      a duration or a payment count — a term the consumer floated is not a
+      term the engine agreed to.
+    * **An explicit currency marker.** ``_classify`` reads any bare number at
+      or above $100 as money, which is the right default for screening what
+      the *agent* says and the wrong one here: "999 problems", "850 a week"
+      and a case reference are not amounts on the table. The cost is that
+      bare slang ("a grand", "a G") no longer widens anything, which is a
+      thin loss — it resolves to the balance, already authorized.
+    * **Bounded by ``ceiling``**, the largest already-authorized amount (the
+      balance). Nothing the consumer says widens the guard past the account.
+    * **Nothing suspicious.** A digit run against a letter is an evasion
+      shape whoever typed it; it never widens anything.
+    * **Never a figure in ``withheld``** — the engine's private thresholds
+      (``withheld_policy_money``). A consumer can name any number, so "would
+      you take eight hundred dollars?" would otherwise be enough to put the
+      settlement floor in the agent's mouth, on that turn and every turn
+      after: exactly the disclosure ``authorized_for`` withholds until an
+      $800 settlement is on the table. Nothing is lost by excluding them,
+      because the moment the engine does offer one it is authorized through
+      the offer itself and needs no echo.
+
+    Three things it still cannot do, and none of them are detectable from the
+    text of a figure:
+
+    * Tell an *acknowledgment* from an *offer*. Both are the agent saying
+      "$200". "Two hundred dollars, understood" and "Two hundred dollars
+      works" are the same figure to this guard — the rule that the agent must
+      not accept terms the engine has not priced lives in the decision engine
+      and the system prompt.
+    * Tell who named it. A figure the consumer *relayed* ("my neighbour
+      settled his for four hundred dollars") reads exactly like one they
+      offered.
+    * Tell why. A figure named to refuse it ("I definitely can't do $900"),
+      or one carried in on injected instructions, is still a figure the
+      consumer's channel contains.
+
+    So this widens the agent's vocabulary to amounts that were *said near the
+    consumer*, not amounts the consumer agreed to. Everything above keeps
+    that set small; nothing above makes it exact.
+    """
+    values = {
+        figure.value
+        for figure in extract_figures(utterance)
+        if figure.kind is FigureKind.MONEY
+        and figure.value is not None
+        and not figure.suspicious
+        and _CURRENCY_MARKER_RE.search(figure.text) is not None
+        and (ceiling is None or figure.value <= ceiling)
+        and figure.value not in withheld
+    }
+    return AuthorizedFigures(money=frozenset(values))
+
+
 # -- invisible-character defense --------------------------------------------
 #
 # Unicode format characters (category ``Cf``: zero-width space, zero-width
@@ -472,12 +558,49 @@ _CENTS_SUFFIX_RE = re.compile(r"^[\s-]*cents?\b", re.IGNORECASE)
 _PERCENT_SUFFIX_RE = re.compile(r"^\s*(?:%|per\s*cent\b)", re.IGNORECASE)
 _DURATION_SUFFIX_RE = re.compile(r"^[\s-]*(day|week|month|year)s?\b", re.IGNORECASE)
 _THOUSAND_SUFFIX_RE = re.compile(r"^k\b", re.IGNORECASE)
+# Up to two adjectives may sit between the count and the payment word:
+# a live call promised "four monthly payments" and the anchored form read
+# "four" as a bare number — which only warns — where "four payments" would
+# have blocked. The bridge is a closed adjective list, never ``[a-z]+``:
+# a preposition means the number belongs to something else ("two fifty in
+# monthly payments" is an amount, not 250 payments).
+_PAYMENT_ADJECTIVE = (
+    r"(?:monthly|weekly|bi-?weekly|quarterly|equal|even|separate|small(?:er)?|"
+    r"low(?:er)?|easy|easier|fixed|simple|affordable|manageable|convenient)"
+)
 _PAYMENT_SUFFIX_RE = re.compile(
-    r"^[\s-]*(?:payments?|installments?|checks?|cheques?)\b", re.IGNORECASE
+    rf"^[\s-]*(?:{_PAYMENT_ADJECTIVE}[\s-]+){{0,2}}(?:payments?|installments?|checks?|cheques?)\b",
+    re.IGNORECASE,
 )
 
 _ORDINAL_SUFFIX_RE = re.compile(r"(?:st|nd|rd|th)$", re.IGNORECASE)
-_CONTEXT_CHARS = 24
+# Wide enough for two bridged adjectives and the payment word ("separate
+# smaller payments" is 26 characters). Every prefix pattern is anchored at
+# the window's end and every suffix pattern at its start, so widening the
+# window cannot introduce a match at a distance.
+_CONTEXT_CHARS = 48
+
+# What may sit between the dollars half and the cents half of one amount.
+# Anything else ("$250 and we can talk about the thirty cents") is two
+# amounts that happen to be adjacent, not one amount said in two parts.
+# Spaces and commas only, never ``\s`` — a line break is not the same clause.
+_CENTS_JOINER_RE = re.compile(r"^[ ,]*(?:and[ ]*)?$", re.IGNORECASE)
+
+# A cents word the sentence keeps building on is a rate or a share, not the
+# tail of an amount: "$800 and forty cents of every dollar" is not $800.40.
+_CENTS_CONTINUATION_RE = re.compile(r"^\s*(?:of|on|per|in|to|for|off)\b", re.IGNORECASE)
+
+# Money the consumer may be taken to have *named*. Any bare number at or
+# above ``_MONEY_INFERENCE_FLOOR`` classifies as money, which is the right
+# default when screening what the agent says and the wrong one for deciding
+# the consumer put a figure on the table — "999 problems", "850 a week" and
+# a case reference are not amounts.
+#
+# Dollar markers only. A figure denominated purely in cents is either
+# immaterial ("thirty cents") or a unit trick: "eighty thousand cents" is
+# $800, the settlement floor, which the engine withholds until it offers it.
+# A composed "$250 and thirty cents" still carries its dollar marker.
+_CURRENCY_MARKER_RE = re.compile(r"\$|\b(?:dollars?|bucks?|usd)\b", re.IGNORECASE)
 
 # Below this, an unattached number is chatter ("two things"); at or above it, in
 # a call about a $1,000 balance, it is an amount.
@@ -564,6 +687,68 @@ def _touches_letter_or_underscore(text: str, start: int, end: int) -> bool:
     before = text[start - 1] if start > 0 else ""
     after = text[end] if end < len(text) else ""
     return any(ch.isalpha() or ch == "_" for ch in (before, after) if ch)
+
+
+def _is_cents(figure: Figure) -> bool:
+    """Did this figure get its value from a ``cents`` suffix?
+
+    ``_classify`` widens a cents figure's span to cover the suffix word, so
+    the suffix is in ``figure.text`` — the cheapest reliable discriminator,
+    and one that cannot mistake a plain ``0.30`` for thirty cents.
+    """
+    return "cent" in figure.text.lower()
+
+
+def _compose_dollars_and_cents(text: str, figures: list[Figure]) -> list[Figure]:
+    """Fold "two hundred fifty dollars and thirty cents" into one $250.30.
+
+    Spoken aloud, a cents amount is two number words, and the two halves are
+    found by *different* parser passes ("$250" by the digit regex, "thirty
+    cents" by the word regex) — so this is a pass over the assembled list
+    rather than something the extraction loop could do inline.
+
+    Without it the guard compares 250 and 0.30 separately against an
+    authorized set holding 250.30, and blocks the agent for stating the
+    engine's own installment correctly.
+    """
+    composed: list[Figure] = []
+    figures = sorted(figures, key=lambda f: f.start)
+    index = 0
+    while index < len(figures):
+        current = figures[index]
+        following = figures[index + 1] if index + 1 < len(figures) else None
+        if (
+            following is not None
+            and current.kind is FigureKind.MONEY
+            and following.kind is FigureKind.MONEY
+            and current.value is not None
+            and following.value is not None
+            # Whole dollars only: "$250.50 and thirty cents" is not one amount.
+            and current.value == current.value.to_integral_value()
+            # Cents are cents: a half worth a dollar or more ("ten thousand
+            # cents") would carry into the dollars column and compose an
+            # unauthorized amount into an authorized total, while the amount
+            # actually spoken aloud went unchecked.
+            and following.value < 1
+            and not _is_cents(current)
+            and _is_cents(following)
+            and _CENTS_JOINER_RE.match(text[current.end : following.start]) is not None
+            and _CENTS_CONTINUATION_RE.match(text[following.end :]) is None
+        ):
+            composed.append(
+                replace(
+                    current,
+                    text=text[current.start : following.end],
+                    end=following.end,
+                    value=current.value + following.value,
+                    suspicious=current.suspicious or following.suspicious,
+                )
+            )
+            index += 2
+            continue
+        composed.append(current)
+        index += 1
+    return composed
 
 
 def extract_figures(text: str) -> tuple[Figure, ...]:
@@ -666,7 +851,7 @@ def extract_figures(text: str) -> tuple[Figure, ...]:
                 )
             )
 
-    return tuple(sorted(figures, key=lambda f: f.start))
+    return tuple(_compose_dollars_and_cents(text, figures))
 
 
 # -- the check -------------------------------------------------------------

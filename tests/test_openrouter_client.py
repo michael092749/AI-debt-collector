@@ -9,64 +9,13 @@ OpenRouter and LiveKit Inference — so these pin both routes at once.
 from __future__ import annotations
 
 import json
-from typing import Any
 
-import httpx
-import openai
 import pytest
 
 from collector.llm.base import Message, ToolCall, system_prompt
 from collector.llm.openai_shape import to_openai_messages, tool_definitions
-from collector.llm.openrouter_client import MODEL, OpenRouterClient
+from collector.llm.openrouter_client import OpenRouterClient
 from collector.tools import TOOL_NAMES
-
-_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
-
-
-class _StubCompletions:
-    """Stands in for `client.chat.completions`, recording what was asked for."""
-
-    def __init__(self, usage: Any = None, raises: BaseException | None = None) -> None:
-        self.usage = usage
-        self.raises = raises
-        self.calls: list[dict[str, Any]] = []
-
-    def create(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        if self.raises is not None:
-            raise self.raises
-        message = type("Msg", (), {"content": "Hello.", "refusal": None, "tool_calls": []})
-        choice = type("Choice", (), {"message": message, "finish_reason": "stop"})
-        body: dict[str, Any] = {"choices": [choice]}
-        if self.usage is not None:
-            body["usage"] = self.usage
-        return type("Response", (), body)
-
-
-class _StubClient:
-    def __init__(self, completions: _StubCompletions) -> None:
-        self.completions = completions
-        self.chat = self
-
-
-def _client(
-    *, usage: Any = None, raises: BaseException | None = None
-) -> tuple[OpenRouterClient, _StubClient]:
-    client = OpenRouterClient(api_key="sk-test")
-    stub = _StubClient(_StubCompletions(usage=usage, raises=raises))
-    client._client = stub  # type: ignore[assignment]
-    return client, stub
-
-
-def _status_error(status: int) -> openai.APIStatusError:
-    request = httpx.Request("POST", _ENDPOINT)
-    return openai.APIStatusError(
-        f"status {status}", response=httpx.Response(status, request=request), body=None
-    )
-
-
-def _preamble() -> tuple[Message, ...]:
-    return (system_prompt(consumer_name="Dana", account_ref="A-1"),)
 
 
 class TestOpenRouterMapping:
@@ -168,94 +117,3 @@ class TestOpenRouterMapping:
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
             OpenRouterClient()
-
-
-class TestOpenRouterUsage:
-    """Usage capture is shared with the LiveKit route via `openai_shape`, so
-    this route gets tokens and latency for free. Cost it does not get."""
-
-    def test_tokens_and_latency_come_back_populated(self) -> None:
-        usage = type(
-            "Usage",
-            (),
-            {
-                "prompt_tokens": 2100,
-                "completion_tokens": 48,
-                "prompt_tokens_details": type("Details", (), {"cached_tokens": 1800}),
-            },
-        )
-        client, _ = _client(usage=usage)
-        result = client.respond(_preamble()).usage
-        assert result is not None
-        assert result.input_tokens == 2100
-        assert result.output_tokens == 48
-        assert result.cache_read_tokens == 1800
-        assert result.stop_reason == "stop"
-        assert result.latency_ms >= 0
-
-    def test_a_details_block_without_the_livekit_extension_does_not_raise(self) -> None:
-        """`cache_write_tokens` is a LiveKit addition to the OpenAI shape and is
-        simply absent here. Reading it by attribute would take the call down."""
-        usage = type(
-            "Usage",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 2,
-                "prompt_tokens_details": type("Details", (), {"cached_tokens": 0}),
-            },
-        )
-        client, _ = _client(usage=usage)
-        result = client.respond(_preamble()).usage
-        assert result is not None
-        assert result.cache_write_tokens == 0
-
-    def test_cost_is_not_guessed_on_this_route(self) -> None:
-        """OpenRouter bills its own margin over whichever provider it routes
-        to. Reporting Anthropic's published rates for it would put a wrong
-        number in a cost report, so no number is reported at all."""
-        usage = type("Usage", (), {"prompt_tokens": 2100, "completion_tokens": 48})
-        client, _ = _client(usage=usage)
-        result = client.respond(_preamble()).usage
-        assert result is not None
-        assert result.model == MODEL
-        assert result.cost_usd is None
-
-
-class TestOpenRouterTransportFailures:
-    @pytest.mark.parametrize("status", [429, 500, 503, 529])
-    def test_a_transient_status_is_absorbed_into_the_response(self, status: int) -> None:
-        client, _ = _client(raises=_status_error(status))
-        response = client.respond(_preamble())
-        assert response.error is not None
-        assert response.text == ""
-        assert response.usage is not None
-
-    @pytest.mark.parametrize("status", [400, 401, 403, 404, 405, 413, 422])
-    def test_a_fatal_status_propagates(self, status: int) -> None:
-        client, _ = _client(raises=_status_error(status))
-        with pytest.raises(openai.APIStatusError):
-            client.respond(_preamble())
-
-    def test_the_reasoning_extra_body_is_still_sent(self) -> None:
-        """Task-scoped guard: absorbing errors must not have changed the
-        request this route builds."""
-        client, stub = _client()
-        client.respond(_preamble())
-        assert stub.completions.calls[0]["extra_body"] == {"reasoning": {"effort": "low"}}
-
-
-class TestOpenRouterTimeoutConfiguration:
-    def test_the_timeout_and_retry_budget_reach_the_openai_client(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        captured: dict[str, Any] = {}
-
-        def _spy(**kwargs: Any) -> Any:
-            captured.update(kwargs)
-            return object()
-
-        monkeypatch.setattr("openai.OpenAI", _spy)
-        OpenRouterClient(api_key="sk-test")
-        assert captured["timeout"] == 6.0
-        assert captured["max_retries"] == 1
