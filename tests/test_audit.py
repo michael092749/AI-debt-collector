@@ -522,7 +522,10 @@ class TestJsonExport:
         ]
         assert [c["rule_id"] for c in data["conditions"]] == [r.value for r in RuleId]
         assert len(data["exchanges"]) == 2
-        assert data["exchanges"][0]["verdict"]["rationale_code"] == "BELOW_SETTLEMENT_FLOOR"
+        # $200 fails both the payment floor and the settlement floor. MIN_PAYMENT
+        # is evaluated first because it answers the figure the consumer actually
+        # named, rather than a total assembled around it.
+        assert data["exchanges"][0]["verdict"]["rationale_code"] == "BELOW_MIN_PAYMENT"
         assert len(data["guardrail_events"]) == 1
         assert len(data["escalations"]) == 1
         assert data["confirmation"]["confirmed"] is True

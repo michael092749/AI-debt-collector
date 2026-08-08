@@ -46,9 +46,9 @@ from collector.decision_engine import Verdict
 from collector.guardrails.confirmation import agreed_line, confirmation_line, repeats_back
 from collector.guardrails.disclosures import (
     AI_DISCLOSURE_WITH_HUMAN,
+    DisclosureRuleId,
     confirms_identity,
     denies_identity,
-    fires_mini_miranda,
 )
 from collector.guardrails.numeric import AuthorizedFigures, authorized_for, extract_figures
 from collector.guardrails.rings import (
@@ -80,7 +80,7 @@ from collector.llm.base import (
     system_prompt,
 )
 from collector.negotiation import CallOutcome
-from collector.offers import Offer
+from collector.offers import Offer, Tier
 from collector.policy import PolicyConfig
 from collector.tools import TOOL_SCHEMAS, ToolContext, ToolResult, execute
 from collector.tracing import CallTrace
@@ -238,17 +238,44 @@ _ACTION_FOR: dict[_Outcome, GuardrailAction] = {
 }
 
 
+# Disclosure complaints a *longer* chunk can still cure, and the only ones
+# ``_owes_a_disclosure`` may hold a chunk back for. Compared by value, not
+# membership in a set of enum members: a ``Violation`` carries its rule id as a
+# plain str.
+#
+# ``MINI_MIRANDA_REDUNDANT`` is deliberately absent. Every other rule here says
+# the turn has not finished saying something it owes, which the next sentence
+# can answer; that one says the opposite — the notice is already on record —
+# and no amount of further text makes a second delivery acceptable. Holding on
+# it would withhold the chunk to the end of the round and swallow the whole
+# turn instead of blocking one sentence and letting the model rewrite it.
+_CURABLE_BY_MORE_TEXT: tuple[str, ...] = (
+    DisclosureRuleId.MINI_MIRANDA_NOT_FIRED,
+    DisclosureRuleId.MINI_MIRANDA_OUT_OF_ORDER,
+    DisclosureRuleId.AI_DISCLOSURE_MISSING_AT_OPEN,
+    DisclosureRuleId.AI_DISCLOSURE_REQUEST_IGNORED,
+)
+
+
 def _stands_on_its_own(spoken_text: str) -> bool:
     """Did the spoken prefix say something a connective can close?
 
-    A figure means concrete terms reached the consumer's ear (and every
+    A figure means concrete terms reached the consumer's ear, and every
     sentence in the prefix already cleared the outbound guard, so any figure
-    present is authorized by construction); a completed Mini-Miranda stands
-    by itself. A keyword match alone — "offer", "payments" — is not enough:
-    it is how an announcement of content that never arrived gets closed as
-    though the content had been said.
+    present is authorized by construction. A keyword match alone — "offer",
+    "payments" — is not enough: it is how an announcement of content that
+    never arrived gets closed as though the content had been said.
+
+    A completed Mini-Miranda used to count here too, and that was the same
+    mistake one line further on. The connective is "Does that work for you?",
+    a request for assent; a legal notice is a disclosure, not a proposition,
+    so there is nothing in it to agree to and the question refers to nothing.
+    A live call on 2026-08-07 ended exactly that way after the balance
+    sentence behind the notice was blocked. A turn holding only the notice
+    takes the scripted fallback instead, which at least asks the consumer
+    something they can answer.
     """
-    return bool(extract_figures(spoken_text)) or fires_mini_miranda(spoken_text) is not None
+    return bool(extract_figures(spoken_text))
 
 
 @dataclass
@@ -356,6 +383,19 @@ class NegotiationAgent:
     account_ref: str = "ACCT-0001"
     store: AuditStore | None = None
     channel: str = "text"
+
+    @property
+    def _standing_tier(self) -> Tier | None:
+        """The tier of the offer currently on the table, for the naming guard.
+
+        Read fresh at every gate rather than cached: the offer changes inside a
+        turn (a concession mid-round), and a stale tier would either wave a real
+        mislabel through or block the correct name for the offer just authored.
+        ``None`` before anything is on the table, which the guard reads as
+        "nothing to misname yet".
+        """
+        standing = self.tools.standing_offer
+        return standing.tier if standing is not None else None
 
     def __post_init__(self) -> None:
         self.tools = ToolContext.opening(self.policy)
@@ -747,8 +787,19 @@ class NegotiationAgent:
         rule still fires the moment a sentence completes, and a chunk still
         owing when the round ends is guarded whole and blocked there, which is
         where the fallback belongs.
+
+        Only the complaints in ``_CURABLE_BY_MORE_TEXT``, though. Reading *any*
+        disclosure complaint as "not finished saying it" was right for every
+        rule that existed when this was written and is exactly wrong for
+        ``MINI_MIRANDA_REDUNDANT``, which fires because the notice is already
+        on record: a chunk held for that is never released, so the whole turn
+        is silently swallowed instead of one sentence being blocked and
+        rewritten.
         """
-        return bool(self.guard.disclosures.check_agent_turn(candidate))
+        return any(
+            violation.rule_id in _CURABLE_BY_MORE_TEXT
+            for violation in self.guard.disclosures.check_agent_turn(candidate)
+        )
 
     def _guard_sentence(
         self, sentence: str, round_: _Round, spoken: Sequence[str], *, may_rewrite: bool = False
@@ -776,7 +827,12 @@ class NegotiationAgent:
             round_.blocked = sentence
             return None
 
-        check = check_outbound(self.guard, candidate, authorized=self.authorized)
+        check = check_outbound(
+            self.guard,
+            candidate,
+            authorized=self.authorized,
+            standing_tier=self._standing_tier,
+        )
         self.guard = check.state
         if check.allowed:
             self._consecutive_fallbacks = 0
@@ -1178,6 +1234,7 @@ class NegotiationAgent:
                 self.guard,
                 candidate,
                 authorized=self.authorized,
+                standing_tier=self._standing_tier,
                 confidential_reference=_CONFIDENTIAL_REFERENCE,
             )
             self.guard = check.state

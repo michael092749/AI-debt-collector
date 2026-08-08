@@ -46,7 +46,9 @@ from collector.guardrails.prohibited import (
     is_negated,
     scan_prohibited,
 )
+from collector.guardrails.tiers import scan_tier_names
 from collector.llm.base import SYSTEM_PROMPT
+from collector.offers import Tier
 from collector.policy import PolicyConfig
 
 Speaker = Literal["consumer", "agent", "system"]
@@ -702,6 +704,7 @@ def check_outbound(
     candidate: str,
     *,
     authorized: AuthorizedFigures | None = None,
+    standing_tier: Tier | None = None,
     confidential_reference: str = SYSTEM_PROMPT,
 ) -> OutboundCheck:
     """The pre-TTS gate. Nothing reaches the consumer's ear without passing here.
@@ -723,6 +726,12 @@ def check_outbound(
     violations.extend(scan_prohibited(candidate))
     violations.extend(check_numeric(candidate, figure_set))
     violations.extend(state.disclosures.check_agent_turn(candidate))
+    # The companion to the numeric guard. That one settles which *figures* may
+    # be said; this settles what the arrangement they make up may be called.
+    # Both are needed: every amount in "I can offer a payment plan for the one
+    # thousand dollars" was engine-authored and passed the numeric guard, while
+    # the offer on the table was a downpayment plus one (live call, 2026-08-07).
+    violations.extend(scan_tier_names(candidate, standing_tier))
     if _contains_verbatim_leak(candidate, confidential_reference):
         violations.append(
             _ring_violation(

@@ -35,6 +35,7 @@ class DisclosureRuleId(StrEnum):
 
     MINI_MIRANDA_NOT_FIRED = "MINI_MIRANDA_NOT_FIRED"
     MINI_MIRANDA_OUT_OF_ORDER = "MINI_MIRANDA_OUT_OF_ORDER"
+    MINI_MIRANDA_REDUNDANT = "MINI_MIRANDA_REDUNDANT"
     AI_DISCLOSURE_MISSING_AT_OPEN = "AI_DISCLOSURE_MISSING_AT_OPEN"
     AI_DISCLOSURE_REQUEST_IGNORED = "AI_DISCLOSURE_REQUEST_IGNORED"
 
@@ -288,6 +289,25 @@ class DisclosureState:
                     "the consumer asked whether they are speaking to a human; answer it",
                 )
             )
+
+        # The latch, read on the way *out*. ``may_discuss_debt`` was consumed
+        # only as a permission — the check below complains when the notice is
+        # absent and said nothing when it was redundant — so a second delivery
+        # went to the consumer with the guard's full approval. A live call on
+        # 2026-08-07 said it on two consecutive agent turns for exactly that
+        # reason. Blocking routes the turn through regeneration, which is what
+        # makes this a control rather than a prompt line the model may outweigh.
+        if self.may_discuss_debt:
+            repeat_at = fires_mini_miranda(candidate)
+            if repeat_at is not None:
+                violations.append(
+                    _violation(
+                        DisclosureRuleId.MINI_MIRANDA_REDUNDANT,
+                        candidate,
+                        (repeat_at, len(candidate)),
+                        "the Mini-Miranda is already on record; say it once and do not repeat it",
+                    )
+                )
 
         span = substantive_span(candidate)
         if span is not None and not self.may_discuss_debt:

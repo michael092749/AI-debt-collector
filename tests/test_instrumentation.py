@@ -115,12 +115,20 @@ class TestArgumentSchema:
 
         assert properties["payment_count"] == {
             "type": "integer",
-            "description": "How many payments to split it into. 1 for a lump sum.",
+            "description": (
+                "How many payments they said to split it into. 1 for a lump sum. "
+                "Omit when they did not say — a bare figure like 'three hundred "
+                "dollars' names no count, and inventing one is what turned $150 "
+                "into a refusal for overpaying."
+            ),
             "minimum": 1,
             "maximum": MAX_PROPOSED_PAYMENTS,
         }
         assert properties["cadence"]["enum"] == [c.value for c in Cadence]
-        assert set(schema.input_schema["required"]) == {"payment_count", "cadence"}
+        # Nothing is required. Every field on this tool describes something the
+        # consumer may or may not have said, and a required field is one the
+        # model must invent when they did not say it.
+        assert schema.input_schema["required"] == []
 
     def test_arguments_reach_the_handler_already_typed(self) -> None:
         parsed = next(s for s in TOOL_SCHEMAS if s.name == "validate_consumer_offer").parse(
@@ -144,8 +152,11 @@ class TestArgumentSchema:
     @pytest.mark.parametrize(
         ("arguments", "expected"),
         [
-            ({"payment_count": 2}, "cadence is required"),
-            ({"cadence": "monthly"}, "payment_count is required"),
+            # payment_count and cadence are deliberately optional: a consumer who
+            # names a bare figure ("three hundred dollars") states neither, and
+            # requiring them forced the model to invent a count — which is what
+            # turned $150 into a refusal for collecting more than was owed.
+            # Omitting them is legal; naming them badly still is not.
             ({"payment_count": 0, "cadence": "monthly"}, "at least 1"),
             (
                 {"payment_count": MAX_PROPOSED_PAYMENTS + 1, "cadence": "monthly"},
@@ -784,11 +795,21 @@ class _SplitMiniMiranda(_Streamer):
 
 
 class _ThreatensAfterDisclosing(_Streamer):
-    """Clears the disclosure, then threatens. The block lands mid-stream, so
-    the round aborts before ``StreamCompleted`` ever arrives."""
+    """Clears the disclosure, says something substantive, then threatens. The
+    block lands mid-stream, so the round aborts before ``StreamCompleted``
+    ever arrives.
+
+    The balance line is load-bearing, not scenery: the connective closes a
+    *proposition*, and the notice is not one. A turn whose only surviving
+    content was the Mini-Miranda used to earn "Does that work for you?",
+    which asked the consumer to assent to a legal disclosure (live call,
+    2026-08-07). The balance is engine-authorized from the opening, so this
+    turn says something that genuinely stands.
+    """
 
     lines = (
         MINI_MIRANDA_TEXT,
+        "There is a balance of one thousand dollars on your account.",
         "Pay today or we will garnish your wages.",
         "So what will it be?",
     )
@@ -800,6 +821,7 @@ class _InventsADueDate(_Streamer):
 
     lines = (
         MINI_MIRANDA_TEXT,
+        "There is a balance of one thousand dollars on your account.",
         "Your first payment is due Jan. 15.",
         "Does that work?",
     )

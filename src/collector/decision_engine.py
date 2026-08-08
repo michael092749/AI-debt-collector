@@ -28,12 +28,26 @@ Outcome = Literal["accept", "counter", "reject"]
 
 
 class RuleId(StrEnum):
-    """Stable identifiers. These appear in the audit log and must not churn."""
+    """Stable identifiers. These appear in the audit log and must not churn.
 
-    TOTAL_FLOOR = "TOTAL_FLOOR"
-    NO_UNAUTHORIZED_DISCOUNT = "NO_UNAUTHORIZED_DISCOUNT"
-    NO_OVER_COLLECTION = "NO_OVER_COLLECTION"
+    Declaration order is the evaluation order and the order ``_first_failure``
+    explains a verdict in, so it is load-bearing twice over. The three hard
+    floors come first, which makes the rejection invariant structural: a
+    rejection is caused by a hard floor, so if the hard floors are the first
+    rules evaluated, the first failing rule is always one of them. It used to
+    run the other way — NO_OVER_COLLECTION sat third and MIN_PAYMENT fourth, so
+    a consumer refused for offering $150 a payment was told the problem was
+    that $150 x 7 collected more than they owed (live call, 2026-08-07).
+
+    MIN_PAYMENT leads. A sub-floor instalment is a fact about the figure the
+    consumer actually named; the settlement floor is a fact about a total, and
+    a total may have been assembled around them.
+    """
+
     MIN_PAYMENT = "MIN_PAYMENT"
+    NO_UNAUTHORIZED_DISCOUNT = "NO_UNAUTHORIZED_DISCOUNT"
+    TOTAL_FLOOR = "TOTAL_FLOOR"
+    NO_OVER_COLLECTION = "NO_OVER_COLLECTION"
     PAYMENT_COUNT = "PAYMENT_COUNT"
     CADENCE = "CADENCE"
     MAX_DURATION = "MAX_DURATION"
@@ -81,8 +95,19 @@ def classify(proposal: ConsumerProposal, policy: PolicyConfig) -> Tier:
 
     Classification is structural, not charitable: it reads what they proposed.
     Whether that proposal is *allowed* is the rules' job, below.
+
+    A settlement is a discount we are authorized to grant, so the band is
+    bounded at both ends. A total under the floor is not a settlement anyone
+    could write — it is a discount nobody may authorize, and naming it one puts
+    the wrong sentence in the consumer's ear: $300 offered against a $1,000
+    balance came back as "that is below the least I can settle for", which
+    reads as *your $300 is too small a payment* when $300 clears the payment
+    floor comfortably. Read as the shape it is, it answers with the truth —
+    the balance cannot be reduced to that. Nothing is loosened: below the floor
+    both TOTAL_FLOOR and NO_UNAUTHORIZED_DISCOUNT now fail where one did, and
+    anything acceptable clears the floor, so no accepted proposal changes tier.
     """
-    if proposal.total < policy.original_balance:
+    if policy.settlement_floor <= proposal.total < policy.original_balance:
         return Tier.SETTLEMENT
     if proposal.payment_count <= 1:
         return Tier.PAY_IN_FULL
@@ -105,17 +130,25 @@ def _evaluate(
     smallest = proposal.smallest_payment
 
     return (
+        # First, because it is the only rule that answers the figure the
+        # consumer said out loud rather than a sum assembled around it.
         Condition(
-            RuleId.TOTAL_FLOOR,
-            proposal.total >= policy.settlement_floor,
-            str(proposal.total),
-            f">= {policy.settlement_floor}",
+            RuleId.MIN_PAYMENT,
+            smallest >= policy.min_payment,
+            str(smallest),
+            f">= {policy.min_payment}",
         ),
         Condition(
             RuleId.NO_UNAUTHORIZED_DISCOUNT,
             tier is Tier.SETTLEMENT or proposal.total >= policy.original_balance,
             str(proposal.total),
             f">= {policy.original_balance} unless settlement",
+        ),
+        Condition(
+            RuleId.TOTAL_FLOOR,
+            proposal.total >= policy.settlement_floor,
+            str(proposal.total),
+            f">= {policy.settlement_floor}",
         ),
         # The ceiling. The total is `== ORIGINAL_BALANCE` unless
         # the tier is settlement, and the rule above only ever enforced the
@@ -129,17 +162,16 @@ def _evaluate(
         # "$3,000.00" as engine-authorized, so the numeric guard passed it
         # correctly and the agreement record was written. No guardrail above
         # the engine can catch an illegal number the engine itself authorized.
+        #
+        # It guards engine-authored figures and totals the consumer named, and
+        # only those: it must never rule on one the tool layer multiplied out
+        # of an invented payment count, which is why that layer now caps an
+        # assembled total at the balance instead of handing an overshoot here.
         Condition(
             RuleId.NO_OVER_COLLECTION,
             proposal.total <= policy.original_balance,
             str(proposal.total),
             f"<= {policy.original_balance}",
-        ),
-        Condition(
-            RuleId.MIN_PAYMENT,
-            smallest >= policy.min_payment,
-            str(smallest),
-            f">= {policy.min_payment}",
         ),
         Condition(
             RuleId.PAYMENT_COUNT,
@@ -174,10 +206,10 @@ def _evaluate(
 
 
 _FAILURE_CODES: dict[RuleId, RationaleCode] = {
-    RuleId.TOTAL_FLOOR: RationaleCode.BELOW_SETTLEMENT_FLOOR,
-    RuleId.NO_UNAUTHORIZED_DISCOUNT: RationaleCode.DISCOUNT_NOT_AUTHORIZED,
-    RuleId.NO_OVER_COLLECTION: RationaleCode.ABOVE_BALANCE_OWED,
     RuleId.MIN_PAYMENT: RationaleCode.BELOW_MIN_PAYMENT,
+    RuleId.NO_UNAUTHORIZED_DISCOUNT: RationaleCode.DISCOUNT_NOT_AUTHORIZED,
+    RuleId.TOTAL_FLOOR: RationaleCode.BELOW_SETTLEMENT_FLOOR,
+    RuleId.NO_OVER_COLLECTION: RationaleCode.ABOVE_BALANCE_OWED,
     RuleId.PAYMENT_COUNT: RationaleCode.TOO_MANY_PAYMENTS,
     RuleId.CADENCE: RationaleCode.CADENCE_NOT_OFFERED,
     RuleId.MAX_DURATION: RationaleCode.SCHEDULE_TOO_LONG,
@@ -187,7 +219,13 @@ _FAILURE_CODES: dict[RuleId, RationaleCode] = {
 
 def _first_failure(conditions: tuple[Condition, ...]) -> RationaleCode:
     """Rules are ordered most- to least-fundamental, so the first failure is the
-    one worth explaining to the consumer."""
+    one worth explaining to the consumer.
+
+    The hard floors lead that order (``RuleId``), which is what keeps the
+    rationale honest about the verdict: a rejection is decided by a hard floor,
+    and a hard floor failing is always the first failure, so a rejection can
+    never be explained by a rule that did not reject it.
+    """
     for c in conditions:
         if not c.passed:
             return _FAILURE_CODES[c.rule_id]
@@ -291,20 +329,39 @@ def effective_capacity(proposal: ConsumerProposal, state: NegotiationState) -> M
     """What this proposal reveals the consumer thinks they can pay at a time.
 
     An explicit signal wins outright: it is the latest thing they actually said,
-    and it may move the figure in either direction. Otherwise their own smallest
-    instalment is the honest read — someone asking for 13 weekly payments of $77
-    has told us $77 without ever saying a capacity out loud.
+    and it may move the figure in either direction. So does a per-payment figure
+    they sized themselves — "a hundred and fifty a month" is a statement about
+    their wallet however it reaches us.
 
-    But a figure we inferred may only *lower* one they stated. Inference reads a
-    ceiling, never a floor: a lump sum they are asking us to accept says nothing
-    about what they can produce, and where no sum was named at all the shape is
-    scored against the balance, so the "capacity" is arithmetic on a default.
-    Left unclamped, both talk over the number the consumer gave us — $300 said
-    three times became a counter built on $500 — and the next counter comes back
-    harder than the one they just refused.
+    A lump sum they named is the same evidence, but only while we are still
+    asking for the whole balance. Until a settlement has been put up there is
+    nothing for a part payment to be a bid *on*, so "$300, that's what I've
+    got" is money they can produce and may raise a figure on record. Once the
+    ladder stands at a settlement the amount itself is what is being haggled
+    over, and a lump sum is a bid on that amount: "settle at $700" from someone
+    who had twice said $300 is not an offer to produce $700 at a time, and read
+    as one it countered $400/$400 at a consumer who could fund neither half.
+
+    Everything else is the consumer's own smallest instalment, which is the
+    honest read — someone asking for 13 weekly payments of $77 has told us $77
+    without ever saying a capacity out loud — and a figure inferred that way may
+    only *lower* one they stated. Inference is evidence of a ceiling, never of a
+    floor: where no sum was named at all the shape is scored against the
+    balance, so "$1,000 over two payments" infers $500 from someone who said
+    $300, and left unclamped the next counter comes back harder than the one
+    they just refused.
+
+    Clamping *both* directions was the defect this fix removes: a consumer who
+    moved from $150 to $300 was still scored at $150 and heard the same "$250
+    today and $750 in thirty days" twice (live call, 2026-08-07).
     """
     if proposal.signaled_capacity is not None:
         return proposal.signaled_capacity
+    if proposal.amount_each is not None:
+        return proposal.amount_each
+    lump = proposal.lump_sum
+    if lump is not None and state.ladder_floor < Tier.SETTLEMENT:
+        return lump
     inferred = proposal.smallest_payment
     if state.signaled_capacity is not None:
         return min(inferred, state.signaled_capacity)

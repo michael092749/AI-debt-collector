@@ -297,7 +297,13 @@ class TestConcessionsAreEarned:
             assert context.standing_offer is not None
             walked.append(context.standing_offer.tier)
             context = execute(ToolCall(name="record_refusal"), context).context
-        assert walked == [Tier.DOWNPAYMENT_PLUS_ONE, Tier.SETTLEMENT, Tier.SETTLEMENT]
+        # The third step reaches the payment plan rather than stalling on the
+        # settlement. Stepping settlement -> plan raises the *total* ($800 to
+        # $1,000) and used to fail `_is_concession` for that reason, which left
+        # the last of the brief's four acceptable outcomes unreachable by
+        # conceding. Moving down the brief's preference order is the concession:
+        # the plan is more money in smaller pieces over more time.
+        assert walked == [Tier.DOWNPAYMENT_PLUS_ONE, Tier.SETTLEMENT, Tier.PAYMENT_PLAN]
 
         held = execute(ToolCall(name="validate_consumer_offer", arguments=plan), context)
         context = held.context
