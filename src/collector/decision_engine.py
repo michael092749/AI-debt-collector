@@ -279,6 +279,36 @@ def validate_offer(
         preferred_cadence=proposal.cadence,
     )
     failed = {c.rule_id for c in conditions if not c.passed}
+
+    # A counter may ask for better *terms*. It may never ask for less *money*.
+    #
+    # The ladder ranks tiers, and a settlement outranks a payment plan because
+    # it closes sooner — but it also discounts. So the whole balance in four
+    # legal instalments, proposed once the ladder had reached a settlement, was
+    # answered with the $800 floor: the agent talked the consumer $200 down
+    # from their own offer, unprompted, on a proposal that broke no rule.
+    #
+    # Where the ladder is the only objection and the counter would come back
+    # for *strictly less* than what is already on the table, the objection has
+    # nothing left to win. Take it. Re-evaluated as ``repeated`` rather than
+    # accepted over a failing condition, because that is what taking their
+    # terms means and it keeps the trail honest: no accepted verdict carries a
+    # rule it did not satisfy.
+    #
+    # Strictly less, not "no more". On equal totals the ladder is still doing
+    # real work — $1,000 today and $1,000 over ninety days are the same money
+    # in different shapes, and asking once for the better shape is the whole of
+    # A7. Taking the equal case is how the first thing a consumer says would
+    # decide the outcome with no negotiation at all.
+    if failed == {RuleId.LADDER} and counter.total < proposal.total:
+        return Verdict(
+            outcome="accept",
+            tier=tier,
+            conditions=_evaluate(proposal, tier, policy, state.ladder_floor, True),
+            counter=None,
+            rationale_code=RationaleCode.ACCEPTED,
+        )
+
     outcome: Outcome = "reject" if failed & _HARD_FLOORS else "counter"
 
     return Verdict(

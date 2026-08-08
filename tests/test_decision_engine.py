@@ -376,19 +376,27 @@ class TestLadderAnchoring:
         $800 back to $1,000 (``_concede``), so without this their own legal
         four-payment plan — worth $200 more to us than the settlement — is
         unreachable by any path and the account is simply lost.
+
+        This case now closes on the *first* ask rather than the second. The
+        "better" the ladder was holding out for was $800 against the $1,000
+        already offered, so the round it used to spend was spent volunteering a
+        $200 discount to someone who had just offered the whole balance. The
+        plan is still reachable — reached sooner, and for more money — so the
+        loss this test was written to prevent is prevented harder. The
+        ask-once-for-better behaviour it guards is unchanged wherever the
+        counter is not for strictly less money; ``TestLadderAnchoring``'s
+        turn-one cases below still assert it.
         """
         from collector.decision_engine import validate_offer
 
         state = _at(Tier.SETTLEMENT, policy)
         theirs = _propose("1000", 4, capacity="250")
 
-        first = validate_offer(theirs, state, policy)
-        assert first.outcome == "counter", "the better ask comes first"
+        taken = validate_offer(theirs, state, policy)
 
-        state = state.record_round(theirs, first.counter, first.rationale_code)
-        again = validate_offer(theirs, state, policy)
-        assert again.outcome == "accept"
-        assert again.tier is Tier.PAYMENT_PLAN
+        assert taken.outcome == "accept", "a full-balance offer is not countered down"
+        assert taken.tier is Tier.PAYMENT_PLAN
+        assert taken.counter is None
 
     def test_an_illegal_proposal_does_not_unlock_its_tier(
         self, policy: PolicyConfig, fresh: NegotiationState
@@ -670,3 +678,57 @@ class TestPaymentPlan:
         assert classify(_propose("900", 3), policy) is Tier.SETTLEMENT
         verdict = validate_offer(_propose("900", 3), fresh.conceded_to(Tier.PAYMENT_PLAN), policy)
         assert verdict.tier is Tier.SETTLEMENT
+
+
+class TestALegalProposalIsNeverCounteredBelowItself:
+    """A counter may ask for better terms. It may never ask for less money.
+
+    The ``LADDER`` condition ranks tiers, not totals, and a settlement outranks
+    a payment plan — so a consumer offering the *whole balance* in four legal
+    instalments, once the ladder has reached a settlement, was answered with the
+    $800 floor. The agent talked the consumer $200 down from their own offer,
+    unprompted, on a proposal that broke no rule at all.
+
+    Countering for a *better* tier is the point of the ladder (A7) and is kept.
+    What cannot stand is a counter whose total is below the total already on
+    offer: there is nothing left to negotiate for.
+    """
+
+    def test_full_balance_in_four_legal_payments_is_not_countered_with_a_discount(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        from collector.decision_engine import validate_offer
+
+        state = fresh.conceded_to(Tier.SETTLEMENT)
+        proposal = _propose("1000", 4, capacity="250")
+
+        verdict = validate_offer(proposal, state, policy)
+
+        assert verdict.counter is None or verdict.counter.total >= proposal.total, (
+            f"countered a legal ${proposal.total} offer with "
+            f"${verdict.counter.total if verdict.counter else None}"
+        )
+
+    def test_that_proposal_is_simply_accepted(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """It breaks no rule and pays more than anything we would have asked."""
+        from collector.decision_engine import validate_offer
+
+        state = fresh.conceded_to(Tier.SETTLEMENT)
+        verdict = validate_offer(_propose("1000", 4, capacity="250"), state, policy)
+
+        assert verdict.outcome == "accept"
+
+    def test_a_sharpened_re_proposal_still_does_not_walk_us_down(
+        self, policy: PolicyConfig, fresh: NegotiationState
+    ) -> None:
+        """The ``_held_to`` protection this must not undo: a consumer who is
+        countered and comes back *lower* has sharpened their offer, not held to
+        it, and the ladder may not be talked down to meet them."""
+        from collector.decision_engine import validate_offer
+
+        state = fresh.conceded_to(Tier.SETTLEMENT)
+        verdict = validate_offer(_propose("700", 1), state, policy)
+
+        assert verdict.outcome != "accept"
