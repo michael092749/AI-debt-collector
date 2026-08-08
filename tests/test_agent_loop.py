@@ -396,8 +396,14 @@ class TestConcessionsAreEarned:
         manage $250 a month and nothing more.
 
         Their plan is the last of the four acceptable outcomes, so it is asked
-        past three times before it is taken — and it still closes at the full
+        past four times before it is taken — and it still closes at the full
         balance rather than at the $800 settlement offered along the way.
+
+        Four, not three: the settlement tier is spent before it is left, so the
+        floor gets a step of its own. The comment below used to describe an
+        $800 offer "along the way" that no consumer could actually have heard —
+        ``_tier_total`` re-prices a settlement only once one has been refused,
+        and the ladder used to leave the tier on that exact turn.
         """
         plan = {
             "total": "1000.00",
@@ -416,18 +422,29 @@ class TestConcessionsAreEarned:
         assert first.payload["rationale_code"] == RationaleCode.PREFERRED_TIER_AVAILABLE
 
         walked = []
-        for _ in range(3):
+        totals = []
+        for _ in range(4):
             context = execute(ToolCall(name="concede"), context).context
             assert context.standing_offer is not None
             walked.append(context.standing_offer.tier)
+            totals.append(context.standing_offer.total)
             context = execute(ToolCall(name="record_refusal"), context).context
-        # The third step reaches the payment plan rather than stalling on the
-        # settlement. Stepping settlement -> plan raises the *total* ($800 to
-        # $1,000) and used to fail `_is_concession` for that reason, which left
-        # the last of the brief's four acceptable outcomes unreachable by
-        # conceding. Moving down the brief's preference order is the concession:
-        # the plan is more money in smaller pieces over more time.
-        assert walked == [Tier.DOWNPAYMENT_PLUS_ONE, Tier.SETTLEMENT, Tier.PAYMENT_PLAN]
+        # The settlement is offered twice — once at its opening price, once at
+        # the floor — before the ladder leaves it. Only then does the fourth
+        # step reach the payment plan. Stepping settlement -> plan raises the
+        # *total* ($800 to $1,000) and used to fail `_is_concession` for that
+        # reason, which left the last of the brief's four acceptable outcomes
+        # unreachable by conceding. Moving down the brief's preference order is
+        # the concession: the plan is more money in smaller pieces over more
+        # time. That step is allowed only once the tier above it is spent.
+        assert walked == [
+            Tier.DOWNPAYMENT_PLUS_ONE,
+            Tier.SETTLEMENT,
+            Tier.SETTLEMENT,
+            Tier.PAYMENT_PLAN,
+        ]
+        assert totals[1] == POLICY.opening_settlement
+        assert totals[2] == POLICY.settlement_floor, "the authorized floor is said out loud"
 
         held = execute(ToolCall(name="validate_consumer_offer", arguments=plan), context)
         context = held.context

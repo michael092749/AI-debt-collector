@@ -281,3 +281,79 @@ class TestRepetitionDoesNotBuyTheLadder:
             context = result.context
 
         assert context.state.pending_refusals > 0
+
+
+class TestTheSettlementTierIsSpentBeforeItIsLeft:
+    """A concession may not cost the consumer more than what they refused.
+
+    The ladder descends PAY_IN_FULL -> DOWNPAYMENT_PLUS_ONE -> SETTLEMENT ->
+    PAYMENT_PLAN, but only SETTLEMENT discounts: ``_tier_total`` returns
+    ``original_balance`` for every other tier. So the step off a settlement puts
+    the full balance back up, and a consumer who refused $900 is answered with
+    $1,000 — the ask rising on the turn they said no (live call, 2026-08-08).
+
+    Underneath it, ``_tier_total`` never reaches its own floor. It re-prices a
+    settlement at ``settlement_floor`` "once a settlement has been put up and
+    not taken" — which is exactly the moment ``_step_down`` advances the ladder
+    off the tier, so the branch is dead and the $800 the policy authorizes is
+    never offered to anyone.
+    """
+
+    def _conceded_ladder(self) -> list[Offer]:
+        """Every offer put on the table by a consumer who names a real figure
+        and refuses each answer. Uses ``concede`` rather than repetition, which
+        ``TestRepetitionDoesNotBuyTheLadder`` deliberately does not reward.
+        """
+        context = ToolContext.opening(POLICY)
+        offers: list[Offer] = []
+        result = _call(context, "propose_offer", preferred_cadence="immediate")
+        context, offers = result.context, [*offers, result.offer]
+        result = _call(
+            context,
+            "validate_consumer_offer",
+            amount_each="300",
+            cadence="monthly",
+            signaled_capacity="300",
+        )
+        context = result.context
+        if result.offer is not None:
+            offers.append(result.offer)
+        while not context.state.is_exhausted and not context.state.is_terminal:
+            context = _call(context, "record_refusal").context
+            result = _call(context, "concede", preferred_cadence="monthly")
+            context = result.context
+            if result.offer is not None:
+                offers.append(result.offer)
+        return [o for o in offers if o is not None]
+
+    def test_the_settlement_floor_is_offered_before_the_tier_is_left(self) -> None:
+        totals = [o.total for o in self._conceded_ladder()]
+
+        assert POLICY.settlement_floor in totals, (
+            f"the most we are authorized to discount was never said aloud; "
+            f"every total offered was {sorted({str(t) for t in totals})}"
+        )
+
+    def test_a_settlement_above_its_floor_is_answered_below_itself(self) -> None:
+        """The step the consumer actually heard: $900 refused, $1,000 back.
+
+        Scoped to a settlement that still has ground in it, because the ladder
+        is deliberately allowed to end above where it passed through. A payment
+        plan is the full balance and is ranked below a settlement anyway — it is
+        easier to fund, in smaller pieces, over more time — so the last step may
+        cost more. What may not happen is reaching for it while the tier the
+        consumer is standing on has authorized discount left unspoken.
+        """
+        offers = self._conceded_ladder()
+
+        for earlier, later in zip(offers, offers[1:], strict=False):
+            if earlier.tier is not Tier.SETTLEMENT:
+                continue
+            if earlier.total <= POLICY.settlement_floor:
+                continue  # the tier is spent; leaving it is allowed to cost more
+            assert later.total <= earlier.total, (
+                f"left {earlier.tier.label} at ${earlier.total} for "
+                f"{later.tier.label} at ${later.total} — ${later.total - earlier.total} "
+                f"more than the offer refused, with ${POLICY.settlement_floor} "
+                f"still authorized and never offered"
+            )

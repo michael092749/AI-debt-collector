@@ -836,6 +836,21 @@ def _step_down(
     still on record for a concession that actually helps them
     (ADVERSARIAL_TESTING.md L1).
     """
+    # Spend the tier before leaving it. A settlement re-prices at
+    # ``settlement_floor`` once one has been put up and refused — which is
+    # exactly the moment the walk below would step off SETTLEMENT, so that
+    # branch of ``_tier_total`` never ran and the $800 the policy authorizes
+    # was never offered to anyone. Worse, the tier it stepped to is the full
+    # balance again: the consumer refused $900 and heard $1,000 back, the ask
+    # rising on the turn they said no (live call, 2026-08-08).
+    #
+    # Only when holding actually gives ground. On every other rung the rebuild
+    # returns what is already standing, which is not a concession, and the walk
+    # proceeds untouched — so this cannot stall the ladder.
+    held = build_counter(state, policy, preferred_cadence=cadence)
+    if _is_concession(held, standing):
+        return state.spend_refusal(), held, True
+
     stepped = state.advance_ladder()
     offer = build_counter(stepped, policy, preferred_cadence=cadence)
     while (

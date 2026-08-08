@@ -138,6 +138,22 @@ class NegotiationState:
             pending_refusals=self.pending_refusals - 1,
         )
 
+    def spend_refusal(self) -> NegotiationState:
+        """Consume a refusal while holding the tier.
+
+        Movement does not have to cost a rung. A settlement that was put up and
+        turned down re-prices at ``settlement_floor``, which is a real
+        concession made *inside* the tier — the consumer earned it, so the
+        refusal is spent, but the ladder keeps its position and the tiers below
+        stay unspent.
+
+        A no-op with nothing on record, matching ``advance_ladder``: giving
+        ground for free is the thing ``can_concede`` exists to prevent.
+        """
+        if not self.can_concede:
+            return self
+        return self._step(pending_refusals=self.pending_refusals - 1)
+
     def conceded_to(self, tier: Tier) -> NegotiationState:
         """Move the ladder down. Never back up (A4)."""
         return self._step(ladder_floor=max(self.ladder_floor, tier))
