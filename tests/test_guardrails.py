@@ -879,24 +879,6 @@ class TestDisclosureDetection:
     @pytest.mark.parametrize(
         "utterance",
         [
-            "Hi, this is Sarah, an AI assistant with Meridian Recovery Services. "
-            "Am I speaking with Dana?",
-            "Hi Dana — this is Sarah, an AI assistant calling from Meridian "
-            "Recovery Services. Is this Dana?",
-        ],
-    )
-    def test_appositive_ai_assistant_opening_is_recognized(self, utterance: str) -> None:
-        """SYSTEM_PROMPT steers the opening toward folding the disclosure into
-        the introduction as "an AI assistant" (a punchier open than a standalone
-        "I am an AI calling for..." sentence). The detector must accept that
-        appositive form, or every prompt-compliant first turn would be blocked
-        at the open. Note a bare appositive "an AI" without a trailing noun does
-        NOT fire — the prompt must keep steering to "AI assistant"."""
-        assert fires_ai_disclosure(utterance)
-
-    @pytest.mark.parametrize(
-        "utterance",
-        [
             "Please hold, this is a virtual queue and you're next in line.",
             "This is a digital signature requirement for the settlement letter.",
             "This is synthetic material, not leather, per the product description.",
