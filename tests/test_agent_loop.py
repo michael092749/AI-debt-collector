@@ -281,6 +281,88 @@ class TestConcessionsAreEarned:
         )
         assert "500" in result.payload["you_must_confirm"]
 
+    def test_an_uneven_schedule_the_consumer_named_is_kept_uneven(self) -> None:
+        """ "I can pay four hundred today, and then I can pay six hundred next
+        month" closed as $500 and $500 (live call, 2026-08-08).
+
+        ``Offer.from_proposal`` builds an accepted proposal's schedule from
+        ``even_installments``, so a two-payment proposal always writes half the
+        total twice. The consumer's own front-loading is discarded — and the
+        $400 they said they could produce today becomes $500 they did not.
+        Against them it is $100 more due on the day than they offered; the same
+        flattening in the other direction would hand back money they had put up.
+
+        The figure is not missing from the relay: ``signaled_capacity`` carries
+        it, and the engine's own ``_allocate`` already leads a *counter* with a
+        capacity named out loud. Only the accepted-proposal path splits evenly
+        regardless.
+
+        The floor still binds. Leading with their figure may not push the tail
+        below the minimum payment, which is why this cannot simply move into
+        ``from_proposal`` — that function cannot see the policy.
+        """
+        context = ToolContext.opening(POLICY)
+        context = execute(ToolCall(name="propose_offer"), context).context
+        context = _rule_on_something(context)
+        context = execute(ToolCall(name="record_refusal"), context).context
+        context = execute(
+            ToolCall(name="concede", arguments={"preferred_cadence": "monthly"}), context
+        ).context
+
+        result = execute(
+            ToolCall(
+                name="validate_consumer_offer",
+                arguments={
+                    "total": "1000",
+                    "payment_count": 2,
+                    "cadence": "monthly",
+                    "signaled_capacity": "400",
+                },
+            ),
+            context,
+        )
+
+        assert result.payload["outcome"] == "accept"
+        assert result.offer is not None
+        assert [i.amount for i in result.offer.installments] == [Money("400"), Money("600")], (
+            "the consumer's own split was flattened to an even one"
+        )
+        assert result.offer.total == Money("1000.00")
+
+    def test_a_named_downpayment_never_starves_the_tail(self) -> None:
+        """Leading with their figure stops where the payment floor starts.
+
+        "$800 today and the rest next month" leaves $200, which is below the
+        $250 minimum. Their split cannot be written, so the even one stands
+        rather than an illegal schedule being agreed to.
+        """
+        context = ToolContext.opening(POLICY)
+        context = execute(ToolCall(name="propose_offer"), context).context
+        context = _rule_on_something(context)
+        context = execute(ToolCall(name="record_refusal"), context).context
+        context = execute(
+            ToolCall(name="concede", arguments={"preferred_cadence": "monthly"}), context
+        ).context
+
+        result = execute(
+            ToolCall(
+                name="validate_consumer_offer",
+                arguments={
+                    "total": "1000",
+                    "payment_count": 2,
+                    "cadence": "monthly",
+                    "signaled_capacity": "800",
+                },
+            ),
+            context,
+        )
+
+        assert result.offer is not None
+        assert min(i.amount for i in result.offer.installments) >= POLICY.min_payment, (
+            f"agreed a schedule below the payment floor: "
+            f"{[str(i.amount) for i in result.offer.installments]}"
+        )
+
     def test_terms_better_than_the_standing_ones_are_taken_at_their_number(self) -> None:
         """The rule is "never take more than we *asked* for", not "never take
         more than we offered". A consumer who puts up $950 against a standing

@@ -34,7 +34,7 @@ from collector.guardrails.confirmation import confirmation_line
 from collector.llm.base import ToolCall
 from collector.money import Money
 from collector.negotiation import CallOutcome, NegotiationState
-from collector.offers import Cadence, ConsumerProposal, Offer, Tier
+from collector.offers import Cadence, ConsumerProposal, Installment, Offer, Tier
 from collector.policy import PolicyConfig
 
 JsonDict = dict[str, Any]
@@ -429,6 +429,38 @@ def _schedule_for(each: Money, balance: Money) -> tuple[Money, int]:
     return balance, max(1, covered)
 
 
+def _consumer_led_schedule(
+    proposal: ConsumerProposal, policy: PolicyConfig
+) -> tuple[Money, ...] | None:
+    """The schedule the consumer described, when they sized its first payment.
+
+    ``even_installments`` is the right reading of "two payments" — a shape with
+    no figures in it. It is the wrong reading of "four hundred today, and then
+    six hundred next month", which has both: accepted as an even split that
+    closed at $500 and $500, $100 more due on the day than was offered (live
+    call, 2026-08-08). The engine's own ``_allocate`` already leads a *counter*
+    with a capacity named out loud; this is the same rule for the proposal we
+    are agreeing to.
+
+    ``None`` whenever their split cannot be written as a legal schedule, and the
+    even one stands. Lives here rather than in ``Offer.from_proposal`` because
+    the payment floor decides that, and ``offers.py`` cannot see the policy —
+    the engine ruled MIN_PAYMENT against ``smallest_payment``, which is the even
+    split's figure, so a front-loaded schedule is unchecked until here. "$800
+    today and the rest next month" leaves $200 against a $250 floor.
+    """
+    down = proposal.signaled_capacity
+    if down is None or proposal.payment_count < 2 or down < policy.min_payment:
+        return None
+    remainder = proposal.total - down
+    if remainder.amount <= 0:
+        return None
+    rest = remainder.allocate(proposal.payment_count - 1)
+    if min(rest) < policy.min_payment:
+        return None
+    return (down, *rest)
+
+
 def _consumer_proposal(args: JsonDict, policy: PolicyConfig) -> ConsumerProposal:
     """What the consumer proposed, out of whichever way the model relayed it.
 
@@ -540,6 +572,20 @@ def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult
         if verdict.outcome == "accept" and verdict.tier is not None
         else None
     )
+    # Their own front-loading, where they sized the first payment themselves.
+    consumer_led = False
+    if accepted is not None:
+        schedule = _consumer_led_schedule(proposal, context.policy)
+        if schedule is not None and schedule != tuple(i.amount for i in accepted.installments):
+            interval = accepted.cadence.interval_days
+            accepted = Offer(
+                tier=accepted.tier,
+                installments=tuple(
+                    Installment(amount, i * interval) for i, amount in enumerate(schedule)
+                ),
+                cadence=accepted.cadence,
+            )
+            consumer_led = True
     # We never take more than we *asked* for. Same tier, same money, harsher
     # schedule than the one on the table means they have agreed to our
     # arrangement and mis-stated it, so it closes on ours: "two payments" read
@@ -563,6 +609,7 @@ def _validate_consumer_offer(args: JsonDict, context: ToolContext) -> ToolResult
     if (
         accepted is not None
         and proposal.amount_each is None
+        and not consumer_led
         and standing is not None
         and standing.tier is accepted.tier
         and standing.total == accepted.total
