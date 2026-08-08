@@ -477,11 +477,23 @@ def verdict_from_json(data: JsonDict) -> Verdict:
 
 
 def proposal_from_json(data: JsonDict) -> ConsumerProposal:
+    """Rebuild the proposal the engine ruled on, provenance included.
+
+    ``amount_each`` and ``total_stated`` are not decoration: they are what
+    ``smallest_payment`` answers the payment floor on, so a decoder that drops
+    them re-derives the figure from an even split and reports a proposal the
+    consumer never made. ``.get``, for the same reason ``Escalated`` uses it:
+    rows written before the two fields existed carry neither key, and their
+    defaults are the ones the dataclass gives a proposal that named no
+    per-payment figure.
+    """
     return ConsumerProposal(
         total=Money(data["total"]),
         payment_count=int(data["payment_count"]),
         cadence=Cadence(data["cadence"]),
         signaled_capacity=money_from_json(data["signaled_capacity"]),
+        amount_each=money_from_json(data.get("amount_each")),
+        total_stated=bool(data.get("total_stated", True)),
     )
 
 

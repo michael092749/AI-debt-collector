@@ -14,6 +14,7 @@ import json
 import os
 import sqlite3
 import stat
+from dataclasses import fields
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -36,8 +37,11 @@ from collector.audit import (
     GuardrailTripped,
     Speaker,
     TurnRecorded,
+    event_from_json,
+    event_json,
     to_jsonable,
 )
+from collector.audit.events import proposal_from_json
 from collector.audit.store import (
     DB_PATH_ENV_VAR,
     DEFAULT_DB_PATH,
@@ -68,6 +72,28 @@ SETTLEMENT = Offer(
         Installment(Money("300.00"), 60),
     ),
     cadence=Cadence.MONTHLY,
+)
+
+
+#: The 2026-08-07 relay: the consumer said "$150 a month" and named no total,
+#: so the tool layer assembled one and derived the count. Every field carries a
+#: value other than its default, so a round trip cannot come back equal while
+#: quietly dropping one.
+RELAYED_150 = ConsumerProposal(
+    total=Money("1000.00"),
+    payment_count=7,
+    cadence=Cadence.MONTHLY,
+    signaled_capacity=Money("150.00"),
+    amount_each=Money("150.00"),
+    total_stated=False,
+)
+
+#: What the engine ruled on it, so the decision event under test is a real one
+#: rather than a hand-assembled shape.
+RELAYED_VERDICT = validate_offer(
+    RELAYED_150,
+    NegotiationState.opening(PolicyConfig.default()),
+    PolicyConfig.default(),
 )
 
 
@@ -490,6 +516,64 @@ class TestRoundTrip:
 
         with AuditStore(db, json_dir=tmp_path / "agreements") as second:
             assert second.agreement(CALL_ID) == record
+
+
+class TestTheProposalReadsBackAsTheOneRuledOn:
+    """A decision record must name the consumer's own money, not an even split.
+
+    ``ConsumerProposal`` carries two provenance fields — ``amount_each``, the
+    per-payment figure the consumer actually said, and ``total_stated``, false
+    when the tool layer assembled the total around a shape. They exist because
+    a figure the consumer named and a figure we derived are not interchangeable
+    evidence (``offers.py``), and ``smallest_payment`` is the figure the payment
+    floor is answered on.
+
+    ``to_jsonable`` writes all six fields; a decoder that reconstructs four
+    puts a proposal nobody made into every reader of ``store.decisions`` and
+    into the rehydrated ``AgreementRecord`` — the 2026-08-07 "$150 a month"
+    shape, restored from the log as $142.85.
+    """
+
+    RELAYED = RELAYED_150
+
+    def test_every_field_is_exercised(self) -> None:
+        assert {f.name for f in fields(ConsumerProposal)} == {
+            "total",
+            "payment_count",
+            "cadence",
+            "signaled_capacity",
+            "amount_each",
+            "total_stated",
+        }
+
+    def test_the_decision_survives_the_json_round_trip(self) -> None:
+        event = DecisionRecorded(CALL_ID, 4, self.RELAYED, RELAYED_VERDICT, at="t4d")
+
+        assert event_from_json(event_json(event)) == event
+
+    def test_the_figure_the_floor_is_answered_on_is_not_re_derived(self) -> None:
+        """$150 a month is what they said they could produce. An even split of
+        an assembled $1,000 over seven payments is $142.85 — a number nobody
+        named, and a different answer from the payment floor."""
+        loaded = proposal_from_json(to_jsonable(self.RELAYED))
+
+        assert loaded.amount_each == Money("150.00")
+        assert loaded.total_stated is False
+        assert loaded.smallest_payment == Money("150.00")
+
+    def test_a_row_written_before_the_provenance_fields_still_reads(self) -> None:
+        """Rows already in the log carry neither key, and an evidence store that
+        cannot read its own older rows back has lost the evidence."""
+        older = to_jsonable(ConsumerProposal(Money("800"), 3, Cadence.MONTHLY))
+        del older["amount_each"]
+        del older["total_stated"]
+
+        assert proposal_from_json(older) == ConsumerProposal(Money("800"), 3, Cadence.MONTHLY)
+
+    def test_the_stored_decision_reads_back_intact(self, store: AuditStore) -> None:
+        store.record(DecisionRecorded(CALL_ID, 4, self.RELAYED, RELAYED_VERDICT, at="t4d"))
+
+        assert store.decisions(CALL_ID)[0].proposal == self.RELAYED
 
 
 # --------------------------------------------------------------------------
