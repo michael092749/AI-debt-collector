@@ -314,12 +314,26 @@ def consumer_stated_money(
     * **Money only.** "I could do twelve months" must not make 12 sayable as
       a duration or a payment count — a term the consumer floated is not a
       term the engine agreed to.
-    * **An explicit currency marker.** ``_classify`` reads any bare number at
-      or above $100 as money, which is the right default for screening what
-      the *agent* says and the wrong one here: "999 problems", "850 a week"
-      and a case reference are not amounts on the table. The cost is that
-      bare slang ("a grand", "a G") no longer widens anything, which is a
-      thin loss — it resolves to the balance, already authorized.
+    * **A currency marker, or a payment cue in the sentence.** ``_classify``
+      reads any bare number at or above $100 as money, which is the right
+      default for screening what the *agent* says and the wrong one here:
+      "999 problems", "850 a week" and a case reference are not amounts on
+      the table.
+
+      Requiring the marker *alone* was judged a thin loss — bare slang, "a
+      grand". On a voice line it is not thin at all, and that judgement was
+      made against typed text. Nobody says "dollars" out loud: the consumer
+      says "I can only pay a hundred and fifty today", the transcript carries
+      no marker, and the figure they just spoke is unsayable back to them. The
+      agent spent both regeneration strikes trying to acknowledge it and
+      closed the turn on the scripted fallback (live call, 2026-08-09).
+
+      So a payment cue in the utterance — pay, afford, manage, put down, come
+      up with — stands in for the marker. It is what separates "a hundred and
+      fifty" in "I can only pay a hundred and fifty" from the same figure in
+      "I drove four hundred miles". The cue is read from the sentence, not the
+      figure, because that is where the intent to offer money lives; every
+      other filter below still applies to whatever it lets through.
     * **Bounded by ``ceiling``**, the largest already-authorized amount (the
       balance). Nothing the consumer says widens the guard past the account.
     * **Nothing suspicious.** A digit run against a letter is an evasion
@@ -352,17 +366,39 @@ def consumer_stated_money(
     consumer*, not amounts the consumer agreed to. Everything above keeps
     that set small; nothing above makes it exact.
     """
+    offering = _PAYMENT_CUE_RE.search(utterance) is not None
     values = {
         figure.value
         for figure in extract_figures(utterance)
         if figure.kind is FigureKind.MONEY
         and figure.value is not None
         and not figure.suspicious
-        and _CURRENCY_MARKER_RE.search(figure.text) is not None
+        and (offering or _CURRENCY_MARKER_RE.search(figure.text) is not None)
         and (ceiling is None or figure.value <= ceiling)
         and figure.value not in withheld
     }
     return AuthorizedFigures(money=frozenset(values))
+
+
+# Sentences in which a bare number is money the consumer is putting on the
+# table, rather than a distance, a case reference or a turn of phrase. Read
+# from the whole utterance: "I can only pay a hundred and fifty today" carries
+# its cue three words before the figure, and "make it three hundred" carries
+# it before as well. Deliberately about *producing* money — "owe" and "cost"
+# are left out, since a figure the consumer believes they owe is a claim about
+# the account, and the balance is authorized already.
+#
+# Cadence words are not cues, though they read like them. "a week" would make
+# "I make 850 a week before taxes" an offer of $850 — income the consumer
+# volunteered, not money on the table (``test_a_bare_number_is_not_a_stated_
+# amount``). A real proposal at a cadence carries its own cue regardless:
+# "I can do three hundred a month".
+_PAYMENT_CUE_RE = re.compile(
+    r"\b(?:pay|paying|paid|afford|manage|managing|put\s+down|down\s+payment|"
+    r"downpayment|come\s+up\s+with|spare|budget|cover|give\s+you|send|"
+    r"instal?ments?\s+of|do|make\s+it|offer|settle\s+for)\b",
+    re.IGNORECASE,
+)
 
 
 # -- invisible-character defense --------------------------------------------

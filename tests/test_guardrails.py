@@ -1549,6 +1549,46 @@ class TestAcknowledgingCallerStatedAmounts:
         echoed = check_outbound(heard.state, "Two hundred dollars — let me see what I can do.")
         assert echoed.allowed, echoed.violations
 
+    def test_a_spoken_amount_without_the_word_dollars_is_echoable(
+        self, ready: GuardrailState
+    ) -> None:
+        """ "And I can only pay a hundred and fifty today." — then the agent
+        spent both strikes trying to acknowledge it and fell back (live call,
+        2026-08-09).
+
+        The acknowledgment required an explicit currency marker. That is the
+        right default when screening the *agent*, and it was judged a thin loss
+        here — bare slang like "a grand". On a voice line it is not thin at
+        all: the consumer says "a hundred and fifty today" and the transcript
+        carries no "dollars", so nothing is acknowledged and the figure the
+        consumer just spoke is unsayable back to them.
+        """
+        heard = check_inbound(ready, "And I can only pay a hundred and fifty today.")
+        echoed = check_outbound(
+            heard.state, "I understand a hundred and fifty is what you can manage today."
+        )
+        assert echoed.allowed, echoed.violations
+
+    def test_a_bare_figure_with_no_payment_cue_is_not_acknowledged(
+        self, ready: GuardrailState
+    ) -> None:
+        """Dropping the currency marker may not open every number in the
+        consumer's channel. A figure is echoable because they offered it, not
+        because they uttered it near the agent."""
+        heard = check_inbound(ready, "I drove four hundred miles to get here this morning.")
+        result = check_outbound(heard.state, "Four hundred, understood.")
+        assert NumericRuleId.UNAUTHORIZED_AMOUNT in rule_ids(result.violations)
+
+    def test_a_withheld_floor_is_still_unsayable_however_they_phrase_it(
+        self, ready: GuardrailState
+    ) -> None:
+        """The settlement floor stays withheld whether or not they say
+        "dollars" — a consumer guessing the number must not put it in the
+        agent's mouth."""
+        heard = check_inbound(ready, "Would you take eight hundred to settle it?")
+        result = check_outbound(heard.state, "Eight hundred would settle it.")
+        assert NumericRuleId.UNAUTHORIZED_AMOUNT in rule_ids(result.violations)
+
     def test_only_money_is_widened(self, ready: GuardrailState) -> None:
         """ "I could do twelve months" must not make 12 sayable as a duration.
         A term the consumer floated is not a term the engine has agreed to."""
