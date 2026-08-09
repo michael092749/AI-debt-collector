@@ -295,6 +295,10 @@ class _Round:
     note: str | None = None
     # The guard's strike budget is spent; a rewrite is no longer on offer.
     exhausted: bool = False
+    # One sentence was withheld and the turn carries on regardless. Distinct
+    # from ``blocked``, which ends the round and decides how the turn closes:
+    # this is a sentence the consumer loses nothing by not hearing.
+    dropped: bool = False
 
     @property
     def failed(self) -> bool:
@@ -745,6 +749,9 @@ class NegotiationAgent:
                                 candidate, round_, spoken, may_rewrite=may_rewrite
                             )
                             if allowed is None:
+                                if round_.dropped:
+                                    round_.dropped = False
+                                    continue
                                 return
                             yield allowed
                     case StreamCompleted():
@@ -759,6 +766,9 @@ class NegotiationAgent:
             tail = f"{held} {buffer.strip()}".strip() if held else buffer.strip()
             if tail:
                 allowed = self._guard_sentence(tail, round_, spoken, may_rewrite=may_rewrite)
+                # A dropped tail needs no continue — there is nothing after it —
+                # but the flag must not outlive the round that set it.
+                round_.dropped = False
                 if allowed is not None:
                     yield allowed
         finally:
@@ -903,6 +913,23 @@ class NegotiationAgent:
             self._record_audio(candidate)
             return candidate
 
+        # A notice the consumer has already had is not a sentence to end a turn
+        # over. ``MINI_MIRANDA_REDUNDANT`` fires precisely because a complete,
+        # correctly-ordered disclosure is already on record, so the duplicate
+        # carries nothing new — but it is not curable by more text either, so
+        # it blocked, and a block is what walks the turn to the fallback. Live
+        # (2026-08-09): the consumer heard the notice, then "I'd rather not
+        # misstate anything..." instead of their balance, because the model
+        # said the notice twice.
+        #
+        # Withheld rather than spoken: the rule exists to stop the stutter and
+        # still does. Withheld rather than blocked: the turn had done nothing
+        # wrong.
+        if self._only_redundant_notice(check):
+            round_.dropped = True
+            self._record_trip(check, candidate, GuardrailAction.BLOCKED)
+            return None
+
         round_.blocked = sentence
         round_.note = check.regeneration_note()
         round_.exhausted = check.fallback_text is not None
@@ -911,6 +938,11 @@ class NegotiationAgent:
         # the drift is only ever visible in the compliance record, where it is
         # least likely to be noticed and most expensive to have been wrong.
         action = _ACTION_FOR[round_.outcome(list(spoken), may_rewrite=may_rewrite)]
+        self._record_trip(check, candidate, action)
+        return None
+
+    def _record_trip(self, check: OutboundCheck, text: str, action: GuardrailAction) -> None:
+        """One compliance row per rule that fired on a withheld sentence."""
         for violation in check.blocking_violations:
             self._record(
                 GuardrailTripped(
@@ -920,10 +952,21 @@ class NegotiationAgent:
                     rule_id=violation.rule_id,
                     action=action,
                     detail=violation.detail,
-                    blocked_text=candidate,
+                    blocked_text=text,
                 )
             )
-        return None
+
+    @staticmethod
+    def _only_redundant_notice(check: OutboundCheck) -> bool:
+        """Is a *second* Mini-Miranda the entire objection?
+
+        The mirror of ``_only_missing_notice``. Any other violation means the
+        sentence is wrong on its own terms and must take the ordinary path —
+        dropping one that also invents a figure would lose the record of the
+        turn the numeric guard caught.
+        """
+        rules = {v.rule_id for v in check.blocking_violations}
+        return rules == {DisclosureRuleId.MINI_MIRANDA_REDUNDANT}
 
     def _perceive(self, consumer_utterance: str) -> InboundCheck:
         """The inbound half of a turn, shared by the text and voice paths."""

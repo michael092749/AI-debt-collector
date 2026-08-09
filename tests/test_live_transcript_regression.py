@@ -580,7 +580,7 @@ def test_the_read_back_is_never_bolted_onto_a_scripted_recovery() -> None:
 
 
 def test_the_streaming_path_repairs_a_missing_mini_miranda_too() -> None:
-    """"Yes." answered with the scripted fallback, on the path that carries
+    """ "Yes." answered with the scripted fallback, on the path that carries
     calls (live, 2026-08-09).
 
     ``8c41068`` put the canonical notice in front of a turn whose only fault is
@@ -616,3 +616,36 @@ def test_the_streaming_path_repairs_a_missing_mini_miranda_too() -> None:
         f"the turn after identity confirmation fell back: {heard!r}"
     )
     assert fires_mini_miranda(heard), f"no Mini-Miranda reached the consumer: {heard!r}"
+
+
+def test_a_repeated_notice_does_not_cost_the_whole_turn() -> None:
+    """The fallback the consumer still hears occasionally (live, 2026-08-09).
+
+    Once a notice is on record — the model's own, or the one the repair put
+    there — a model that says it again trips ``MINI_MIRANDA_REDUNDANT``. That
+    is not curable by more text, so the sentence blocks, and a block is what
+    walks the turn to ``SAFE_FALLBACK_TEXT``. The consumer had already heard a
+    complete, correctly-ordered disclosure; the turn was then thrown away for
+    saying it twice.
+
+    A duplicate notice carries no information the consumer has not had, so the
+    sentence is dropped and the turn carries on. Blocking is for a sentence
+    that must not be said; this is a sentence that need not be.
+    """
+    agent = _agent(
+        LLMResponse(text=_OPENING),
+        # A paraphrase with no figure in it: the repair supplies the notice,
+        # and nothing has been said that a connective could close over. This
+        # is the live shape — the recovery below is the fallback, not the
+        # connective, precisely because no figure reached the consumer yet.
+        LLMResponse(
+            text="I'm calling about a debt you owe. Let me pull up your account.",
+            tool_calls=(ToolCall(name="propose_offer", arguments={}),),
+        ),
+        LLMResponse(text=f"{MINI_MIRANDA_TEXT} You have a balance of one thousand dollars."),
+    )
+
+    heard = "".join(agent.stream_turn("Yes."))
+
+    assert SAFE_FALLBACK_TEXT not in heard, f"a repeated notice cost the turn: {heard!r}"
+    assert "one thousand dollars" in heard, f"the balance never reached the consumer: {heard!r}"
